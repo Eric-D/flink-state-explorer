@@ -1,0 +1,50 @@
+# Real Flink 1.20 cluster for generating v5 canonical savepoints.
+# Usage:
+#   docker compose up -d
+#   docker compose run --rm generator
+#   docker compose down
+
+services:
+  jobmanager:
+    image: flink:1.20-java11
+    command: jobmanager
+    ports:
+      - "8081:8081"
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        state.savepoints.dir: file:///savepoints
+        state.backend: hashmap
+    volumes:
+      - savepoints:/savepoints
+
+  taskmanager:
+    image: flink:1.20-java11
+    command: taskmanager
+    depends_on:
+      - jobmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        state.savepoints.dir: file:///savepoints
+        state.backend: hashmap
+    volumes:
+      - savepoints:/savepoints
+
+  # Build the job jar, submit it, trigger savepoint, extract it
+  generator:
+    image: maven:3.9-eclipse-temurin-11
+    depends_on:
+      - jobmanager
+      - taskmanager
+    volumes:
+      - .:/app
+      - savepoints:/savepoints
+      - maven-cache:/root/.m2
+    working_dir: /app
+    entrypoint: /app/run-on-cluster.sh
+
+volumes:
+  savepoints:
+  maven-cache:
