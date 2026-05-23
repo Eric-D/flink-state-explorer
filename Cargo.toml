@@ -1,0 +1,25 @@
+[package]
+name = "flink-explorer"
+version = "0.1.0"
+edition = "2021"
+description = "TUI tool for exploring Apache Flink 1.20 savepoints interactively"
+
+[features]
+# RocksDB/SST reading (for external state files) is off by default: the canonical
+# heap-savepoint path never uses it, and dropping it keeps the default build pure-Rust
+# (no C++/libclang) so it cross-compiles to Windows trivially. Enable with `--features sst`.
+default = []
+sst = ["dep:rocksdb"]
+
+[dependencies]
+ratatui = "0.30"
+crossterm = "0.29"
+rocksdb = { version = "0.24", features = ["snappy"], optional = true }
+protox = "0.9"
+prost-reflect = "0.16"
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+serde_json = "1.0.149"
