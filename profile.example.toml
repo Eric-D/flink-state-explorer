@@ -1,0 +1,26 @@
+## flink-explorer profile example
+## Place in <binary_dir>/config/profiles/<name>.toml
+
+name = "asse-verts"
+
+## Directories containing .proto files (relative to CWD or absolute)
+## Proto schemas are project-specific — relative paths resolved from binary directory
+proto_dirs = ["./protos", "/shared/proto-schemas"]
+
+## Proto detection patterns
+## When a POJO has the configured fields, protoBytes are decoded automatically
+[[proto_patterns]]
+class_field = "className"       # Field containing the Java proto class name
+bytes_field = "protoBytes"      # Field containing the raw protobuf bytes
+resolve = "auto"                # "auto": fr.asse.proto.Effectif$FicheJoueur → fr.asse.proto.FicheJoueur
+                                # "direct": use className as-is for proto lookup
+
+## Path-based overrides (optional)
+## Use the breadcrumb path shown in the status bar to target specific fields
+## "*" matches any single segment
+# [proto_patterns.path_overrides]
+# "*.ficheJoueur.content.protoBytes" = "fr.asse.proto.FicheJoueur"
+
+## Explicit className → proto message bindings (optional, overrides auto-resolve)
+# [bindings]
+# "fr.asse.proto.Effectif$Contrat" = "fr.asse.proto.Contrat"
