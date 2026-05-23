@@ -1,0 +1,17 @@
+name: CI
+on:
+  push: { branches: [main] }
+  pull_request:
+jobs:
+  build-lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy, rustfmt }
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets    # sans -D warnings (lints de style préexistants)
+      - run: cargo test --lib
+      - run: cargo test --test cache_test --test empty_map_test --test integration_test --test java_deser_test --test metadata_test --test state_handle_test --test kafka_test --test real_savepoint_test
