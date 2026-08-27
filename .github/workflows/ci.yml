@@ -15,3 +15,15 @@ jobs:
       - run: cargo clippy --all-targets    # sans -D warnings (lints de style préexistants)
       - run: cargo test --lib
       - run: cargo test --test cache_test --test empty_map_test --test integration_test --test java_deser_test --test metadata_test --test state_handle_test --test kafka_test --test real_savepoint_test
+
+  # Le générateur de fixtures Java n'était pas construit par la CI : un bump Dependabot
+  # sur test-flink-job/pom.xml pouvait casser `mvn verify` sans qu'aucun check ne le voie.
+  # Compilation + résolution du classpath de test uniquement (les ITs ont besoin de Docker).
+  java-fixture-generator:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17', cache: maven }
+      - run: mvn -B -DskipITs verify
+        working-directory: test-flink-job
