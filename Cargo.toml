@@ -1,6 +1,6 @@
 [package]
 name = "flink-explorer"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "TUI tool for exploring Apache Flink 1.20 savepoints interactively"
 
