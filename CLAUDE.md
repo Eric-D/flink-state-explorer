@@ -64,6 +64,29 @@ Gotchas already handled in the pom/IT (don't re-debug):
 - `state.storage.fs.memory-threshold: 20 mb` forces small state inline → a single self-contained
   `_metadata`.
 
+## Exporting one state (streaming)
+
+`cargo run -- <savepoint> --list-states` lists the keyed states; `--export-state <name>` streams a
+single one to NDJSON (`-o -` for stdout, `--operator <hex prefix>` when a name is ambiguous — timer
+states repeat across operators). This is a **headless** path: it never touches the terminal.
+
+`src/export_state.rs` deliberately bypasses `src/index`, because the index holds every key and
+every raw value in memory. Instead it reads only each subtask's **header** (it ends where the first
+key-group begins) to resolve the state's id/type/serializers, then seeks per key-group via
+`KeyGroupsStateHandle.offsets`, reading **one key-group at a time** into a reused buffer. Entries of
+other states are skipped by their length prefixes without decoding keys or copying values
+(`KeyGroupParse::only_state`). Peak memory is one key-group, not one savepoint —
+`ExportStats::max_block_bytes` reports it.
+
+Two things to know about the rows:
+- a **MAP** state exports **exploded**, one row per entry, with `map_key` decoded from the
+  namespace (`VoidNamespace + map key`) and the value unwrapped from `NullableSerializer`. The raw
+  per-entry bytes are *not* the blob `index::builder` assembles per key, so `decode_map_entry` in
+  `parser::value` is shared by both paths;
+- `key_group` is the **absolute** key-group (`start_key_group + i`). The index/TUI path instead
+  reports the index *within the subtask's range*, which is only correct for subtask 0 — e.g. for
+  `int-key-count` the full JSON export shows key `15` in key-group 6 where it is really 70.
+
 ## Decoder architecture — IMPORTANT
 
 **`src/parser/value.rs` is the single source of truth for binary value decoding.** It turns a
@@ -135,9 +158,12 @@ don't store a user class — only the serializer class, which implies the type.
   window's buffered contents and its firing timer are shown; if one key has multiple windows, only
   the first window's contents is kept per key.
 - **Snapshot compression**: the keyed/operator backend headers carry a `usingKeyGroupCompression` /
-  `usingStateCompression` boolean (Flink default OFF). We do **not** read it; if a savepoint was
-  written with snapshot compression enabled, each key-group is snappy-compressed and inline decoding
-  would produce garbage. (Our fixtures are uncompressed.)
+  `usingStateCompression` boolean (Flink default OFF). The **streaming single-state export** reads
+  it (`read_keyed_stream_header`) and inflates each key-group (`key_group_block`), but the **index /
+  TUI path still ignores it**: on a savepoint written with snapshot compression the index would
+  decode garbage. Our fixtures are uncompressed, so this is covered only by a synthetic
+  Snappy-framed block in `tests/export_state_stream_test.rs` — a real compressed fixture needs
+  `execution.checkpointing.snapshot-compression: true` in the IT's `FLINK_PROPERTIES`.
 - **Broadcast / operator-state element decoding is best-effort String**: broadcast maps decode when
   the key/value are Strings (the common case; `decode_broadcast_map`), and operator `ListState`
   elements decode as `StringValue`; other element types fall back to a byte preview (the operator
@@ -180,6 +206,9 @@ source** (branch `release-1.20`, https://github.com/apache/flink) rather than gu
 - `tests/decode_e2e_test.rs` — protobuf, tuples, primitive arrays, full-POJO, scrollbar.
 - `tests/coverage_audit.rs` — dumps the full operator/state inventory + decoded values (diagnostic).
 - `tests/gitlab_savepoint_test.rs` — exhaustive per-state assertions.
+- `tests/export_state_stream_test.rs` — streaming export: strict parity with the full JSON export
+  for every non-MAP state, exploded parity for MAP states, the `v6`/compression header, a
+  Snappy-framed key-group, the state filter, and the bounded peak block.
 
 ## Dependencies — IMPORTANT
 
