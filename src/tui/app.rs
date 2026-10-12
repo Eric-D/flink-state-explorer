@@ -566,7 +566,7 @@ fn centered_popup(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 }
 
 /// Returns (ProtoContext, list of loaded proto file paths).
-fn build_proto_context(profile: &Profile) -> Option<(crate::proto::ProtoContext, Vec<String>)> {
+pub fn build_proto_context(profile: &Profile) -> Option<(crate::proto::ProtoContext, Vec<String>)> {
     if profile.proto_dirs.is_empty()
         && profile.bindings.is_empty()
         && profile.proto_patterns.is_empty()
