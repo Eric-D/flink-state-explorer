@@ -41,9 +41,13 @@ struct Cli {
     #[arg(long, value_name = "HEX")]
     operator: Option<String>,
 
-    /// Where --export-state writes; "-" means stdout
+    /// Where --export-state writes; "-" means stdout (ndjson only)
     #[arg(short, long, value_name = "PATH")]
     out: Option<PathBuf>,
+
+    /// Output format for --export-state. `parquet` needs a build with `--features parquet`.
+    #[arg(long, value_name = "FMT", default_value = "ndjson")]
+    format: String,
 
     /// List the keyed states available to --export-state, then exit
     #[arg(long)]
@@ -137,7 +141,7 @@ fn list_states(cli: &Cli) -> Result<(), String> {
         eprintln!("No keyed state found in {}", cli.savepoint_dir.display());
         return Ok(());
     }
-    println!("{:<34} {:<10} {}", "OPERATOR", "TYPE", "STATE");
+    println!("{:<34} {:<10} STATE", "OPERATOR", "TYPE");
     for (op, name, state_type) in states {
         println!("{:<34} {:<10} {}", op, state_type, name);
     }
@@ -156,39 +160,52 @@ fn export_state(cli: &Cli) -> Result<(), String> {
         .and_then(|p| flink_explorer::tui::app::build_proto_context(&p))
         .map(|(ctx, _loaded)| ctx);
 
-    let to_stdout = cli
-        .out
-        .as_deref()
-        .map(|p| p == Path::new("-"))
-        .unwrap_or(false);
+    let to_stdout = cli.out.as_deref().is_some_and(|p| p == Path::new("-"));
+    let extension = match cli.format.as_str() {
+        "ndjson" => "jsonl",
+        "parquet" => "parquet",
+        other => {
+            return Err(format!(
+                "unknown --format {:?}; expected \"ndjson\" or \"parquet\"",
+                other
+            ))
+        }
+    };
     let path = cli.out.clone().unwrap_or_else(|| {
         cli.savepoint_dir
-            .join(format!("{}.jsonl", state.replace('/', "_")))
+            .join(format!("{}.{}", state.replace('/', "_"), extension))
     });
 
-    let stats = if to_stdout {
-        let stdout = io::stdout();
-        let mut w = io::BufWriter::new(stdout.lock());
-        flink_explorer::export_state::export_state_ndjson(
-            &savepoint,
-            &cli.savepoint_dir,
-            cli.operator.as_deref(),
-            state,
-            proto.as_ref(),
-            &mut w,
-        )?
-    } else {
-        let file = std::fs::File::create(&path)
-            .map_err(|e| format!("create {}: {}", path.display(), e))?;
-        let mut w = io::BufWriter::new(file);
-        flink_explorer::export_state::export_state_ndjson(
-            &savepoint,
-            &cli.savepoint_dir,
-            cli.operator.as_deref(),
-            state,
-            proto.as_ref(),
-            &mut w,
-        )?
+    let stats = match cli.format.as_str() {
+        "ndjson" if to_stdout => {
+            let stdout = io::stdout();
+            let mut w = io::BufWriter::new(stdout.lock());
+            flink_explorer::export_state::export_state_ndjson(
+                &savepoint,
+                &cli.savepoint_dir,
+                cli.operator.as_deref(),
+                state,
+                proto.as_ref(),
+                &mut w,
+            )?
+        }
+        "ndjson" => {
+            let file = std::fs::File::create(&path)
+                .map_err(|e| format!("create {}: {}", path.display(), e))?;
+            let mut w = io::BufWriter::new(file);
+            flink_explorer::export_state::export_state_ndjson(
+                &savepoint,
+                &cli.savepoint_dir,
+                cli.operator.as_deref(),
+                state,
+                proto.as_ref(),
+                &mut w,
+            )?
+        }
+        "parquet" => {
+            export_state_parquet(cli, &savepoint, state, proto.as_ref(), &path, to_stdout)?
+        }
+        _ => unreachable!("format validated above"),
     };
 
     if !to_stdout {
@@ -208,4 +225,43 @@ fn export_state(cli: &Cli) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+#[cfg(feature = "parquet")]
+fn export_state_parquet(
+    cli: &Cli,
+    savepoint: &flink_explorer::parser::Savepoint,
+    state: &str,
+    proto: Option<&flink_explorer::proto::ProtoContext>,
+    path: &Path,
+    to_stdout: bool,
+) -> Result<flink_explorer::export_state::ExportStats, String> {
+    if to_stdout {
+        // The writer must emit a footer, and a Parquet file on a pipe is rarely what anyone
+        // wants; say so instead of producing something awkward.
+        return Err("parquet output needs a file path, not stdout".to_string());
+    }
+    let mut sink = flink_explorer::export_parquet::ParquetSink::create(path)?;
+    let stats = flink_explorer::export_state::export_state_rows(
+        savepoint,
+        &cli.savepoint_dir,
+        cli.operator.as_deref(),
+        state,
+        proto,
+        &mut sink,
+    )?;
+    eprintln!("value column: {:?}", sink.value_column());
+    Ok(stats)
+}
+
+#[cfg(not(feature = "parquet"))]
+fn export_state_parquet(
+    _cli: &Cli,
+    _savepoint: &flink_explorer::parser::Savepoint,
+    _state: &str,
+    _proto: Option<&flink_explorer::proto::ProtoContext>,
+    _path: &Path,
+    _to_stdout: bool,
+) -> Result<flink_explorer::export_state::ExportStats, String> {
+    Err("this build has no parquet support; rebuild with `--features parquet`".to_string())
 }

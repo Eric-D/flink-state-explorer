@@ -94,7 +94,11 @@ fn index_export_reports_the_key_group_flink_assigned() {
     let len = std::fs::metadata(&metadata_path).unwrap().len();
     let index = build_index(&sp, len, 0u64, dir);
 
-    let tmp = std::env::temp_dir().join(format!("kg_assign_{}.json", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!(
+        "kg_assign_{}_{:?}.json",
+        std::process::id(),
+        std::thread::current().id()
+    ));
     flink_explorer::export::export_json(&index, None, &tmp).expect("export_json");
     let root: Value = serde_json::from_str(&std::fs::read_to_string(&tmp).unwrap()).unwrap();
     std::fs::remove_file(&tmp).ok();

@@ -276,10 +276,82 @@ pub fn hex_id(id: &[u8; 16]) -> String {
     id.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-/// Stream one keyed state to NDJSON (one JSON object per line).
+/// One exported entry, handed to a [`RowSink`] as it is read.
 ///
-/// `operator` optionally restricts the export to one operator, matched as a prefix of its hex id;
-/// without it the state name must be unambiguous across operators.
+/// Borrowed rather than owned: at a billion rows, allocating a row per entry is the difference
+/// between an export that streams and one that churns.
+pub struct StateRow<'a> {
+    pub operator: &'a str,
+    pub subtask: i32,
+    pub state: &'a str,
+    pub state_type: &'a str,
+    /// The value serializer type, e.g. `Long`, `Pojo`, `Map<String,Pojo>` — a sink may use it to
+    /// pick a column type.
+    pub value_type: &'a str,
+    pub key: &'a str,
+    /// Absolute key-group.
+    pub key_group: u16,
+    /// For MAP states: the decoded map entry key.
+    pub map_key: Option<&'a str>,
+    /// Namespace bytes when they carry more than the 1-byte VoidNamespace (e.g. a window).
+    pub namespace_hex: Option<&'a str>,
+    pub value: &'a Value,
+}
+
+/// Where exported rows go. Implemented by [`NdjsonSink`] and, with the `parquet` feature, by
+/// `ParquetSink` — the reading side is shared, so a new format is a sink and nothing else.
+pub trait RowSink {
+    fn row(&mut self, row: &StateRow<'_>) -> Result<(), String>;
+    /// Flush whatever is buffered. Always called on success.
+    fn finish(&mut self) -> Result<(), String>;
+}
+
+/// One JSON object per line, keys in alphabetical order (serde_json's map ordering).
+pub struct NdjsonSink<W: Write> {
+    out: W,
+    line: Vec<u8>,
+}
+
+impl<W: Write> NdjsonSink<W> {
+    pub fn new(out: W) -> Self {
+        Self {
+            out,
+            line: Vec::new(),
+        }
+    }
+}
+
+impl<W: Write> RowSink for NdjsonSink<W> {
+    fn row(&mut self, row: &StateRow<'_>) -> Result<(), String> {
+        let mut obj = json!({
+            "operator": row.operator,
+            "subtask": row.subtask,
+            "state": row.state,
+            "state_type": row.state_type,
+            "key": row.key,
+            "key_group": row.key_group,
+            "value": row.value,
+        });
+        let map = obj.as_object_mut().unwrap();
+        if let Some(mk) = row.map_key {
+            map.insert("map_key".into(), Value::String(mk.to_string()));
+        } else if let Some(ns) = row.namespace_hex {
+            map.insert("namespace_hex".into(), Value::String(ns.to_string()));
+        }
+        self.line.clear();
+        serde_json::to_writer(&mut self.line, &obj).map_err(|e| format!("serialize row: {}", e))?;
+        self.line.push(b'\n');
+        self.out
+            .write_all(&self.line)
+            .map_err(|e| format!("write: {}", e))
+    }
+
+    fn finish(&mut self) -> Result<(), String> {
+        self.out.flush().map_err(|e| format!("flush: {}", e))
+    }
+}
+
+/// Stream one keyed state to NDJSON (one JSON object per line).
 pub fn export_state_ndjson<W: Write>(
     savepoint: &Savepoint,
     savepoint_dir: &Path,
@@ -287,6 +359,29 @@ pub fn export_state_ndjson<W: Write>(
     state_name: &str,
     proto: Option<&ProtoContext>,
     out: &mut W,
+) -> Result<ExportStats, String> {
+    let mut sink = NdjsonSink::new(out);
+    export_state_rows(
+        savepoint,
+        savepoint_dir,
+        operator,
+        state_name,
+        proto,
+        &mut sink,
+    )
+}
+
+/// Stream one keyed state into any [`RowSink`].
+///
+/// `operator` optionally restricts the export to one operator, matched as a prefix of its hex id;
+/// without it the state name must be unambiguous across operators.
+pub fn export_state_rows<S: RowSink + ?Sized>(
+    savepoint: &Savepoint,
+    savepoint_dir: &Path,
+    operator: Option<&str>,
+    state_name: &str,
+    proto: Option<&ProtoContext>,
+    sink: &mut S,
 ) -> Result<ExportStats, String> {
     let mut stats = ExportStats::default();
 
@@ -346,7 +441,6 @@ pub fn export_state_ndjson<W: Write>(
     // Reused across every key-group: the export's entire data footprint.
     let mut raw = Vec::new();
     let mut inflated = Vec::new();
-    let mut line = Vec::new();
 
     for (subtask_index, kg) in keyed_handles(op) {
         let Some(src) = source_for(effective_delegate(kg), savepoint_dir) else {
@@ -453,36 +547,33 @@ pub fn export_state_ndjson<W: Write>(
                             ),
                         )
                     };
-                    let mut row = json!({
-                        "operator": op_hex,
-                        "subtask": subtask_index,
-                        "state": sub.name,
-                        "state_type": sub.state_type,
-                        "key": entry.key,
-                        "key_group": entry.key_group,
-                        "value": value,
-                    });
-                    let obj = row.as_object_mut().unwrap();
-                    if let Some(mk) = map_key {
-                        obj.insert("map_key".into(), Value::String(mk));
-                    } else if entry.namespace.len() > 1 {
-                        // A plain VALUE state has a 1-byte VoidNamespace; anything longer carries
-                        // information (e.g. a window namespace) we cannot type yet, so keep it.
-                        let hex: String = entry
-                            .namespace
-                            .iter()
-                            .map(|b| format!("{:02x}", b))
-                            .collect();
-                        obj.insert("namespace_hex".into(), Value::String(hex));
-                    }
-                    line.clear();
-                    if let Err(e) = serde_json::to_writer(&mut line, &row) {
-                        err = Some(format!("serialize row: {}", e));
-                        return;
-                    }
-                    line.push(b'\n');
-                    if let Err(e) = out.write_all(&line) {
-                        err = Some(format!("write: {}", e));
+                    // A plain VALUE state has a 1-byte VoidNamespace; anything longer carries
+                    // information (e.g. a window namespace) we cannot type yet, so keep it.
+                    let namespace_hex = if map_key.is_none() && entry.namespace.len() > 1 {
+                        Some(
+                            entry
+                                .namespace
+                                .iter()
+                                .map(|b| format!("{:02x}", b))
+                                .collect::<String>(),
+                        )
+                    } else {
+                        None
+                    };
+                    let row = StateRow {
+                        operator: &op_hex,
+                        subtask: subtask_index,
+                        state: &sub.name,
+                        state_type: &sub.state_type,
+                        value_type: &sub.value_type,
+                        key: &entry.key,
+                        key_group: entry.key_group,
+                        map_key: map_key.as_deref(),
+                        namespace_hex: namespace_hex.as_deref(),
+                        value: &value,
+                    };
+                    if let Err(e) = sink.row(&row) {
+                        err = Some(e);
                         return;
                     }
                     stats.rows += 1;
@@ -494,6 +585,6 @@ pub fn export_state_ndjson<W: Write>(
         }
     }
 
-    out.flush().map_err(|e| format!("flush: {}", e))?;
+    sink.finish()?;
     Ok(stats)
 }

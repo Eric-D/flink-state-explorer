@@ -62,9 +62,15 @@ fn index_keys(dir: &str) -> std::collections::BTreeMap<String, BTreeSet<String>>
     let len = std::fs::metadata(&metadata_path).unwrap().len();
     let index = build_index(&sp, len, 0u64, path);
 
+    // Unique per call: these tests run in parallel threads of one process and more than one of
+    // them indexes the same fixture, so a path derived only from the pid and the directory would
+    // have them clobbering each other's file.
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
     let tmp = std::env::temp_dir().join(format!(
-        "compressed_keys_{}_{}.json",
+        "compressed_keys_{}_{}_{}.json",
         std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed),
         dir.replace('/', "_")
     ));
     flink_explorer::export::export_json(&index, None, &tmp).expect("export_json");
