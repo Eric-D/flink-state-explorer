@@ -696,6 +696,11 @@ pub fn extract_keyed_entries(
 ) -> Vec<KeyedEntry> {
     let kg_prefix_len = key_group_prefix_bytes(max_parallelism);
     let offsets = &kg.offsets;
+    // The header is never compressed, so the flag is readable from the same bytes; when it is set
+    // each key-group is an independent Snappy-framed stream and must be inflated before parsing.
+    // Without this, a savepoint written with snapshot compression decoded as garbage.
+    let compressed = read_keyed_stream_header(data).is_some_and(|h| h.using_key_group_compression);
+    let mut inflated = Vec::new();
 
     // Check if offsets are valid: at least one offset points past the header
     let has_valid_offsets = offsets
@@ -727,8 +732,14 @@ pub fn extract_keyed_entries(
             // Reporting `i` was only correct for the subtask whose range starts at 0.
             let absolute_kg = (kg.start_key_group + i as i32).max(0) as u16;
 
+            let block = match key_group_block(&data[start..end], compressed, &mut inflated) {
+                Ok(b) => b,
+                // A key-group that will not inflate is skipped rather than parsed as garbage.
+                Err(_) => continue,
+            };
+
             parse_key_group_block(
-                &data[start..end],
+                block,
                 absolute_kg,
                 &KeyGroupParse {
                     num_states,
