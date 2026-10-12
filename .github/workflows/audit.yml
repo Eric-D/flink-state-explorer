@@ -1,6 +1,9 @@
 name: Security audit
 on:
-  push: { paths: ['**/Cargo.toml', '**/Cargo.lock', 'deny.toml'] }
+  push: { branches: [main], paths: ['**/Cargo.toml', '**/Cargo.lock', 'deny.toml'] }
+  # Sans ce trigger, un bump de dépendance n'était pas audité avant merge et une
+  # nouvelle advisory n'apparaissait qu'au run hebdo sur main (passé inaperçu 4 semaines).
+  pull_request: { paths: ['**/Cargo.toml', '**/Cargo.lock', 'deny.toml'] }
   schedule: [{ cron: '0 6 * * 1' }]
   workflow_dispatch:
 permissions: { contents: read }
