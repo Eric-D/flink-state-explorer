@@ -10,6 +10,9 @@ description = "TUI tool for exploring Apache Flink 1.20 savepoints interactively
 # (no C++/libclang) so it cross-compiles to Windows trivially. Enable with `--features sst`.
 default = []
 sst = ["dep:rocksdb"]
+# Parquet output for `--export-state --format parquet`. Off by default: arrow+parquet pull ~36
+# crates the TUI has no use for. `cargo audit`/`cargo deny` are clean on that tree.
+parquet = ["dep:parquet", "dep:arrow-array", "dep:arrow-schema"]
 
 [dependencies]
 ratatui = "0.30"
@@ -27,6 +30,9 @@ serde_json = "1.0.149"
 # stream (SnappyStreamCompressionDecorator -> SnappyFramedOutputStream), which is what
 # snap::read::FrameDecoder reads. Pure Rust, no C dependency.
 snap = "1"
+parquet = { version = "60", default-features = false, features = ["arrow", "zstd"], optional = true }
+arrow-array = { version = "60", optional = true }
+arrow-schema = { version = "60", optional = true }
 
 [dev-dependencies]
 # Build a Snappy-framed key-group in tests, to prove the compressed path decodes.

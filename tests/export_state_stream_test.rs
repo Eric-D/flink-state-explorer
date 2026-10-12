@@ -57,7 +57,15 @@ fn full_export() -> HashMap<(String, String, String), Value> {
     let len = std::fs::metadata(&metadata_path).unwrap().len();
     let index = build_index(&sp, len, 0u64, dir);
 
-    let tmp = std::env::temp_dir().join(format!("export_state_parity_{}.json", std::process::id()));
+    // Unique per call: several tests here call this concurrently (cargo runs them in parallel
+    // threads), so a pid-only path would have them overwriting each other's file.
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    let tmp = std::env::temp_dir().join(format!(
+        "export_state_parity_{}_{}.json",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
     flink_explorer::export::export_json(&index, None, &tmp).expect("export_json");
     let root: Value = serde_json::from_str(&std::fs::read_to_string(&tmp).unwrap()).unwrap();
     std::fs::remove_file(&tmp).ok();
