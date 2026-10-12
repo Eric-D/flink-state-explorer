@@ -131,6 +131,47 @@ class SavepointGeneratorIT {
             }
             System.out.println("==> Savepoint written to " + out.toAbsolutePath()
                     + " (_metadata " + size + " bytes, " + fileCount + " files)");
+            cancelJob(rest, jobId);
+        } catch (Exception | AssertionError e) {
+            dumpLogs();
+            throw e;
+        }
+    }
+
+    /**
+     * Same job, but with snapshot compression on, into {@code tests/fixtures/savepoint-compressed}.
+     *
+     * <p>Without this fixture the compressed read path is only covered by a Snappy frame built in
+     * a Rust unit test — never by bytes Flink actually wrote. Each key-group becomes its own
+     * Snappy-framed stream and the keyed header's {@code usingKeyGroupCompression} flips to true;
+     * {@code tests/compressed_savepoint_test.rs} asserts both.
+     */
+    @Test
+    void generatesCompressedSavepoint() throws Exception {
+        String rest = "http://" + JOBMANAGER.getHost() + ":" + JOBMANAGER.getMappedPort(8081);
+        try {
+            awaitTaskManagerRegistered(rest);
+
+            Path jar = findJobJar();
+            String jarId = uploadJar(rest, jar);
+            String jobId = runJob(rest, jarId, "compress");
+            System.out.println("Submitted compressed job " + jobId);
+
+            awaitJobRunning(rest, jobId);
+            Thread.sleep(6_000);
+
+            String location = triggerCanonicalSavepoint(rest, jobId);
+            Path out = resolveOutputDir("savepoint.compressed.output.dir",
+                    "../tests/fixtures/savepoint-compressed");
+            copySavepointFromContainer(new URI(location).getPath(), out);
+
+            Path metadata = out.resolve("_metadata");
+            assertTrue(Files.exists(metadata), "_metadata must exist in " + out);
+            long size = Files.size(metadata);
+            assertTrue(size > 100, "_metadata should be non-trivial, was " + size + " bytes");
+            System.out.println("==> Compressed savepoint written to " + out.toAbsolutePath()
+                    + " (_metadata " + size + " bytes)");
+            cancelJob(rest, jobId);
         } catch (Exception | AssertionError e) {
             dumpLogs();
             throw e;
@@ -174,9 +215,28 @@ class SavepointGeneratorIT {
     }
 
     private String runJob(String rest, String jarId) throws Exception {
-        String payload = "{\"entryClass\":\"" + ENTRY_CLASS + "\",\"parallelism\":" + PARALLELISM + "}";
+        return runJob(rest, jarId, null);
+    }
+
+    /** `programArg` is passed to {@link ClusterJob#main} — "compress" enables snapshot compression. */
+    private String runJob(String rest, String jarId, String programArg) throws Exception {
+        String args = programArg == null ? "" : ",\"programArgsList\":[\"" + programArg + "\"]";
+        String payload = "{\"entryClass\":\"" + ENTRY_CLASS + "\",\"parallelism\":" + PARALLELISM
+                + args + "}";
         JsonNode resp = mapper.readTree(post(rest + "/jars/" + jarId + "/run", payload));
         return resp.get("jobid").asText();
+    }
+
+    /**
+     * Cancels the job so its slots are free for the next test's job: both tests share one
+     * cluster, and a savepoint does not stop the job it was taken from.
+     */
+    private void cancelJob(String rest, String jobId) {
+        try {
+            post(rest + "/jobs/" + jobId + "/stop", "{\"drain\":false}");
+        } catch (Exception e) {
+            System.out.println("Could not stop job " + jobId + ": " + e.getMessage());
+        }
     }
 
     private void awaitJobRunning(String rest, String jobId) throws Exception {
@@ -265,8 +325,11 @@ class SavepointGeneratorIT {
     }
 
     private static Path resolveOutputDir() throws IOException {
-        Path out = Paths.get(System.getProperty("savepoint.output.dir",
-                "../tests/fixtures/savepoint-gitlab")).toAbsolutePath().normalize();
+        return resolveOutputDir("savepoint.output.dir", "../tests/fixtures/savepoint-gitlab");
+    }
+
+    private static Path resolveOutputDir(String property, String defaultDir) throws IOException {
+        Path out = Paths.get(System.getProperty(property, defaultDir)).toAbsolutePath().normalize();
         if (Files.exists(out)) {
             deleteRecursively(out);
         }

@@ -36,6 +36,15 @@ public class ClusterJob {
         env.getConfig().disableForceAvro();
         env.getConfig().disableForceKryo();
 
+        // Pass "compress" to enable snapshot compression (ExecutionOptions.SNAPSHOT_COMPRESSION).
+        // The keyed backend then writes each key-group as an independent Snappy-framed stream and
+        // sets usingKeyGroupCompression in the KeyedBackendSerializationProxy header, which is
+        // what tests/fixtures/savepoint-compressed exercises.
+        if (args.length > 0 && "compress".equals(args[0])) {
+            env.getConfig().setUseSnapshotCompression(true);
+            System.out.println("Snapshot compression ENABLED");
+        }
+
         // --- Source ---
         DataStream<String> mainStream = env.addSource(new HoldingSource(STRING_KEYS))
                 .name("Main Source").uid("main-source");
