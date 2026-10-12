@@ -83,9 +83,12 @@ Two things to know about the rows:
   namespace (`VoidNamespace + map key`) and the value unwrapped from `NullableSerializer`. The raw
   per-entry bytes are *not* the blob `index::builder` assembles per key, so `decode_map_entry` in
   `parser::value` is shared by both paths;
-- `key_group` is the **absolute** key-group (`start_key_group + i`). The index/TUI path instead
-  reports the index *within the subtask's range*, which is only correct for subtask 0 — e.g. for
-  `int-key-count` the full JSON export shows key `15` in key-group 6 where it is really 70.
+- `key_group` is the **absolute** key-group, on this path and on the index/TUI path alike. Both
+  used to report the index *within a subtask's range* (correct only for the subtask starting at 0);
+  `extract_keyed_entries` now takes the `KeyGroupsStateHandle` and adds `start_key_group`.
+  `tests/key_group_assignment_test.rs` checks the result against Flink's own
+  `murmurHash(key.hashCode()) % maxParallelism` and against each subtask's computed range — this
+  also fixes the TUI's key-group **range filter**, which could not match subtasks past the first.
 
 ## Decoder architecture — IMPORTANT
 
@@ -206,6 +209,9 @@ source** (branch `release-1.20`, https://github.com/apache/flink) rather than gu
 - `tests/decode_e2e_test.rs` — protobuf, tuples, primitive arrays, full-POJO, scrollbar.
 - `tests/coverage_audit.rs` — dumps the full operator/state inventory + decoded values (diagnostic).
 - `tests/gitlab_savepoint_test.rs` — exhaustive per-state assertions.
+- `tests/key_group_assignment_test.rs` — the reported key-group is the one Flink assigned
+  (ported `MathUtils.murmurHash` + `KeyGroupRangeAssignment`), and every streamed row falls inside
+  its subtask's range. POJO keys are range-checked only: their `hashCode()` is user code.
 - `tests/export_state_stream_test.rs` — streaming export: strict parity with the full JSON export
   for every non-MAP state, exploded parity for MAP states, the `v6`/compression header, a
   Snappy-framed key-group, the state filter, and the bounded peak block.
@@ -217,6 +223,9 @@ advisory, including `unmaintained`/`unsound` *warnings* (not just vulnerabilitie
 stay clean.
 - Prefer **removing** a dep if it's unused (`tui-tree-widget` and `dirs` were dead and were dropped;
   removing `tui-tree-widget` also deduped a second `ratatui`).
+- The index cache carries a `cache_format` version (`src/index/cache.rs`): bump it whenever an
+  older cache would decode cleanly but hold values this build computes differently — a mismatch, or
+  a cache predating the field, falls back to a full rebuild.
 - The index cache (`src/index/cache.rs`) uses **`postcard`** (not `bincode`, which is unmaintained —
   RUSTSEC-2025-0141, and whose 3.0.0 is a serde-less tombstone). Use
   `postcard = { default-features = false, features = ["use-std"] }` to avoid `heapless →

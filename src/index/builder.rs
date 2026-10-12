@@ -68,6 +68,7 @@ where
             .map(|m| format!("{} (v{}, {} bytes)", m.name, m.version, m.data.len()))
             .collect(),
         operators,
+        cache_format: crate::index::cache::CACHE_FORMAT,
     }
 }
 
@@ -351,7 +352,7 @@ where
 
     let keyed_entries = extract_keyed_entries(
         &data,
-        &kg.offsets,
+        kg,
         num_states,
         key_type,
         header_size,

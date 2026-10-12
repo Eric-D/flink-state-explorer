@@ -686,7 +686,7 @@ fn key_group_prefix_bytes(max_parallelism: i32) -> usize {
 /// here; typed decoding lives in `parser::value` (the single decode source of truth).
 pub fn extract_keyed_entries(
     data: &[u8],
-    offsets: &[i64],
+    kg: &crate::parser::state_handle::KeyGroupsStateHandle,
     num_states: usize,
     key_type: &str,
     header_size: usize,
@@ -695,6 +695,7 @@ pub fn extract_keyed_entries(
     key_pojo: Option<&crate::parser::pojo::PojoInfo>,
 ) -> Vec<KeyedEntry> {
     let kg_prefix_len = key_group_prefix_bytes(max_parallelism);
+    let offsets = &kg.offsets;
 
     // Check if offsets are valid: at least one offset points past the header
     let has_valid_offsets = offsets
@@ -720,9 +721,15 @@ pub fn extract_keyed_entries(
                 continue;
             }
 
+            // `i` indexes this subtask's key-group range, so the absolute key-group is
+            // `start_key_group + i` (Flink: `KeyGroupRangeOffsets` is built over
+            // `computeKeyGroupRangeForOperatorIndex(maxParallelism, parallelism, subtask)`).
+            // Reporting `i` was only correct for the subtask whose range starts at 0.
+            let absolute_kg = (kg.start_key_group + i as i32).max(0) as u16;
+
             parse_key_group_block(
                 &data[start..end],
-                i as u16,
+                absolute_kg,
                 &KeyGroupParse {
                     num_states,
                     key_type,

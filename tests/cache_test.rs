@@ -1,6 +1,6 @@
 use flink_explorer::index::cache::{
     load_cache, save_cache, CachedEntry, CachedKeyedState, CachedOperator, CachedState, IndexCache,
-    KeyPartition, StateDescriptor, ValueRef,
+    KeyPartition, StateDescriptor, ValueRef, CACHE_FORMAT,
 };
 
 fn make_test_cache() -> IndexCache {
@@ -9,6 +9,7 @@ fn make_test_cache() -> IndexCache {
         metadata_mtime: 1711900000,
         checkpoint_id: 42,
         savepoint_version: 5,
+        cache_format: CACHE_FORMAT,
         master_states: vec!["coordinator (v1, 64 bytes)".to_string()],
         operators: vec![CachedOperator {
             id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
