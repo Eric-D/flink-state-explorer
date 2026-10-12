@@ -467,13 +467,9 @@ pub fn decode_field(
 }
 
 /// Decode a MAP value from the index blob: `int(count) + [int nsLen, ns, int valLen, val]*`.
-fn decode_map_blob(
-    bytes: &[u8],
-    value_type: &str,
-    pojo_info: Option<&PojoInfo>,
-    proto: Option<&ProtoContext>,
-) -> Value {
-    let (key_type, val_type) = value_type
+/// Split a `Map<K,V>` serializer type string into its key and value types.
+pub fn split_map_types(value_type: &str) -> (String, String) {
+    value_type
         .strip_prefix("Map<")
         .and_then(|s| s.strip_suffix('>'))
         .and_then(|s| {
@@ -483,7 +479,55 @@ fn decode_map_blob(
                 .split_first()
                 .map(|(k, rest)| (k.trim().to_string(), rest.join(",").trim().to_string()))
         })
-        .unwrap_or_else(|| ("?".to_string(), "?".to_string()));
+        .unwrap_or_else(|| ("?".to_string(), "?".to_string()))
+}
+
+/// Decode a single MAP-state entry as stored in a key-group.
+///
+/// `namespace` is `VoidNamespace(1 byte) + serialized map key` and `value` is
+/// `NullableSerializer(isNull byte) + serialized value`, per the layout in
+/// `docs/parsing-format.md`. Shared by [`decode_map_blob`] (which walks the blob the index
+/// builder assembles per key) and by the streaming single-state export, which emits one row per
+/// entry — so both read map bytes through the same code.
+pub fn decode_map_entry(
+    namespace: &[u8],
+    value: &[u8],
+    key_type: &str,
+    val_type: &str,
+    pojo_info: Option<&PojoInfo>,
+    proto: Option<&ProtoContext>,
+    fallback_key: usize,
+) -> (String, Value) {
+    // Key bytes are `VoidNamespace(1 byte) + serialized map key` — skip the namespace byte.
+    let key_payload: &[u8] = if namespace.is_empty() {
+        namespace
+    } else {
+        &namespace[1..]
+    };
+    let key_str = {
+        let mut kr = JavaReader::new(key_payload);
+        match decode_field(&mut kr, key_type, None, proto) {
+            Some(Value::String(s)) => s,
+            Some(v) => v.to_string().trim_matches('"').to_string(),
+            None => format!("key{}", fallback_key),
+        }
+    };
+    // Value bytes are `NullableSerializer(isNull byte) + serialized value`.
+    let decoded = match value.first() {
+        Some(1) => Value::Null,
+        Some(_) => decode_state_value(&value[1..], val_type, pojo_info, proto),
+        None => Value::Null,
+    };
+    (key_str, decoded)
+}
+
+fn decode_map_blob(
+    bytes: &[u8],
+    value_type: &str,
+    pojo_info: Option<&PojoInfo>,
+    proto: Option<&ProtoContext>,
+) -> Value {
+    let (key_type, val_type) = split_map_types(value_type);
 
     let mut r = JavaReader::new(bytes);
     let count = match r.read_int() {
@@ -500,22 +544,9 @@ fn decode_map_blob(
             Some(b) => b,
             None => break,
         };
-        // Key bytes are `VoidNamespace(1 byte) + serialized map key` — skip the namespace byte.
-        let key_payload: &[u8] = if ns.is_empty() { &ns } else { &ns[1..] };
-        let key_str = {
-            let mut kr = JavaReader::new(key_payload);
-            match decode_field(&mut kr, &key_type, None, proto) {
-                Some(Value::String(s)) => s,
-                Some(v) => v.to_string().trim_matches('"').to_string(),
-                None => format!("key{}", i),
-            }
-        };
-        // Value bytes are `NullableSerializer(isNull byte) + serialized value`.
-        let value = match val.first() {
-            Some(1) => Value::Null,
-            Some(_) => decode_state_value(&val[1..], &val_type, pojo_info, proto),
-            None => Value::Null,
-        };
+        let (key_str, value) = decode_map_entry(
+            &ns, &val, &key_type, &val_type, pojo_info, proto, i as usize,
+        );
         obj.insert(key_str, value);
     }
     Value::Object(obj)

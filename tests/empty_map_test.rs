@@ -14,6 +14,7 @@ fn cache_with_map(values: Vec<Option<Vec<u8>>>) -> IndexCache {
         metadata_mtime: 0,
         checkpoint_id: 0,
         savepoint_version: 4,
+        cache_format: flink_explorer::index::cache::CACHE_FORMAT,
         master_states: vec![],
         operators: vec![CachedOperator {
             id: [0u8; 16],
