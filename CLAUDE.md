@@ -71,8 +71,18 @@ Gotchas already handled in the pom/IT (don't re-debug):
 ## Exporting one state (streaming)
 
 `cargo run -- <savepoint> --list-states` lists the keyed states; `--export-state <name>` streams a
-single one to NDJSON (`-o -` for stdout, `--operator <hex prefix>` when a name is ambiguous — timer
+single one out (`-o -` for stdout, `--operator <hex prefix>` when a name is ambiguous — timer
 states repeat across operators). This is a **headless** path: it never touches the terminal.
+
+`--format ndjson` (default) or `--format parquet`, the latter only in a build with
+`--features parquet` (off by default: arrow+parquet add ~36 crates the TUI has no use for; a build
+without it says so instead of failing obscurely). Reading is shared — a format is a
+`RowSink` (`src/export_state.rs`) and nothing more, so rows are identical across formats and the
+tests assert that. The Parquet `value` column is **typed per export**, since one export covers one
+state and a state has one value serializer: `Int64`/`Float64`/`Boolean`/`Utf8` for scalars, and
+`Utf8` holding compact JSON for anything structured (POJO, Map, List, Tuple, arrays, Kryo). The
+`value_type` column carries the Flink serializer type so a reader can tell the two `Utf8` cases
+apart. Files are zstd-compressed, written in 65 536-row row groups.
 
 `src/export_state.rs` deliberately bypasses `src/index`, because the index holds every key and
 every raw value in memory. Instead it reads only each subtask's **header** (it ends where the first
@@ -217,6 +227,10 @@ source** (branch `release-1.20`, https://github.com/apache/flink) rather than gu
 - `tests/decode_e2e_test.rs` — protobuf, tuples, primitive arrays, full-POJO, scrollbar.
 - `tests/coverage_audit.rs` — dumps the full operator/state inventory + decoded values (diagnostic).
 - `tests/gitlab_savepoint_test.rs` — exhaustive per-state assertions.
+- `tests/export_parquet_test.rs` — **needs `--features parquet`**: the file is well-formed, the
+  `value` column is typed per state, map rows keep `map_key`, key-groups are absolute, columns are
+  zstd, and the rows read back equal the NDJSON ones. Verified by reading with arrow-rs, not with
+  a third-party engine (DuckDB/Polars were not available here).
 - `tests/compressed_savepoint_test.rs` — needs `savepoint-compressed`: the fixture really sets
   the compression flag, the index path inflates its key-groups (same key sets as the uncompressed
   run), and the streaming export agrees with the index path on those bytes.
