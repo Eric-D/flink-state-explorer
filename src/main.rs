@@ -1,5 +1,5 @@
 use std::io::{self, Stdout};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
@@ -31,10 +31,47 @@ struct Cli {
     /// Skip index cache (always re-parse)
     #[arg(long)]
     no_cache: bool,
+
+    /// Export a single keyed state as NDJSON instead of opening the TUI (streaming: memory stays
+    /// bounded by the largest key-group, not by the size of the state)
+    #[arg(long, value_name = "STATE")]
+    export_state: Option<String>,
+
+    /// Restrict --export-state to one operator, matched as a prefix of its hex OperatorID
+    #[arg(long, value_name = "HEX")]
+    operator: Option<String>,
+
+    /// Where --export-state writes; "-" means stdout
+    #[arg(short, long, value_name = "PATH")]
+    out: Option<PathBuf>,
+
+    /// List the keyed states available to --export-state, then exit
+    #[arg(long)]
+    list_states: bool,
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+
+    // Headless paths must not touch the terminal: they are meant to be piped and scripted.
+    if cli.list_states {
+        return match list_states(&cli) {
+            Ok(()) => ExitCode::from(0),
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                ExitCode::from(2)
+            }
+        };
+    }
+    if cli.export_state.is_some() {
+        return match export_state(&cli) {
+            Ok(()) => ExitCode::from(0),
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                ExitCode::from(2)
+            }
+        };
+    }
 
     match run(cli) {
         Ok(()) => ExitCode::from(0),
@@ -84,4 +121,91 @@ fn load_and_run(
     loading.render(terminal)?;
 
     app.run_with_terminal(terminal)
+}
+
+/// Parse `_metadata` without building the (fully in-memory) index.
+fn parse_savepoint(cli: &Cli) -> Result<flink_explorer::parser::Savepoint, String> {
+    let metadata = cli.savepoint_dir.join("_metadata");
+    flink_explorer::parser::parse_metadata(&metadata)
+        .map_err(|e| format!("parse {}: {}", metadata.display(), e))
+}
+
+fn list_states(cli: &Cli) -> Result<(), String> {
+    let savepoint = parse_savepoint(cli)?;
+    let states = flink_explorer::export_state::list_states(&savepoint, &cli.savepoint_dir);
+    if states.is_empty() {
+        eprintln!("No keyed state found in {}", cli.savepoint_dir.display());
+        return Ok(());
+    }
+    println!("{:<34} {:<10} {}", "OPERATOR", "TYPE", "STATE");
+    for (op, name, state_type) in states {
+        println!("{:<34} {:<10} {}", op, state_type, name);
+    }
+    Ok(())
+}
+
+fn export_state(cli: &Cli) -> Result<(), String> {
+    let state = cli.export_state.as_deref().unwrap_or_default();
+    let savepoint = parse_savepoint(cli)?;
+
+    // Reuse the TUI's proto-context builder so protobuf-in-POJO decodes identically headless.
+    let proto = cli
+        .profile
+        .as_deref()
+        .and_then(|name| flink_explorer::profile::storage::load_profile(name).ok())
+        .and_then(|p| flink_explorer::tui::app::build_proto_context(&p))
+        .map(|(ctx, _loaded)| ctx);
+
+    let to_stdout = cli
+        .out
+        .as_deref()
+        .map(|p| p == Path::new("-"))
+        .unwrap_or(false);
+    let path = cli.out.clone().unwrap_or_else(|| {
+        cli.savepoint_dir
+            .join(format!("{}.jsonl", state.replace('/', "_")))
+    });
+
+    let stats = if to_stdout {
+        let stdout = io::stdout();
+        let mut w = io::BufWriter::new(stdout.lock());
+        flink_explorer::export_state::export_state_ndjson(
+            &savepoint,
+            &cli.savepoint_dir,
+            cli.operator.as_deref(),
+            state,
+            proto.as_ref(),
+            &mut w,
+        )?
+    } else {
+        let file = std::fs::File::create(&path)
+            .map_err(|e| format!("create {}: {}", path.display(), e))?;
+        let mut w = io::BufWriter::new(file);
+        flink_explorer::export_state::export_state_ndjson(
+            &savepoint,
+            &cli.savepoint_dir,
+            cli.operator.as_deref(),
+            state,
+            proto.as_ref(),
+            &mut w,
+        )?
+    };
+
+    if !to_stdout {
+        eprintln!(
+            "Exported {} rows of {:?} to {} ({} subtasks, {} key-groups, peak block {} KiB{})",
+            stats.rows,
+            state,
+            path.display(),
+            stats.subtasks,
+            stats.key_groups,
+            stats.max_block_bytes / 1024,
+            if stats.compressed {
+                ", snappy key-groups"
+            } else {
+                ""
+            }
+        );
+    }
+    Ok(())
 }

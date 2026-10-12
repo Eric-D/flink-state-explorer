@@ -594,6 +594,71 @@ pub struct KeyedEntry {
     pub value: Vec<u8>,
 }
 
+/// Current `KeyedBackendSerializationProxy.VERSION` in Flink 1.20.
+pub const KEYED_BACKEND_VERSION: i32 = 6;
+
+/// Header of a keyed-state stream, i.e. what `KeyedBackendSerializationProxy` writes at offset 0
+/// of the delegate stream (before any key-group data).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyedStreamHeader {
+    /// `KeyedBackendSerializationProxy` format version (6 for Flink 1.20).
+    pub version: i32,
+    /// When true, **each key-group is an independent Snappy-framed stream**; the header itself is
+    /// always uncompressed.
+    pub using_key_group_compression: bool,
+}
+
+/// Read the keyed-state stream header.
+///
+/// Layout verified against apache/flink `release-1.20`:
+/// `VersionedIOReadableWritable.write` emits `writeInt(getVersion())`, then
+/// `KeyedBackendSerializationProxy.write` emits `writeBoolean(usingKeyGroupCompression)` —
+/// so the flag is a single byte at offset 4. It is only present from version 4 on
+/// (`read()` guards with `if (readVersion >= 4)`); older streams are never compressed.
+///
+/// `FullSnapshotAsyncWriter.writeKVStateMetaData` writes this proxy straight to the checkpoint
+/// output stream, so offset 0 of the delegate stream is the version int.
+pub fn read_keyed_stream_header(data: &[u8]) -> Option<KeyedStreamHeader> {
+    if data.len() < 5 {
+        return None;
+    }
+    let version = i32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+    // Guard against being handed something that isn't a keyed stream at all.
+    if !(1..=KEYED_BACKEND_VERSION).contains(&version) {
+        return None;
+    }
+    let using_key_group_compression = if version >= 4 { data[4] != 0 } else { false };
+    Some(KeyedStreamHeader {
+        version,
+        using_key_group_compression,
+    })
+}
+
+/// Return one key-group's raw bytes, decompressing them when the stream uses per-key-group
+/// compression.
+///
+/// Flink decorates **each key-group separately**
+/// (`FullSnapshotAsyncWriter.writeKVStateData` calls `decorateWithCompression` per key-group,
+/// recording the offset on the *undecorated* stream first), so every key-group can be
+/// decompressed independently — which is what makes seeking to a single key-group possible.
+/// `SnappyStreamCompressionDecorator` uses `SnappyFramedOutputStream`, i.e. the Snappy *framed*
+/// format that [`snap::read::FrameDecoder`] reads.
+///
+/// `buf` is reused across calls so a streaming reader keeps a bounded footprint.
+pub fn key_group_block<'a>(
+    raw: &'a [u8],
+    compressed: bool,
+    buf: &'a mut Vec<u8>,
+) -> std::io::Result<&'a [u8]> {
+    if !compressed {
+        return Ok(raw);
+    }
+    use std::io::Read;
+    buf.clear();
+    snap::read::FrameDecoder::new(raw).read_to_end(buf)?;
+    Ok(buf.as_slice())
+}
+
 /// Compute the number of key-group prefix bytes from maxParallelism.
 ///
 /// Matches Flink's `KeyGroupPrefixBytes.computeRequiredBytesInKeyGroupPrefix`.
@@ -621,7 +686,7 @@ fn key_group_prefix_bytes(max_parallelism: i32) -> usize {
 /// here; typed decoding lives in `parser::value` (the single decode source of truth).
 pub fn extract_keyed_entries(
     data: &[u8],
-    offsets: &[i64],
+    kg: &crate::parser::state_handle::KeyGroupsStateHandle,
     num_states: usize,
     key_type: &str,
     header_size: usize,
@@ -630,6 +695,7 @@ pub fn extract_keyed_entries(
     key_pojo: Option<&crate::parser::pojo::PojoInfo>,
 ) -> Vec<KeyedEntry> {
     let kg_prefix_len = key_group_prefix_bytes(max_parallelism);
+    let offsets = &kg.offsets;
 
     // Check if offsets are valid: at least one offset points past the header
     let has_valid_offsets = offsets
@@ -655,15 +721,24 @@ pub fn extract_keyed_entries(
                 continue;
             }
 
+            // `i` indexes this subtask's key-group range, so the absolute key-group is
+            // `start_key_group + i` (Flink: `KeyGroupRangeOffsets` is built over
+            // `computeKeyGroupRangeForOperatorIndex(maxParallelism, parallelism, subtask)`).
+            // Reporting `i` was only correct for the subtask whose range starts at 0.
+            let absolute_kg = (kg.start_key_group + i as i32).max(0) as u16;
+
             parse_key_group_block(
                 &data[start..end],
-                i as u16,
-                num_states,
-                key_type,
-                kg_prefix_len,
-                key_pojo,
-                state_types,
-                &mut entries,
+                absolute_kg,
+                &KeyGroupParse {
+                    num_states,
+                    key_type,
+                    kg_prefix_len,
+                    key_pojo,
+                    state_types,
+                    only_state: None,
+                },
+                &mut |e| entries.push(e),
             );
         }
         entries
@@ -675,16 +750,41 @@ pub fn extract_keyed_entries(
     }
 }
 
-fn parse_key_group_block(
+/// Parse one key-group block, emitting every entry through `emit`.
+///
+/// `only_state` restricts parsing to a single stateId: other states' entries are skipped using
+/// their length prefixes without decoding their keys or copying their values, which is what makes
+/// exporting one state cheap on a savepoint holding many.
+pub struct KeyGroupParse<'a> {
+    /// Number of keyed states declared in the header (diagnostic only; the stateId space is
+    /// shared with priority-queue states, so it does not bound parsing).
+    pub num_states: usize,
+    /// Key serializer type, e.g. `String`, `Long`, `Pojo`.
+    pub key_type: &'a str,
+    /// Key-group prefix width, 1 or 2 bytes depending on maxParallelism.
+    pub kg_prefix_len: usize,
+    /// Key POJO layout, when the key is a POJO.
+    pub key_pojo: Option<&'a crate::parser::pojo::PojoInfo>,
+    /// State type per stateId ("VALUE", "MAP", "TIMER", …).
+    pub state_types: &'a [String],
+    /// Restrict parsing to a single stateId.
+    pub only_state: Option<u16>,
+}
+
+pub fn parse_key_group_block(
     data: &[u8],
     kg_index: u16,
-    num_states: usize,
-    key_type: &str,
-    kg_prefix_len: usize,
-    key_pojo: Option<&crate::parser::pojo::PojoInfo>,
-    state_types: &[String],
-    entries: &mut Vec<KeyedEntry>,
+    ctx: &KeyGroupParse<'_>,
+    emit: &mut dyn FnMut(KeyedEntry),
 ) {
+    let KeyGroupParse {
+        num_states,
+        key_type,
+        kg_prefix_len,
+        key_pojo,
+        state_types,
+        only_state,
+    } = *ctx;
     // Canonical savepoint format (FullSnapshotAsyncWriter):
     // Per state: [short: stateId] then entries...
     // Per entry: [int: keyLen][keyBytes: kgPrefix+key+namespace][int: valueLen][valueBytes]
@@ -732,12 +832,18 @@ fn parse_key_group_block(
                 return;
             }
 
+            // Entries of a state we were not asked for are skipped without decoding the key or
+            // copying the value: only the length prefixes are followed.
+            let wanted = only_state.is_none_or(|s| s == state_id);
+
             // Timer (priority-queue) entries have a different key layout and no value; synthesize
             // the firing timestamp as the value so it can be displayed.
             let is_timer = state_types
                 .get(state_id as usize)
                 .map_or(false, |t| t == "TIMER");
-            let (key, namespace, timer_value) = if is_timer {
+            let (key, namespace, timer_value) = if !wanted {
+                (String::new(), Vec::new(), None)
+            } else if is_timer {
                 let (k, ts) = read_timer_key(&data[key_start..key_end], kg_prefix_len, key_type);
                 (k, Vec::new(), Some(ts))
             } else {
@@ -760,10 +866,14 @@ fn parse_key_group_block(
             if vl < 0 || pos + vl as usize > data.len() {
                 return;
             }
+            if !wanted {
+                pos += vl as usize;
+                continue;
+            }
             let value = timer_value.unwrap_or_else(|| data[pos..pos + vl as usize].to_vec());
             pos += vl as usize;
 
-            entries.push(KeyedEntry {
+            emit(KeyedEntry {
                 state_id,
                 key,
                 key_group: kg_index,
