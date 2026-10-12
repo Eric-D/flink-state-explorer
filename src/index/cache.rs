@@ -5,6 +5,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::IndexError;
 
+/// Bumped whenever a cache written by an older build would hold values this build computes
+/// differently, even though the struct layout still decodes. A mismatch (or a cache from before
+/// this field existed, which fails to decode) falls back to a full rebuild.
+///
+/// 1: `KeyPartition.key_group` became the **absolute** key-group instead of the index within the
+///    subtask's range.
+pub const CACHE_FORMAT: u32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IndexCache {
     pub metadata_size: u64,
@@ -13,6 +21,9 @@ pub struct IndexCache {
     pub savepoint_version: u32,
     pub master_states: Vec<String>,
     pub operators: Vec<CachedOperator>,
+    /// See [`CACHE_FORMAT`]. Last field so that a cache written before it existed hits EOF on
+    /// decode and is rebuilt rather than silently mis-read.
+    pub cache_format: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -216,6 +227,7 @@ pub fn load_cache(
 
     if cache.metadata_size != current_metadata_size
         || cache.metadata_mtime != current_metadata_mtime
+        || cache.cache_format != CACHE_FORMAT
     {
         return Err(IndexError::StaleCache);
     }
