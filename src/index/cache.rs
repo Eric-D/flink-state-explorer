@@ -16,7 +16,10 @@ use crate::error::IndexError;
 ///    is checked before the body is decoded.
 /// 3: past `MAX_STORED_PARTITIONS` keys, the stored keys are shared between subtasks instead of
 ///    coming from the first subtasks only.
-pub const CACHE_FORMAT: u32 = 3;
+/// 4: operator-state elements are decoded from file-backed and compressed streams too (they were
+///    `name[i]` placeholders and hex previews), and keep no copy of their bytes
+///    ([`ValueRef::Decoded`]).
+pub const CACHE_FORMAT: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IndexCache {
@@ -243,6 +246,9 @@ pub enum ValueRef {
     File { path: String, offset: u64 },
     /// Value is inline in the metadata (canonical savepoint format).
     Inline { data: Vec<u8> },
+    /// The value was decoded into the entry's `key` label when indexing, and its bytes are not
+    /// kept (operator-state elements: nothing reads them back, and a stream can hold millions).
+    Decoded,
 }
 
 pub const CACHE_FILE_NAME: &str = ".flink-explorer-cache";

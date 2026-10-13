@@ -2,6 +2,7 @@ pub mod java_deser;
 pub mod kafka;
 pub mod keyed_state;
 pub mod metadata;
+pub mod operator_state;
 pub mod pojo;
 pub mod state_handle;
 pub mod value;
