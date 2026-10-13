@@ -9,10 +9,11 @@ use std::io::Read;
 use std::path::Path;
 
 use common::synth::{self, Item, KeyedOperator, Kind, RunOrder, Ser, Spec, Storage, TempDir, Val};
-use flink_explorer::export_state::{export_state_ndjson, list_states};
+use flink_explorer::export_state::{export_state_ndjson, list_states, ExportStats};
 use flink_explorer::index::builder::build_index;
 use flink_explorer::parser;
 use flink_explorer::parser::state_handle::{StateHandle, StreamStateHandle};
+use flink_explorer::parser::value::decode_state_value;
 use serde_json::{json, Value};
 
 const LAYOUTS: [(Storage, bool); 4] = [
@@ -35,16 +36,29 @@ fn spec_with(op: &KeyedOperator, storage: Storage, compressed: bool) -> Spec {
     spec
 }
 
-fn rows(dir: &Path, state: &str) -> Vec<Value> {
+/// Export `state` as NDJSON and return its rows, with what the export reports.
+fn rows_and_stats(dir: &Path, state: &str) -> (Vec<Value>, ExportStats) {
     let savepoint =
         parser::parse_metadata(&dir.join("_metadata")).expect("synthetic _metadata parses");
     let mut out = Vec::new();
-    export_state_ndjson(&savepoint, dir, None, state, None, &mut out).expect("export");
-    String::from_utf8(out)
+    let stats = export_state_ndjson(&savepoint, dir, None, state, None, &mut out).expect("export");
+    let rows = String::from_utf8(out)
         .unwrap()
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
-        .collect()
+        .collect();
+    (rows, stats)
+}
+
+/// The rows of `state`, from a savepoint whose every key-group must read to its end mark.
+fn rows(dir: &Path, state: &str) -> Vec<Value> {
+    let (rows, stats) = rows_and_stats(dir, state);
+    assert_eq!(
+        stats.malformed_key_groups, 0,
+        "state {}: {:?}",
+        state, stats.first_malformed
+    );
+    rows
 }
 
 /// Epoch milliseconds as the explorer renders a Date: `YYYY-MM-DDTHH:MM:SS.mmmZ`. Written out
@@ -336,4 +350,384 @@ fn iso_millis_matches_known_dates() {
         "2026-10-13T00:00:00.000Z"
     );
     assert_eq!(iso_millis(951_782_400_123), "2000-02-29T00:00:00.123Z");
+}
+
+/// Raw entries per state, as the index counts them (`StateDescriptor::entry_count`).
+fn item_counts(op: &KeyedOperator) -> Vec<usize> {
+    (0..op.states.len())
+        .map(|s| op.items.iter().filter(|it| it.state() == s).count())
+        .collect()
+}
+
+#[test]
+fn long_keys_and_long_map_user_keys_survive_on_both_paths() {
+    // Issue #15: a key over 10,000 bytes ended its key-group's parse, dropping its own entries
+    // and every later one of that key-group, for every state, on the index and on the export.
+    // maxParallelism 32768: 2-byte key-group prefixes, all the way up to key-group 32767.
+    let mut op = KeyedOperator::new(0x15, 2, 32768, Ser::String)
+        .state("long-label", Kind::Value(Ser::String))
+        .state("long-stats", Kind::Map(Ser::String, Ser::Long))
+        .state("long-counter", Kind::Value(Ser::Long));
+    let mut keys: Vec<String> = (0..150).map(|i| format!("key-{:07}", i)).collect();
+    // VALUE entry keys of exactly 10,000, 10,001 and 12,000 bytes: a 2-byte key-group prefix,
+    // the StringValue (2-byte length, then one byte per ASCII char) and the VoidNamespace byte.
+    for (c, total) in [("a", 10_000usize), ("b", 10_001), ("c", 12_000)] {
+        keys.push(c.repeat(total - 5));
+    }
+    // A key Flink assigns to the last key-group, 0x7FFF: its flagged key starts with 0xFF.
+    let last_kg_key = (0..)
+        .map(|i| format!("last-kg-{}", i))
+        .find(|k| synth::key_group_for_hash(synth::java_string_hash(k), 32768) == 32767)
+        .unwrap();
+    keys.push(last_kg_key.clone());
+
+    let long_user_key = "u".repeat(12_000);
+    for (i, k) in keys.iter().enumerate() {
+        op.items.push(Item::Value {
+            state: 0,
+            key: Val::str(k),
+            value: Val::Str(format!("v{}", i)),
+        });
+        // Every 10th key (and the long ones) holds a 12,000-byte map key *mid-run*, between two
+        // short ones, so its run and the next state's run go on after it.
+        let user_keys = if i % 10 == 0 || k.len() > 1000 {
+            vec!["first", long_user_key.as_str(), "last"]
+        } else {
+            vec!["only"]
+        };
+        for (j, uk) in user_keys.into_iter().enumerate() {
+            op.items.push(Item::MapEntry {
+                state: 1,
+                key: Val::str(k),
+                map_key: Val::str(uk),
+                value: Some(Val::Long((i * 10 + j) as i64)),
+            });
+        }
+        op.items.push(Item::Value {
+            state: 2,
+            key: Val::str(k),
+            value: Val::Long(i as i64),
+        });
+    }
+    let mut spec = Spec::new(Storage::Files);
+    spec.operators.push(op.clone());
+    let dir = write(&spec, "issue15");
+
+    // Export path: every row of every state.
+    for (i, name) in ["long-label", "long-stats", "long-counter"]
+        .iter()
+        .enumerate()
+    {
+        assert_eq!(
+            projected(&rows(&dir, name)),
+            expected_rows(&op, i),
+            "state {}",
+            name
+        );
+    }
+    let last = rows(&dir, "long-counter")
+        .into_iter()
+        .find(|r| r["key"] == last_kg_key.as_str())
+        .expect("the key-group 32767 row");
+    assert_eq!(last["key_group"], 32767);
+
+    // Index path: every entry, every key, every value.
+    let savepoint = parser::parse_metadata(&dir.join("_metadata")).unwrap();
+    let index = build_index(&savepoint, 0, 0, &dir);
+    let ks = index.operators[0].keyed_state.as_ref().unwrap();
+    assert_eq!(ks.malformed_key_groups, 0, "{:?}", ks.first_malformed);
+    assert_eq!(ks.total_keys, keys.len());
+    let counts: Vec<usize> = ks.descriptors.iter().map(|d| d.entry_count).collect();
+    assert_eq!(counts, item_counts(&op));
+    for (i, k) in keys.iter().enumerate() {
+        let p = ks
+            .partitions
+            .iter()
+            .find(|p| &p.key == k)
+            .unwrap_or_else(|| panic!("key of {} chars not indexed", k.len()));
+        let w = p.values[2].as_deref().expect("a w value");
+        assert_eq!(decode_state_value(w, "Long", None, None), json!(i as i64));
+    }
+    let p = ks.partitions.iter().find(|p| p.key == last_kg_key).unwrap();
+    assert_eq!(p.key_group, 32767);
+}
+
+#[test]
+fn a_header_over_50_kb_lists_every_state_on_both_paths() {
+    // Issue #17: the header extractors stopped at byte 50,000, so every state registered past it
+    // vanished from --list-states, the index (TUI, `i` panel, export.json) and --export-state.
+    let mut op = KeyedOperator::new(0x17, 2, 128, Ser::String);
+    let kind = |i: usize| match i % 3 {
+        0 => Kind::Value(Ser::Long),
+        1 => Kind::Map(Ser::String, Ser::Long),
+        _ => Kind::List(Ser::Long),
+    };
+    for i in 0..320 {
+        op = op.state(&format!("wide-{:03}", i), kind(i));
+    }
+    op = op.state("_timer_state/processing_user-timers", Kind::Timer);
+    let header_len = synth::header_bytes(op.key, &op.states, false).len();
+    assert!(header_len > 50_000, "header of {} bytes", header_len);
+
+    // Data in the first states and in the last ones, past 50 KB of header.
+    for k in 0..40i64 {
+        let key = Val::Str(format!("key-{:03}", k));
+        op.items.push(Item::Value {
+            state: 0,
+            key: key.clone(),
+            value: Val::Long(k),
+        });
+        op.items.push(Item::MapEntry {
+            state: 316,
+            key: key.clone(),
+            map_key: Val::str("m"),
+            value: Some(Val::Long(-k)),
+        });
+        op.items.push(Item::List {
+            state: 317,
+            key: key.clone(),
+            values: vec![Val::Long(k), Val::Long(k + 1)],
+        });
+        op.items.push(Item::Value {
+            state: 318,
+            key: key.clone(),
+            value: Val::Long(k * 1000),
+        });
+        op.items.push(Item::Timer {
+            state: 320,
+            key,
+            timestamp: 1_700_000_000_000 + k,
+        });
+    }
+    let expected_states: Vec<(String, String)> = op
+        .states
+        .iter()
+        .map(|s| {
+            let ty = match s.kind {
+                Kind::Value(_) => "VALUE",
+                Kind::Map(..) => "MAP",
+                Kind::List(_) => "LIST",
+                Kind::Timer => "TIMER",
+            };
+            (s.name.clone(), ty.to_string())
+        })
+        .collect();
+
+    for (storage, compressed) in [(Storage::Files, false), (Storage::Inline, true)] {
+        let mut spec = Spec::new(storage);
+        spec.compressed = compressed;
+        spec.operators.push(op.clone());
+        let dir = write(&spec, "issue17");
+        let layout = format!("{:?}, compressed {}", storage, compressed);
+
+        let savepoint = parser::parse_metadata(&dir.join("_metadata")).unwrap();
+        let listed: Vec<(String, String)> = list_states(&savepoint, &dir)
+            .into_iter()
+            .map(|(_, name, ty)| (name, ty))
+            .collect();
+        assert_eq!(listed, expected_states, "{}", layout);
+
+        let index = build_index(&savepoint, 0, 0, &dir);
+        let ks = index.operators[0].keyed_state.as_ref().unwrap();
+        let described: Vec<(String, String)> = ks
+            .descriptors
+            .iter()
+            .map(|d| (d.name.clone(), d.state_type.clone()))
+            .collect();
+        assert_eq!(described, expected_states, "{}", layout);
+        let counts: Vec<usize> = ks.descriptors.iter().map(|d| d.entry_count).collect();
+        assert_eq!(counts, item_counts(&op), "{}", layout);
+        assert_eq!(ks.descriptors[318].value_type, "Long", "{}", layout);
+        assert_eq!(ks.total_keys, 40, "{}", layout);
+
+        for (id, name) in [(0, "wide-000"), (316, "wide-316"), (317, "wide-317")] {
+            assert_eq!(
+                projected(&rows(&dir, name)),
+                expected_rows(&op, id),
+                "{} {}",
+                layout,
+                name
+            );
+        }
+        assert_eq!(
+            projected(&rows(&dir, "wide-318")),
+            expected_rows(&op, 318),
+            "{}",
+            layout
+        );
+    }
+}
+
+#[test]
+fn the_index_reads_its_header_from_the_header_only() {
+    // Issue #17: on the index path the header extractors ran over the whole state file, so state
+    // *values* that happen to look like a StateMetaInfoSnapshot were taken for states. This value
+    // spells `[utf "phantom"][int KEY_VALUE][int 1 option][utf KEYED_STATE_TYPE][utf VALUE]`
+    // (a StringValue writes chars below 0x80 as single bytes, U+0000 included).
+    let mut fake = vec![0u8, 7];
+    fake.extend_from_slice(b"phantom");
+    fake.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 1, 0, 16]);
+    fake.extend_from_slice(b"KEYED_STATE_TYPE");
+    fake.extend_from_slice(&[0, 5]);
+    fake.extend_from_slice(b"VALUE");
+    let fake: String = fake.into_iter().map(char::from).collect();
+
+    let mut op =
+        KeyedOperator::new(0x18, 2, 128, Ser::String).state("note", Kind::Value(Ser::String));
+    for k in 0..20 {
+        op.items.push(Item::Value {
+            state: 0,
+            key: Val::Str(format!("key-{}", k)),
+            value: Val::Str(fake.clone()),
+        });
+    }
+    let mut spec = Spec::new(Storage::Files);
+    spec.operators.push(op.clone());
+    let dir = write(&spec, "header-only");
+
+    let savepoint = parser::parse_metadata(&dir.join("_metadata")).unwrap();
+    let listed: Vec<String> = list_states(&savepoint, &dir)
+        .into_iter()
+        .map(|(_, name, _)| name)
+        .collect();
+    assert_eq!(listed, ["note"]);
+    let index = build_index(&savepoint, 0, 0, &dir);
+    let ks = index.operators[0].keyed_state.as_ref().unwrap();
+    let names: Vec<&str> = ks.descriptors.iter().map(|d| d.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["note"],
+        "the index must see the states list_states sees"
+    );
+    assert_eq!(ks.descriptors[0].entry_count, 20);
+    assert_eq!(projected(&rows(&dir, "note")), expected_rows(&op, 0));
+}
+
+#[test]
+fn a_state_name_is_found_at_its_own_record() {
+    // Each state's serializers are read after its name. The name used to be located by its first
+    // byte match anywhere in the header, and "m" first matches inside the key serializer's class
+    // name (`org.apache.flink.api.common…`), so its MAP value type was misread. Names are now
+    // located at their `StateMetaInfoSnapshot` (the same single pass that finds the state count).
+    let mut op = KeyedOperator::new(0x19, 1, 128, Ser::String)
+        .state("m", Kind::Map(Ser::String, Ser::Long))
+        .state("a", Kind::Value(Ser::Long));
+    for k in 0..10 {
+        let key = Val::Str(format!("key-{}", k));
+        op.items.push(Item::MapEntry {
+            state: 0,
+            key: key.clone(),
+            map_key: Val::str("clicks"),
+            value: Some(Val::Long(k)),
+        });
+        op.items.push(Item::Value {
+            state: 1,
+            key,
+            value: Val::Long(-k),
+        });
+    }
+    let mut spec = Spec::new(Storage::Inline);
+    spec.operators.push(op.clone());
+    let dir = write(&spec, "short-names");
+
+    let savepoint = parser::parse_metadata(&dir.join("_metadata")).unwrap();
+    let index = build_index(&savepoint, 0, 0, &dir);
+    let ks = index.operators[0].keyed_state.as_ref().unwrap();
+    let types: Vec<&str> = ks
+        .descriptors
+        .iter()
+        .map(|d| d.value_type.as_str())
+        .collect();
+    assert_eq!(types, ["Map<String,Long>", "Long"]);
+    assert_eq!(projected(&rows(&dir, "m")), expected_rows(&op, 0));
+    assert_eq!(projected(&rows(&dir, "a")), expected_rows(&op, 1));
+}
+
+#[test]
+fn a_malformed_key_group_is_reported_by_the_export_the_index_and_the_cli() {
+    // Issue #15: a key-group that cannot be read to its end mark used to end the parse silently,
+    // passing a partial read off as the whole state.
+    let op = synth::sample_operator(300);
+    let mut spec = Spec::new(Storage::Files);
+    spec.operators.push(op.clone());
+    let dir = synth::temp_dir("malformed");
+    let written = synth::write_savepoint(&spec, &dir);
+
+    // Corrupt one key-group of subtask 0 in place — the file keeps its length — by giving its
+    // first entry a value length that runs past the block: `[short stateId][int keyLen][key]
+    // [int valueLen]`.
+    let savepoint = parser::parse_metadata(&dir.join("_metadata")).unwrap();
+    let StateHandle::KeyGroups(kg) = &savepoint.operators[0].subtask_states[0].managed_keyed_state
+    else {
+        panic!("keyed state expected");
+    };
+    let (i, offset) = kg
+        .offsets
+        .iter()
+        .enumerate()
+        .filter(|(_, &o)| o > 0)
+        .nth(3)
+        .expect("a fourth non-empty key-group");
+    let bad_kg = (kg.start_key_group + i as i32) as i64;
+    let (_, _, path) = written
+        .state_files
+        .iter()
+        .find(|(o, s, _)| *o == 0 && *s == 0)
+        .unwrap();
+    let mut bytes = std::fs::read(path).unwrap();
+    let at = *offset as usize;
+    let key_len = i32::from_be_bytes(bytes[at + 2..at + 6].try_into().unwrap()) as usize;
+    let value_len_at = at + 6 + key_len;
+    bytes[value_len_at..value_len_at + 4].copy_from_slice(&0x7fff_0000i32.to_be_bytes());
+    std::fs::write(path, &bytes).unwrap();
+
+    // Export: the key-group is counted and named; only its rows are missing.
+    let (got, stats) = rows_and_stats(&dir, "counter");
+    assert_eq!(stats.malformed_key_groups, 1, "{:?}", stats);
+    let first = stats.first_malformed.clone().unwrap();
+    assert!(
+        first.starts_with(&format!("subtask 0, key-group {}: truncated", bad_kg)),
+        "{}",
+        first
+    );
+    let expected: BTreeSet<String> = expected_rows(&op, 0)
+        .into_iter()
+        .filter(|r| serde_json::from_str::<Value>(r).unwrap()["key_group"] != bad_kg)
+        .collect();
+    assert!(expected.len() < 300, "the bad key-group held rows");
+    assert_eq!(projected(&got), expected);
+
+    // Index: the same key-group, counted across subtasks, and shown in the `i` panel.
+    let index = build_index(&savepoint, 0, 0, &dir);
+    let ks = index.operators[0].keyed_state.as_ref().unwrap();
+    assert_eq!(ks.malformed_key_groups, 1);
+    let first = ks.first_malformed.as_deref().unwrap();
+    assert!(
+        first.starts_with(&format!("key-group {}: truncated", bad_kg)),
+        "{}",
+        first
+    );
+    assert_eq!(ks.total_keys, expected.len());
+    assert!(index.operators[0]
+        .info_lines()
+        .iter()
+        .any(|(k, v)| k == "Malformed key-groups" && v.starts_with("1 ")));
+
+    // CLI: the rows still go out, with a warning on stderr.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_flink-explorer"))
+        .arg(&dir)
+        .args(["--export-state", "counter", "-o", "-"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).lines().count(),
+        got.len()
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Warning: 1 malformed key-group(s)") && stderr.contains("truncated"),
+        "{}",
+        stderr
+    );
 }

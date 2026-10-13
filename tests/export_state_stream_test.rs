@@ -205,3 +205,40 @@ fn peak_block_is_one_key_group_not_the_whole_stream() {
         metadata_len
     );
 }
+
+#[test]
+fn every_key_group_flink_wrote_reads_to_its_end_mark() {
+    // Runs end on Flink's metadata-follows flag; on blocks Flink wrote, every run is flagged and
+    // every key-group ends with END_OF_KEY_GROUP_MARK, so nothing may be reported as malformed —
+    // plain or Snappy-compressed, on the export path or the index path.
+    for dir in [SAVEPOINT_DIR, "tests/fixtures/savepoint-compressed"] {
+        let dir = Path::new(dir);
+        let sp = parser::parse_metadata(&dir.join("_metadata")).expect("parse metadata");
+        let states = list_states(&sp, dir);
+        assert!(!states.is_empty(), "{}", dir.display());
+        for (op, name, _) in &states {
+            let stats = export_state_ndjson(&sp, dir, Some(op), name, None, &mut std::io::sink())
+                .unwrap_or_else(|e| panic!("export {}: {}", name, e));
+            assert_eq!(
+                (stats.malformed_key_groups, stats.first_malformed),
+                (0, None),
+                "{} {}/{}",
+                dir.display(),
+                op,
+                name
+            );
+        }
+        let index = build_index(&sp, 0, 0, dir);
+        for op in &index.operators {
+            if let Some(ks) = &op.keyed_state {
+                assert_eq!(
+                    (ks.malformed_key_groups, &ks.first_malformed),
+                    (0, &None),
+                    "{} {}",
+                    dir.display(),
+                    op.operator_id_hex()
+                );
+            }
+        }
+    }
+}

@@ -23,8 +23,9 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 
 use crate::parser::keyed_state::{
-    extract_state_metadata, extract_value_pojo_classes, extract_value_serializer_types,
-    key_group_block, parse_key_group_block, read_keyed_stream_header, KeyGroupParse,
+    count_states_in_header, extract_state_metadata, extract_value_pojo_classes,
+    extract_value_serializer_types, key_group_block, parse_key_group_block,
+    read_keyed_stream_header, KeyGroupParse,
 };
 use crate::parser::metadata::{Operator, Savepoint};
 use crate::parser::pojo::{extract_pojo_infos, PojoInfo};
@@ -44,6 +45,11 @@ pub struct ExportStats {
     pub max_block_bytes: usize,
     /// True when the savepoint was written with per-key-group snapshot compression.
     pub compressed: bool,
+    /// Key-groups that could not be read to their end mark (truncated, a bad length, an unknown
+    /// stateId): the rows read before the defect are exported, the rest of that key-group is not.
+    pub malformed_key_groups: usize,
+    /// The first of them, as `subtask N, key-group K: <defect>`.
+    pub first_malformed: Option<String>,
 }
 
 /// A keyed state located in the savepoint, with everything needed to decode its values.
@@ -258,8 +264,8 @@ fn resolve_state(header: &[u8], state_name: &str) -> Option<ResolvedState> {
     let idx = metas.iter().position(|m| m.name == state_name)?;
     let meta = &metas[idx];
 
-    let value_types = extract_value_serializer_types(header);
-    let value_pojo_classes = extract_value_pojo_classes(header);
+    let value_types = extract_value_serializer_types(header, &metas);
+    let value_pojo_classes = extract_value_pojo_classes(header, &metas);
     let pojo_infos = extract_pojo_infos(header);
 
     let is_timer = meta.state_type == "TIMER";
@@ -287,9 +293,7 @@ fn resolve_state(header: &[u8], state_name: &str) -> Option<ResolvedState> {
         None
     };
     let state_types: Vec<String> = metas.iter().map(|m| m.state_type.clone()).collect();
-    let num_states = crate::parser::keyed_state::count_states_in_header(header)
-        .max(metas.len())
-        .max(1);
+    let num_states = count_states_in_header(header, &metas);
 
     let (map_key_type, map_value_type) = if meta.state_type == "MAP" {
         crate::parser::value::split_map_types(&value_type)
@@ -644,7 +648,7 @@ pub fn export_state_rows<S: RowSink + ?Sized>(
             let absolute_kg = (kg.start_key_group + i as i32) as u16;
 
             let mut err: Option<String> = None;
-            parse_key_group_block(
+            let parsed = parse_key_group_block(
                 block,
                 absolute_kg,
                 &KeyGroupParse {
@@ -720,6 +724,17 @@ pub fn export_state_rows<S: RowSink + ?Sized>(
             );
             if let Some(e) = err {
                 return Err(e);
+            }
+            // The rows read before the defect are out; the rest of this key-group cannot be
+            // located. Count it so the caller can say the export is incomplete.
+            if let Err(defect) = parsed {
+                stats.malformed_key_groups += 1;
+                stats.first_malformed.get_or_insert_with(|| {
+                    format!(
+                        "subtask {}, key-group {}: {}",
+                        subtask_index, absolute_kg, defect
+                    )
+                });
             }
         }
     }

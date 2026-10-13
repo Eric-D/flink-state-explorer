@@ -2,8 +2,8 @@ use std::borrow::Cow;
 use std::path::Path;
 
 use crate::parser::keyed_state::{
-    count_states_in_header, extract_keyed_entries, extract_state_metadata,
-    extract_value_serializer_types,
+    count_states_in_header, extract_key_pojo_info, extract_keyed_entries, extract_state_metadata,
+    extract_value_pojo_classes, extract_value_serializer_types,
 };
 use crate::parser::metadata::{Operator, Savepoint, SubtaskState};
 use crate::parser::operator_state::OperatorStreamElements;
@@ -208,6 +208,10 @@ where
 /// here: `build_cached_operator` takes them from every subtask, with [`spread_quotas`].
 fn merge_keyed_state(acc: &mut CachedKeyedState, other: CachedKeyedState) {
     acc.total_keys += other.total_keys;
+    acc.malformed_key_groups += other.malformed_key_groups;
+    if acc.first_malformed.is_none() {
+        acc.first_malformed = other.first_malformed;
+    }
     for od in &other.descriptors {
         if let Some(d) = acc.descriptors.iter_mut().find(|d| d.name == od.name) {
             d.entry_count += od.entry_count;
@@ -468,30 +472,38 @@ where
     };
     crate::state_file::check_offsets(&what, &kg.offsets, kg.start_key_group, data.len() as u64)?;
 
-    let state_metas = extract_state_metadata(&data);
+    // The header ends where the first key-group begins. Every header extractor gets that slice
+    // and nothing more: handed the whole state file they scanned key-group bytes as if they were
+    // serializer snapshots (and `extract_pojo_infos`, uncapped, scanned every byte of it).
+    let header_size = header_size_from_offsets(&kg.offsets, data.len());
+    let header = &data[..header_size];
+
+    let state_metas = extract_state_metadata(header);
     if state_metas.is_empty() {
         return Ok(None);
     }
 
-    let pojo_infos = extract_pojo_infos(&data);
-    let value_types = extract_value_serializer_types(&data);
-    let value_pojo_classes = crate::parser::keyed_state::extract_value_pojo_classes(&data);
-    let num_states = count_states_in_header(&data).max(state_metas.len()).max(1);
+    let pojo_infos = extract_pojo_infos(header);
+    let value_types = extract_value_serializer_types(header, &state_metas);
+    let value_pojo_classes = extract_value_pojo_classes(header, &state_metas);
+    let num_states = count_states_in_header(header, &state_metas);
     let key_type = state_metas
         .first()
         .map(|m| m.key_type.as_str())
         .unwrap_or("String");
-    let header_size = header_size_from_offsets(&kg.offsets, data.len());
     let state_type_strs: Vec<String> = state_metas.iter().map(|m| m.state_type.clone()).collect();
 
     // Extract POJO info for the key serializer (if key is a POJO)
     let key_pojo = if key_type == "Pojo" {
-        crate::parser::keyed_state::extract_key_pojo_info(&data)
+        extract_key_pojo_info(header)
     } else {
         None
     };
 
-    let keyed_entries = extract_keyed_entries(
+    let crate::parser::keyed_state::KeyedEntries {
+        entries: keyed_entries,
+        malformed,
+    } = extract_keyed_entries(
         &data,
         kg,
         num_states,
@@ -637,16 +649,11 @@ where
         partitions,
         total_keys,
         key_type: key_type.to_string(),
+        malformed_key_groups: malformed.len(),
+        first_malformed: malformed.first().map(|m| m.to_string()),
     }))
 }
 
-/// Derive header size from the key-group offsets array.
-///
-/// The smallest offset > 0 is where the first key-group data block starts,
-/// which is exactly the byte after the header. This is far more reliable
-/// than scanning for marker strings in the header.
-///
-/// Falls back to `data_len` (= no key-group data) if all offsets are 0.
 fn pojo_to_cached(p: &crate::parser::pojo::PojoInfo) -> CachedPojoInfo {
     CachedPojoInfo {
         class_name: p.class_name.clone(),
@@ -680,6 +687,13 @@ fn keyed_state_handle_size(handle: &StateHandle) -> u64 {
     }
 }
 
+/// Derive header size from the key-group offsets array.
+///
+/// The smallest offset > 0 is where the first key-group data block starts,
+/// which is exactly the byte after the header. This is far more reliable
+/// than scanning for marker strings in the header.
+///
+/// Falls back to `data_len` (= no key-group data) if all offsets are 0.
 fn header_size_from_offsets(offsets: &[i64], data_len: usize) -> usize {
     offsets
         .iter()
@@ -771,19 +785,20 @@ fn extract_entries_from_handle(handle: &StateHandle) -> Vec<CachedEntry> {
 }
 
 fn entries_from_key_groups(kg: &KeyGroupsStateHandle) -> Vec<CachedEntry> {
-    // Extract real state names and types from the inline data header
-    let state_metas = match &kg.delegate_handle {
-        StreamStateHandle::ByteStream(bs) => extract_state_metadata(&bs.data),
-        _ => Vec::new(),
+    // Extract real state names and types from the inline data header (only the header: it ends
+    // where the first key-group starts).
+    let header = match &kg.delegate_handle {
+        StreamStateHandle::ByteStream(bs) => {
+            &bs.data[..header_size_from_offsets(&kg.offsets, bs.data.len())]
+        }
+        _ => &[][..],
     };
+    let state_metas = extract_state_metadata(header);
 
     let mut entries = Vec::new();
 
     // Extract POJO infos for value type details
-    let pojo_infos = match &kg.delegate_handle {
-        StreamStateHandle::ByteStream(bs) => extract_pojo_infos(&bs.data),
-        _ => Vec::new(),
-    };
+    let pojo_infos = extract_pojo_infos(header);
 
     // If we found state metadata, create one entry per state with type info
     if !state_metas.is_empty() {
