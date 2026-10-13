@@ -8,15 +8,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with: { components: clippy, rustfmt }
+        with: { components: clippy, rustfmt, targets: x86_64-pc-windows-gnu }
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets    # sans -D warnings (lints de style préexistants)
       # The parquet sink is behind an optional feature, so nothing else here compiles it.
       - run: cargo check --features parquet --all-targets
+      # Windows is otherwise only built by release.yml, on a tag: catch cfg(windows) breaks here.
+      - run: cargo check --target x86_64-pc-windows-gnu --all-targets
       - run: cargo test --lib
-      - run: cargo test --test cache_test --test empty_map_test --test integration_test --test java_deser_test --test metadata_test --test state_handle_test --test kafka_test --test real_savepoint_test
+      - run: cargo test --test cache_test --test empty_map_test --test integration_test --test java_deser_test --test metadata_test --test state_handle_test --test kafka_test --test real_savepoint_test --test keyed_block_test --test synth_savepoint_test
 
   # Le générateur de fixtures Java n'était pas construit par la CI : un bump Dependabot
   # sur test-flink-job/pom.xml pouvait casser `mvn verify` sans qu'aucun check ne le voie.
