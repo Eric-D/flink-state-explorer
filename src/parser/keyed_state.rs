@@ -3,13 +3,21 @@
 //!
 //! Extracts state names and type information by scanning for the
 //! KEYED_STATE_TYPE option pattern in the serialized header.
+//!
+//! The header extractors (`extract_state_metadata`, `extract_value_serializer_types`, …) expect
+//! the **header only**: the bytes from offset 0 of the keyed stream up to the first key-group,
+//! whose offset `KeyGroupsStateHandle.offsets` records. Handed key-group bytes, they would scan
+//! them as if they were serializer snapshots.
 
 /// Flink `FullSnapshotUtil.END_OF_KEY_GROUP_MARK` — written (as a `short`) after the last state of
 /// a key group in a full/canonical snapshot.
 const END_OF_KEY_GROUP_MARK: u16 = 0xFFFF;
 
-/// Upper bound on a key-group stateId; beyond this we assume misalignment and stop the block.
-const MAX_PLAUSIBLE_STATE_ID: u16 = 1024;
+/// Flink `FullSnapshotUtil.FIRST_BIT_IN_BYTE_MASK` (`FullSnapshotUtil.java:27`, release-1.20): set
+/// on `key[0]` of the **last** entry of each state's run (`setMetaDataFollowsFlagInKey`), meaning
+/// "a `short` stateId — or `END_OF_KEY_GROUP_MARK` — follows this entry". `key[0]` is the high
+/// byte of the key-group prefix, which never uses that bit (maxParallelism ≤ 32768).
+const FIRST_BIT_IN_BYTE_MASK: u8 = 0x80;
 
 /// Metadata for a single keyed state within an operator.
 #[derive(Debug, Clone)]
@@ -21,7 +29,7 @@ pub struct KeyedStateMeta {
     pub key_type: String,
 }
 
-/// Extract state metadata from the inline keyed state data.
+/// Extract state metadata from a keyed stream's header (see the module doc: header bytes only).
 ///
 /// Scans for `KEYED_STATE_TYPE` patterns in the header and backtracks
 /// to find the corresponding state name and backend type.
@@ -35,8 +43,9 @@ pub fn extract_state_metadata(data: &[u8]) -> Vec<KeyedStateMeta> {
 
     let mut results = Vec::new();
 
-    // Find all occurrences of "KEYED_STATE_TYPE" in the data
-    let limit = data.len().min(50000);
+    // Find all occurrences of "KEYED_STATE_TYPE" in the header. The whole header is scanned:
+    // a fixed cap (it was 50 KB) silently dropped every state registered past it.
+    let limit = data.len();
     let mut search_from = 0;
 
     while search_from < limit.saturating_sub(needle.len()) {
@@ -133,32 +142,23 @@ pub fn extract_state_metadata(data: &[u8]) -> Vec<KeyedStateMeta> {
 /// Strategy: find each state name's position, find the value serializer
 /// snapshot class name that appears BEFORE the VoidNamespaceSerializerSnapshot
 /// following that state name.
-pub fn extract_value_serializer_types(data: &[u8]) -> Vec<String> {
+///
+/// `data` is the header only; `state_metas` is `extract_state_metadata(data)`, computed once by
+/// the caller and shared with the other extractors.
+pub fn extract_value_serializer_types(data: &[u8], state_metas: &[KeyedStateMeta]) -> Vec<String> {
     let ns_marker = b"VoidNamespaceSerializerSnapshot";
     let snap_marker = b"SerializerSnapshot";
-    let limit = data.len().min(50000);
+    let limit = data.len();
 
     // Find all VoidNS positions
-    let mut ns_positions = Vec::new();
-    let mut s = 0;
-    while s < limit.saturating_sub(ns_marker.len()) {
-        if let Some(p) = find_bytes(data, ns_marker, s, limit) {
-            ns_positions.push(p);
-            s = p + ns_marker.len();
-        } else {
-            break;
-        }
-    }
-
-    // Find state name positions (reuse the state metadata scan logic)
-    let state_metas = extract_state_metadata(data);
+    let ns_positions = find_all(data, ns_marker);
+    let name_positions = state_name_positions(data, state_metas);
 
     // For each state, find its name position, then the first VoidNS AFTER it
     let mut results = Vec::new();
 
-    for meta in &state_metas {
-        let name_bytes = meta.name.as_bytes();
-        let name_pos = match find_bytes(data, name_bytes, 0, limit) {
+    for name_pos in name_positions {
+        let name_pos = match name_pos {
             Some(p) => p,
             None => {
                 results.push("?".to_string());
@@ -231,26 +231,21 @@ pub fn extract_value_serializer_types(data: &[u8]) -> Vec<String> {
 /// unreliable because `extract_pojo_infos` deduplicates POJOs by class, so several states sharing
 /// a POJO type (e.g. `ValueState<SimpleEvent>` + `ListState<SimpleEvent>`) would otherwise exhaust
 /// a positional iterator and leave later states without their POJO info.
-pub fn extract_value_pojo_classes(data: &[u8]) -> Vec<Option<String>> {
+///
+/// `data` is the header only; `state_metas` is `extract_state_metadata(data)`.
+pub fn extract_value_pojo_classes(
+    data: &[u8],
+    state_metas: &[KeyedStateMeta],
+) -> Vec<Option<String>> {
     let ns_marker = b"VoidNamespaceSerializerSnapshot";
     let pojo_marker = b"PojoSerializerSnapshot";
-    let limit = data.len().min(50000);
+    let limit = data.len();
 
-    let mut ns_positions = Vec::new();
-    let mut s = 0;
-    while s < limit.saturating_sub(ns_marker.len()) {
-        if let Some(p) = find_bytes(data, ns_marker, s, limit) {
-            ns_positions.push(p);
-            s = p + ns_marker.len();
-        } else {
-            break;
-        }
-    }
+    let ns_positions = find_all(data, ns_marker);
 
-    let state_metas = extract_state_metadata(data);
     let mut results = Vec::with_capacity(state_metas.len());
-    for meta in &state_metas {
-        let name_pos = match find_bytes(data, meta.name.as_bytes(), 0, limit) {
+    for name_pos in state_name_positions(data, state_metas) {
+        let name_pos = match name_pos {
             Some(p) => p,
             None => {
                 results.push(None);
@@ -374,23 +369,105 @@ fn read_classname_ending_at(data: &[u8], end_pos: usize) -> Option<String> {
     None
 }
 
-/// Count the actual number of registered states by counting
-/// VoidNamespaceSerializerSnapshot occurrences in the header.
-/// This includes timer states that `extract_state_metadata` may miss.
-pub fn count_states_in_header(data: &[u8]) -> usize {
-    let marker = b"VoidNamespaceSerializerSnapshot";
-    let limit = data.len().min(50000);
-    let mut count = 0;
-    let mut s = 0;
-    while s < limit.saturating_sub(marker.len()) {
-        if let Some(p) = find_bytes(data, marker, s, limit) {
-            count += 1;
-            s = p + marker.len();
-        } else {
-            break;
-        }
+/// Number of states the header registers — keyed **and** priority-queue (timer) states, which
+/// share one stateId space in the key-groups — i.e. the bound on a key-group's stateIds.
+///
+/// `KeyedBackendSerializationProxy.write` (`KeyedBackendSerializationProxy.java:133`, release-1.20)
+/// writes that count as a `short` right after the key serializer snapshot, and the first
+/// `StateMetaInfoSnapshot` follows at once (`writeUTF(name)`, `writeInt(backendStateType)`,
+/// `writeInt(options.size())`: `StateMetaInfoSnapshotReadersWriters.java:109-111`). A serializer
+/// snapshot has no length prefix, so the `short` is found in front of the earliest state record.
+///
+/// The result is never below what the heuristics see — one `VoidNamespaceSerializerSnapshot` per
+/// state with a void namespace (timers included), and the states `extract_state_metadata` found
+/// (`state_metas`) — so a misread can only loosen the bound, never reject a valid stateId.
+pub fn count_states_in_header(data: &[u8], state_metas: &[KeyedStateMeta]) -> usize {
+    let void_namespaces = find_all(data, b"VoidNamespaceSerializerSnapshot").len();
+    declared_state_count(data, state_metas)
+        .unwrap_or(0)
+        .max(void_namespaces)
+        .max(state_metas.len())
+        .max(1)
+}
+
+/// The `short` state count of `KeyedBackendSerializationProxy`, read in front of the earliest
+/// `StateMetaInfoSnapshot` of a known state. `None` when no state record can be located.
+fn declared_state_count(data: &[u8], state_metas: &[KeyedStateMeta]) -> Option<usize> {
+    let first = meta_info_records(data, state_metas)
+        .into_iter()
+        .flatten()
+        .min()?;
+    // At the very least `[int version][bool compression][int proxy version]` precede the key
+    // serializer snapshot, and the count sits between that snapshot and the first record.
+    if first < 9 + 2 {
+        return None;
     }
-    count
+    Some(u16::from_be_bytes([data[first - 2], data[first - 1]]) as usize)
+}
+
+/// Where each state's `StateMetaInfoSnapshot` starts, in `state_metas` order: the first
+/// `[u16 len][name][int backendStateType][int numOptions]` whose backend state type is an
+/// ordinal of `StateMetaInfoSnapshot.BackendStateType` (KEY_VALUE 0 … PRIORITY_QUEUE 3), as
+/// `StateMetaInfoSnapshotReadersWriters.java:109-111` writes it. `None` when not found.
+///
+/// One pass over the header, however many states it registers: with the header no longer cut at
+/// 50 KB, searching each name from offset 0 would be quadratic on a wide operator.
+fn meta_info_records(data: &[u8], state_metas: &[KeyedStateMeta]) -> Vec<Option<usize>> {
+    // Reversed so that, should a name repeat, its first index wins.
+    let by_name: std::collections::HashMap<&[u8], usize> = state_metas
+        .iter()
+        .enumerate()
+        .rev()
+        .map(|(i, m)| (m.name.as_bytes(), i))
+        .collect();
+    let max_len = state_metas.iter().map(|m| m.name.len()).max().unwrap_or(0);
+    let mut out = vec![None; state_metas.len()];
+    let mut missing = by_name.len();
+    let mut p = 0;
+    while missing > 0 && p + 2 <= data.len() {
+        let len = u16::from_be_bytes([data[p], data[p + 1]]) as usize;
+        let after = p + 2 + len;
+        if (1..=max_len).contains(&len) && after + 8 <= data.len() {
+            if let Some(&i) = by_name.get(&data[p + 2..after]) {
+                let backend_type = i32::from_be_bytes([
+                    data[after],
+                    data[after + 1],
+                    data[after + 2],
+                    data[after + 3],
+                ]);
+                let num_options = i32::from_be_bytes([
+                    data[after + 4],
+                    data[after + 5],
+                    data[after + 6],
+                    data[after + 7],
+                ]);
+                if out[i].is_none()
+                    && (0..=3).contains(&backend_type)
+                    && (0..=64).contains(&num_options)
+                {
+                    out[i] = Some(p);
+                    missing -= 1;
+                }
+            }
+        }
+        p += 1;
+    }
+    out
+}
+
+/// Where each state's name starts in the header, in `state_metas` order: inside its
+/// `StateMetaInfoSnapshot` when that is found, else at the first occurrence of the name's bytes.
+/// The per-state serializer snapshots follow it.
+fn state_name_positions(data: &[u8], state_metas: &[KeyedStateMeta]) -> Vec<Option<usize>> {
+    meta_info_records(data, state_metas)
+        .into_iter()
+        .zip(state_metas)
+        .map(|(record, meta)| {
+            record
+                .map(|p| p + 2)
+                .or_else(|| find_bytes(data, meta.name.as_bytes(), 0, data.len()))
+        })
+        .collect()
 }
 
 /// Extract the key serializer's PojoInfo from the header, if the key is a POJO.
@@ -511,7 +588,7 @@ fn find_states_without_options(
     _buf: &mut Vec<KeyedStateMeta>,
 ) -> Vec<KeyedStateMeta> {
     let mut found = Vec::new();
-    let limit = data.len().min(50000);
+    let limit = data.len();
 
     for pos in 5..limit.saturating_sub(10) {
         if pos + 2 > data.len() {
@@ -673,17 +750,18 @@ fn key_group_prefix_bytes(max_parallelism: i32) -> usize {
     }
 }
 
-/// Extract keyed entries from canonical key-group data blocks.
+/// Extract keyed entries from canonical key-group data blocks: every entry of every state of
+/// every non-empty key-group (see [`parse_key_group_block`] for the layout).
 ///
-/// Reads the first key from each non-empty key-group for each state.
-/// For states with known-size values (Int, Long, …), reads the value
-/// and skips remaining entries to continue to the next state.
-///
-/// Entry format per entry:
-///   `[keyGroupPrefix(1-4 bytes)][StringValue(key)][VoidNamespace(1 byte)][value]`
+/// Key bytes per entry: `[keyGroupPrefix(1-2 bytes)][serialized key][namespace]`.
 ///
 /// `state_types` maps state index → state type ("VALUE", "MAP", …). Value bytes are returned raw
 /// here; typed decoding lives in `parser::value` (the single decode source of truth).
+///
+/// `num_states` is [`count_states_in_header`]: it bounds the stateIds. Key-groups that cannot be
+/// read to their end mark are listed in [`KeyedEntries::malformed`] — with the entries read before
+/// the defect kept — instead of being cut short silently.
+#[allow(clippy::too_many_arguments)]
 pub fn extract_keyed_entries(
     data: &[u8],
     kg: &crate::parser::state_handle::KeyGroupsStateHandle,
@@ -693,7 +771,7 @@ pub fn extract_keyed_entries(
     max_parallelism: i32,
     state_types: &[String],
     key_pojo: Option<&crate::parser::pojo::PojoInfo>,
-) -> Vec<KeyedEntry> {
+) -> KeyedEntries {
     let kg_prefix_len = key_group_prefix_bytes(max_parallelism);
     let offsets = &kg.offsets;
     // The header is never compressed, so the flag is readable from the same bytes; when it is set
@@ -708,7 +786,7 @@ pub fn extract_keyed_entries(
         .any(|&o| o > 0 && (o as usize) >= header_size && (o as usize) < data.len());
 
     if has_valid_offsets {
-        let mut entries = Vec::new();
+        let mut out = KeyedEntries::default();
         for (i, &offset) in offsets.iter().enumerate() {
             let start = offset as usize;
             if start < header_size || start >= data.len() {
@@ -722,7 +800,9 @@ pub fn extract_keyed_entries(
                 .unwrap_or(data.len())
                 .min(data.len());
 
-            if end <= start || end - start < 8 {
+            // No minimum size: Flink records an offset only for a key-group holding entries,
+            // so a block too short to hold one is malformed, and the parser reports it.
+            if end <= start {
                 continue;
             }
 
@@ -734,11 +814,17 @@ pub fn extract_keyed_entries(
 
             let block = match key_group_block(&data[start..end], compressed, &mut inflated) {
                 Ok(b) => b,
-                // A key-group that will not inflate is skipped rather than parsed as garbage.
-                Err(_) => continue,
+                // A key-group that will not inflate is not parsed as garbage, but it is reported.
+                Err(_) => {
+                    out.malformed.push(MalformedKeyGroup {
+                        key_group: absolute_kg,
+                        defect: BlockDefect::Decompression,
+                    });
+                    continue;
+                }
             };
 
-            parse_key_group_block(
+            let parsed = parse_key_group_block(
                 block,
                 absolute_kg,
                 &KeyGroupParse {
@@ -749,26 +835,94 @@ pub fn extract_keyed_entries(
                     state_types,
                     only_state: None,
                 },
-                &mut |e| entries.push(e),
+                &mut |e| out.entries.push(e),
             );
+            if let Err(defect) = parsed {
+                out.malformed.push(MalformedKeyGroup {
+                    key_group: absolute_kg,
+                    defect,
+                });
+            }
         }
-        entries
+        out
     } else {
-        if header_size >= data.len() {
-            return Vec::new();
-        }
-        Vec::new()
+        KeyedEntries::default()
     }
 }
 
-/// Parse one key-group block, emitting every entry through `emit`.
+/// What [`extract_keyed_entries`] read from one subtask's keyed stream.
+#[derive(Debug, Clone, Default)]
+pub struct KeyedEntries {
+    pub entries: Vec<KeyedEntry>,
+    /// Key-groups that could not be read to their end mark, in key-group order.
+    pub malformed: Vec<MalformedKeyGroup>,
+}
+
+/// A key-group block that could not be read to its `END_OF_KEY_GROUP_MARK`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MalformedKeyGroup {
+    /// Absolute key-group.
+    pub key_group: u16,
+    pub defect: BlockDefect,
+}
+
+impl std::fmt::Display for MalformedKeyGroup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "key-group {}: {}", self.key_group, self.defect)
+    }
+}
+
+/// Why a key-group block stopped before its `END_OF_KEY_GROUP_MARK`.
+///
+/// Every entry before the defect has been emitted. Nothing after it can be located — the next
+/// length prefix is wherever the bad one says — so the rest of the key-group is lost, and callers
+/// report it instead of passing a truncated read off as a smaller state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockDefect {
+    /// The block ends inside the entry or stateId starting at `offset`, or before its end mark.
+    Truncated { offset: usize },
+    /// A key length that cannot even hold the key-group prefix, or a negative value length.
+    BadLength { offset: usize, len: i32 },
+    /// A stateId at or beyond the number of states the header registers.
+    UnknownStateId {
+        offset: usize,
+        state_id: u16,
+        num_states: usize,
+    },
+    /// A compressed key-group whose Snappy frame does not decode.
+    Decompression,
+}
+
+impl std::fmt::Display for BlockDefect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BlockDefect::Truncated { offset } => write!(f, "truncated at byte {}", offset),
+            BlockDefect::BadLength { offset, len } => {
+                write!(f, "invalid length {} at byte {}", len, offset)
+            }
+            BlockDefect::UnknownStateId {
+                offset,
+                state_id,
+                num_states,
+            } => write!(
+                f,
+                "stateId {} at byte {}, but the header registers {} states",
+                state_id, offset, num_states
+            ),
+            BlockDefect::Decompression => write!(f, "Snappy frame does not decode"),
+        }
+    }
+}
+
+/// What [`parse_key_group_block`] needs to know about the operator's header.
 ///
 /// `only_state` restricts parsing to a single stateId: other states' entries are skipped using
 /// their length prefixes without decoding their keys or copying their values, which is what makes
 /// exporting one state cheap on a savepoint holding many.
 pub struct KeyGroupParse<'a> {
-    /// Number of keyed states declared in the header (diagnostic only; the stateId space is
-    /// shared with priority-queue states, so it does not bound parsing).
+    /// Number of states the header registers, keyed and priority-queue (timer) states together
+    /// since they share the stateId space ([`count_states_in_header`]). A stateId at or beyond it
+    /// is a [`BlockDefect::UnknownStateId`].
     pub num_states: usize,
     /// Key serializer type, e.g. `String`, `Long`, `Pojo`.
     pub key_type: &'a str,
@@ -782,12 +936,32 @@ pub struct KeyGroupParse<'a> {
     pub only_state: Option<u16>,
 }
 
+/// Parse one key-group block (already inflated), emitting every entry through `emit`.
+///
+/// Layout, verified against apache/flink `release-1.20`:
+/// `FullSnapshotAsyncWriter.writeKVStateData` opens the block with `writeShort(kvStateId)`
+/// (`FullSnapshotAsyncWriter.java:157`), then writes each entry as two
+/// `BytePrimitiveArraySerializer` arrays — `[int len][kgPrefix + key + namespace]`, then
+/// `[int len][value]` (`:233-237`). On `key[0]` of the **last** entry of each state's run it sets
+/// the metadata-follows flag (`setMetaDataFollowsFlagInKey`, `:177` and `:217`), and only after
+/// such an entry comes a `short`: the next stateId (`:200`, `:205`) or `END_OF_KEY_GROUP_MARK`
+/// (`:186`, `:221`). `FullSnapshotRestoreOperation.KeyGroupEntriesIterator.next`
+/// (`FullSnapshotRestoreOperation.java:298-311`) reads it back the same way: the next `short` is
+/// read only `if (hasMetaDataFollowsFlag(key))`.
+///
+/// So a run ends on that flag and on nothing else. A key-length heuristic cannot replace it: a
+/// key over the threshold ended the whole key-group (losing every later entry, of every state),
+/// and a bounds check is fooled by a stateId `short` followed by the high bytes of the next key
+/// length, which read together as a plausible length.
+///
+/// Returns `Err` when the block cannot be read to its end mark — see [`BlockDefect`]; the entries
+/// read before the defect have been emitted.
 pub fn parse_key_group_block(
     data: &[u8],
     kg_index: u16,
     ctx: &KeyGroupParse<'_>,
     emit: &mut dyn FnMut(KeyedEntry),
-) {
+) -> Result<(), BlockDefect> {
     let KeyGroupParse {
         num_states,
         key_type,
@@ -796,95 +970,79 @@ pub fn parse_key_group_block(
         state_types,
         only_state,
     } = *ctx;
-    // Canonical savepoint format (FullSnapshotAsyncWriter):
-    // Per state: [short: stateId] then entries...
-    // Per entry: [int: keyLen][keyBytes: kgPrefix+key+namespace][int: valueLen][valueBytes]
-    // Entries continue until the next short(stateId) appears.
-    //
-    // We parse using position-based access to allow "peeking" without consuming.
-
-    // Canonical savepoint format (FullSnapshotAsyncWriter):
-    // Each state with entries gets one run. Runs are NOT in stateId order on the heap backend
-    // (HeapKeyValueStateIterator walks a HashMap of states; real blocks show e.g. [2, 0, 1]).
-    // Per state: [short: stateId] then entries...
-    // Per entry: [int: keyLen][keyBytes: kgPrefix+key+namespace][int: valueLen][valueBytes]
+    // Canonical savepoint format (FullSnapshotAsyncWriter): each state with entries gets one run.
+    // Runs are NOT in stateId order on the heap backend (HeapKeyValueStateIterator walks a
+    // HashMap of states; real blocks show e.g. [2, 0, 1]).
 
     let mut pos = 0usize;
+    let mut state_id = read_be_u16(data, &mut pos)?;
 
     loop {
-        // Read short(stateId). Stop on EOF or END_OF_KEY_GROUP_MARK.
-        if pos + 2 > data.len() {
-            break;
+        if state_id == END_OF_KEY_GROUP_MARK {
+            return Ok(());
         }
-        let state_id = u16::from_be_bytes([data[pos], data[pos + 1]]);
-        // Terminate on the end marker. The stateId space is shared by keyed and priority-queue
-        // (timer) states, so we don't bound it by `num_states` (which only counts keyed states);
-        // a sane cap guards against reading garbage. keyLen plausibility ends each state's run.
-        if state_id == END_OF_KEY_GROUP_MARK || state_id >= MAX_PLAUSIBLE_STATE_ID {
-            break;
+        // Keyed and priority-queue states share the stateId space; the header registers them all.
+        if state_id as usize >= num_states {
+            return Err(BlockDefect::UnknownStateId {
+                offset: pos - 2,
+                state_id,
+                num_states,
+            });
         }
-        let _ = num_states;
-        pos += 2;
 
-        // Read ALL entries for this state.
-        // Each entry: [int: keyLen][keyBytes][int: valueLen][valueBytes]
-        loop {
-            if pos + 4 > data.len() {
-                return;
-            }
-            let kl = i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-            if kl <= 2 || kl > 10000 {
-                break; // Next stateId or end marker
-            }
-            pos += 4;
+        // [int: keyLen][kgPrefix + key + namespace]. Flink always writes the key-group prefix
+        // (`CompositeKeySerializationUtils.writeKeyGroup`), whose first byte carries the flag.
+        let entry_at = pos;
+        let kl = read_be_i32(data, &mut pos)?;
+        if kl < kg_prefix_len.max(1) as i32 {
+            return Err(BlockDefect::BadLength {
+                offset: entry_at,
+                len: kl,
+            });
+        }
+        if kl as usize > data.len() - pos {
+            return Err(BlockDefect::Truncated { offset: entry_at });
+        }
+        let key_start = pos;
+        let key_end = pos + kl as usize;
+        let last_of_run = data[key_start] & FIRST_BIT_IN_BYTE_MASK != 0;
 
-            let key_start = pos;
-            let key_end = pos + kl as usize;
-            if key_end > data.len() {
-                return;
-            }
+        // Entries of a state we were not asked for are skipped without decoding the key or
+        // copying the value: only the length prefixes are followed.
+        let wanted = only_state.is_none_or(|s| s == state_id);
 
-            // Entries of a state we were not asked for are skipped without decoding the key or
-            // copying the value: only the length prefixes are followed.
-            let wanted = only_state.is_none_or(|s| s == state_id);
+        // Timer (priority-queue) entries have a different key layout and no value; synthesize
+        // the firing timestamp as the value so it can be displayed. Both key readers skip the
+        // key-group prefix, so the flag on key[0] never reaches the decoded key.
+        let is_timer = state_types
+            .get(state_id as usize)
+            .is_some_and(|t| t == "TIMER");
+        let (key, namespace, timer_value) = if !wanted {
+            (String::new(), Vec::new(), None)
+        } else if is_timer {
+            let (k, ts) = read_timer_key(&data[key_start..key_end], kg_prefix_len, key_type);
+            (k, Vec::new(), Some(ts))
+        } else {
+            let (k, ns) =
+                read_key_from_bytes(&data[key_start..key_end], kg_prefix_len, key_type, key_pojo);
+            (k, ns, None)
+        };
+        pos = key_end;
 
-            // Timer (priority-queue) entries have a different key layout and no value; synthesize
-            // the firing timestamp as the value so it can be displayed.
-            let is_timer = state_types
-                .get(state_id as usize)
-                .map_or(false, |t| t == "TIMER");
-            let (key, namespace, timer_value) = if !wanted {
-                (String::new(), Vec::new(), None)
-            } else if is_timer {
-                let (k, ts) = read_timer_key(&data[key_start..key_end], kg_prefix_len, key_type);
-                (k, Vec::new(), Some(ts))
-            } else {
-                let (k, ns) = read_key_from_bytes(
-                    &data[key_start..key_end],
-                    kg_prefix_len,
-                    key_type,
-                    key_pojo,
-                );
-                (k, ns, None)
-            };
-            pos = key_end;
-
-            // Read value: int(valueLen) + valueBytes
-            if pos + 4 > data.len() {
-                return;
-            }
-            let vl = i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-            pos += 4;
-            if vl < 0 || pos + vl as usize > data.len() {
-                return;
-            }
-            if !wanted {
-                pos += vl as usize;
-                continue;
-            }
+        // [int: valueLen][value]
+        let value_at = pos;
+        let vl = read_be_i32(data, &mut pos)?;
+        if vl < 0 {
+            return Err(BlockDefect::BadLength {
+                offset: value_at,
+                len: vl,
+            });
+        }
+        if vl as usize > data.len() - pos {
+            return Err(BlockDefect::Truncated { offset: entry_at });
+        }
+        if wanted {
             let value = timer_value.unwrap_or_else(|| data[pos..pos + vl as usize].to_vec());
-            pos += vl as usize;
-
             emit(KeyedEntry {
                 state_id,
                 key,
@@ -893,7 +1051,30 @@ pub fn parse_key_group_block(
                 value,
             });
         }
+        pos += vl as usize;
+
+        if last_of_run {
+            state_id = read_be_u16(data, &mut pos)?;
+        }
     }
+}
+
+/// Read a big-endian `short` at `*pos`, or report the block as truncated there.
+fn read_be_u16(data: &[u8], pos: &mut usize) -> Result<u16, BlockDefect> {
+    let b = data
+        .get(*pos..*pos + 2)
+        .ok_or(BlockDefect::Truncated { offset: *pos })?;
+    *pos += 2;
+    Ok(u16::from_be_bytes([b[0], b[1]]))
+}
+
+/// Read a big-endian `int` at `*pos`, or report the block as truncated there.
+fn read_be_i32(data: &[u8], pos: &mut usize) -> Result<i32, BlockDefect> {
+    let b = data
+        .get(*pos..*pos + 4)
+        .ok_or(BlockDefect::Truncated { offset: *pos })?;
+    *pos += 4;
+    Ok(i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
 }
 
 /// Decode a priority-queue timer element key (Flink `TimerSerializer`):
@@ -980,6 +1161,22 @@ fn find_bytes(data: &[u8], needle: &[u8], start: usize, end: usize) -> Option<us
         return None;
     }
     (start..=end - needle.len()).find(|&i| data[i..i + needle.len()] == *needle)
+}
+
+/// Every non-overlapping occurrence of `needle` in `data`.
+fn find_all(data: &[u8], needle: &[u8]) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut s = 0;
+    while s < data.len().saturating_sub(needle.len()) {
+        match find_bytes(data, needle, s, data.len()) {
+            Some(p) => {
+                out.push(p);
+                s = p + needle.len();
+            }
+            None => break,
+        }
+    }
+    out
 }
 
 fn extract_key_serializer_type(data: &[u8]) -> String {

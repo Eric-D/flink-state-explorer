@@ -65,6 +65,8 @@ fn make_test_cache() -> IndexCache {
                 }],
                 total_keys: 1,
                 key_type: "String".to_string(),
+                malformed_key_groups: 2,
+                first_malformed: Some("key-group 7: truncated at byte 40".to_string()),
             }),
             load_errors: vec![],
         }],

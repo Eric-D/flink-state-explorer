@@ -253,6 +253,16 @@ fn export_state(cli: &Cli) -> Result<(), String> {
             }
         );
     }
+    // On stderr even when the rows go to stdout: an incomplete export must not pass for a
+    // complete one.
+    if stats.malformed_key_groups > 0 {
+        eprintln!(
+            "Warning: {} malformed key-group(s); their entries past the defect were not exported \
+             (first: {})",
+            stats.malformed_key_groups,
+            stats.first_malformed.as_deref().unwrap_or("?")
+        );
+    }
     Ok(())
 }
 

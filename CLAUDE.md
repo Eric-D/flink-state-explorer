@@ -121,6 +121,12 @@ other states are skipped by their length prefixes without decoding keys or copyi
 (`KeyGroupParse::only_state`). Peak memory is one key-group, not one savepoint —
 `ExportStats::max_block_bytes` reports it.
 
+A key-group that cannot be read to its end mark (truncated, a bad length, a stateId beyond the
+header's state count) is **reported, not silently cut short**: the rows read before the defect are
+exported, and `ExportStats::malformed_key_groups` / `first_malformed` count and name it — the CLI
+prints a `Warning:` on stderr (even with `-o -`), the index carries the same count in
+`CachedKeyedState` and the `i` panel shows it (`Malformed key-groups`).
+
 Two things to know about the rows:
 - a **MAP** state exports **exploded**, one row per entry, with `map_key` decoded from the
   namespace (`VoidNamespace + map key`) and the value unwrapped from `NullableSerializer`. The raw
@@ -217,9 +223,13 @@ Enum (as name), nested POJO, `byte[]`/`String[]`, primitive arrays
 timestamp), **TTL-wrapped values** (`Ttl<T>` → `{ _ttlLastAccess, value }`, via `TtlSerializer`),
 and **broadcast maps** (best-effort String key/value). Keyed state is merged across **all** subtasks
 (full key count; the index *stores* at most 100 000 keys per operator, see "TUI: key cap, text,
-terminal"),
-and the key-group parser handles the shared keyed/priority-queue stateId space (terminating on
-`END_OF_KEY_GROUP_MARK`).
+terminal"), and the key-group parser handles the shared keyed/priority-queue stateId space
+(terminating on `END_OF_KEY_GROUP_MARK`). A state's run of entries ends on Flink's
+**metadata-follows flag** (`0x80` on `key[0]` of its last entry) and on nothing else — keys of any
+length (a 12 KB map key included) parse; the old `keyLen > 10000` heuristic dropped the rest of the
+key-group. The header extractors get the **header only** (`&data[..first key-group offset]`) and
+scan all of it, with the state metadata computed once: they used to stop at 50 KB, so operators
+with hundreds of states lost every state registered past it.
 
 **Kafka connector** state is decoded (`src/parser/kafka.rs`, verified against
 https://github.com/apache/flink-connector-kafka): source **reader splits** (`SourceReaderState` →
@@ -304,9 +314,16 @@ source** (branch `release-1.20`, https://github.com/apache/flink) rather than gu
   **and** priority-queue states (timers) share **one `short` stateId space** —
   `writeShort(kvStateId())` precedes each state's entries; the group ends with
   `writeShort(END_OF_KEY_GROUP_MARK)`. Each entry is `BytePrimitiveArraySerializer.serialize(key)`
-  then `serialize(value)` (each = int length + bytes).
+  then `serialize(value)` (each = int length + bytes). The last entry of each run has
+  `FIRST_BIT_IN_BYTE_MASK` set on `key[0]` (`setMetaDataFollowsFlagInKey`, `:177`/`:217`), and the
+  next `short` is written — and read back, `FullSnapshotRestoreOperation.java:301-308` — only
+  after such an entry. Never delimit runs by key length or by a bounds check.
 - **End marker** — `flink-runtime/.../state/FullSnapshotUtil.java`: `END_OF_KEY_GROUP_MARK = 0xFFFF`,
   `FIRST_BIT_IN_BYTE_MASK = 0x80`.
+- **Keyed header** — `KeyedBackendSerializationProxy.write`: `int version`, `boolean compression`,
+  key serializer snapshot, then `writeShort(numStates)` (`:133`) and one `StateMetaInfoSnapshot` per
+  state (`writeUTF(name)`, `writeInt(backendStateType)`, options, serializer snapshots:
+  `StateMetaInfoSnapshotReadersWriters.java:109-125`). That count bounds the key-group stateIds.
 - **Timers** — `flink-streaming-java/.../api/operators/TimerSerializer.java`: a timer serializes as
   `writeLong(MathUtils.flipSignBit(timestamp))` + key serializer + namespace serializer. Timers are
   a priority-queue state in the shared stateId space (so they shift keyed-state stateIds — e.g. a
@@ -361,9 +378,20 @@ source** (branch `release-1.20`, https://github.com/apache/flink) rather than gu
   (ported `MathUtils.murmurHash` + `KeyGroupRangeAssignment`), and every streamed row falls inside
   its subtask's range. POJO keys are range-checked only: their `hashCode()` is user code.
 - `tests/export_state_stream_test.rs` — streaming export: strict parity with the full JSON export
-  for every non-MAP state, exploded parity for MAP states, the `v6`/compression header, and the
-  bounded peak block. (The Snappy-framed key-group and the state filter are in the
-  fixture-free `tests/keyed_block_test.rs`.)
+  for every non-MAP state, exploded parity for MAP states, the `v6`/compression header, the
+  bounded peak block, and no key-group of a real fixture (plain or compressed) reported malformed
+  on either path.
+- `tests/keyed_block_test.rs` (fixture-free, CI) — block-level parsing on hand-built blocks: a
+  Snappy-framed key-group, the state filter, keys of 10,000/10,001/12,000 bytes with 1- and 2-byte
+  prefixes (kg 32767), a 12 KB MAP user key mid-run, a > 256 KiB four-state block with timers,
+  every `BlockDefect` (truncation, missing end mark, bad lengths, unknown stateId) and the
+  header-declared state count as the stateId bound.
+- `tests/synth_savepoint_test.rs` (fixture-free, CI) — synthetic savepoints: the header against a
+  real one, file-backed/inline/compressed parity, every subtask on the index, long keys and long map
+  keys on both paths (maxParallelism 32768), a > 50 KB header (321 states) on `list_states`, the
+  index and the export, the index reading its header from the header only (a state value that
+  spells a state record is not a state), one-letter state names located at their own record, and
+  a corrupted key-group reported by the export, the index and the CLI.
 - `tests/state_file_errors_test.rs` — fixture-free (CI): a 2-subtask file-backed synthetic
   savepoint with one state file deleted, truncated or (unix) `chmod 000`. The index records an
   error naming the file and keeps the other subtask's keys; the TUI keeps and flags the operator;
