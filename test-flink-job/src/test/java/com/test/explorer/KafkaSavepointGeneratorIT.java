@@ -51,7 +51,8 @@ class KafkaSavepointGeneratorIT {
             "jobmanager.rpc.address: jobmanager",
             "state.savepoints.dir: file://" + SAVEPOINTS_DIR,
             "state.backend: hashmap",
-            "state.storage.fs.memory-threshold: 20 mb",
+            // JobManager storage keeps every handle inline: one self-contained _metadata.
+            "execution.checkpointing.storage: jobmanager",
             "taskmanager.numberOfTaskSlots: 4");
 
     private static final Network NETWORK = Network.newNetwork();
