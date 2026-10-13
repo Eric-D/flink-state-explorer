@@ -656,16 +656,129 @@ fn find_states_without_options(
     found
 }
 
+/// What follows the key in one state's entries, which is how an entry's key bytes are split from
+/// its namespace when the key cannot be decoded (and how a decoded key is checked).
+///
+/// `HeapKeyValueStateIterator` builds each entry key with `SerializedCompositeKeyBuilder`
+/// (flink-runtime, release-1.20): key-group prefix, key, namespace (`setKeyAndKeyGroup` +
+/// `setNamespace`, HeapKeyValueStateIterator.java:260-263) and, for a MAP state, the user map key
+/// right after the namespace (`buildCompositeKeyUserKey`, :357-358). No length is written between
+/// them unless key **and** namespace are both variable-sized
+/// (`isAmbiguousCompositeKeyPossible`, SerializedCompositeKeyBuilder.java:240-243), which none of the
+/// namespace serializers below is.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EntryLayout {
+    /// Serialized width of the state's namespace, when its serializer is one whose width is fixed
+    /// and known; `None` = unknown, nothing is split or checked.
+    pub namespace_len: Option<usize>,
+    /// For a MAP state: the map key serializer type (the user key follows the namespace).
+    pub map_key_type: Option<String>,
+}
+
+/// Serialized width of a namespace, from its serializer snapshot class (exact simple name).
+///
+/// - `VoidNamespaceSerializer` writes one byte (`target.write(0)`, flink-runtime
+///   VoidNamespaceSerializer.java:62-68, release-1.20);
+/// - `TimeWindow.Serializer` two longs, start and end (flink-streaming-java TimeWindow.java:159-162);
+/// - `GlobalWindow.Serializer` one byte (`writeByte(0)`, GlobalWindow.java:96-98).
+fn namespace_width(snapshot_class: &str) -> Option<usize> {
+    match snapshot_class.rsplit('.').next().unwrap_or(snapshot_class) {
+        "VoidNamespaceSerializer$VoidNamespaceSerializerSnapshot" => Some(1),
+        "TimeWindow$Serializer$TimeWindowSerializerSnapshot" => Some(16),
+        "GlobalWindow$Serializer$GlobalWindowSerializerSnapshot" => Some(1),
+        _ => None,
+    }
+}
+
+/// Per state (aligned with [`extract_state_metadata`], i.e. with stateIds), what follows the key
+/// in its entries. `header_end` is where the header stops (the first key-group's offset).
+///
+/// The namespace serializer is the **last** snapshot of each state's block in the header: a keyed
+/// state lists `VALUE_SERIALIZER` then `NAMESPACE_SERIALIZER`, and a timer's
+/// `TimerSerializerSnapshot` nests `[key, namespace]` (flink-streaming-java
+/// TimerSerializerSnapshot.java:57-60). The namespace snapshots above are
+/// `SimpleTypeSerializerSnapshot`s, which write no payload (SimpleTypeSerializerSnapshot.java:90-92),
+/// so a block ends with `writeUTF(class) + writeInt(version)`
+/// (`TypeSerializerSnapshot.writeVersionedSnapshot`, TypeSerializerSnapshot.java:214-219).
+pub fn extract_entry_layouts(data: &[u8], header_end: usize) -> Vec<EntryLayout> {
+    let header_end = header_end.min(data.len());
+    let metas = extract_state_metadata(data);
+    let value_types = extract_value_serializer_types(data);
+
+    let starts: Vec<Option<usize>> = metas
+        .iter()
+        .map(|m| state_block_start(data, &m.name, header_end))
+        .collect();
+
+    metas
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let namespace_len = starts[i].and_then(|start| {
+                // The block runs to the next state's name, or to the end of the header.
+                let end = starts
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .filter(|&p| p > start)
+                    .min()
+                    .unwrap_or(header_end);
+                let class = read_classname_ending_at(data, end.checked_sub(4)?)?;
+                namespace_width(&class)
+            });
+            let map_key_type = (m.state_type == "MAP").then(|| {
+                crate::parser::value::split_map_types(value_types.get(i).map_or("", |s| s)).0
+            });
+            EntryLayout {
+                namespace_len,
+                map_key_type,
+            }
+        })
+        .collect()
+}
+
+/// Where a state's block starts in the header: its `writeUTF(name)`, length prefix included.
+///
+/// The name alone is not enough — a POJO value's field names are `writeUTF`s too, and a field
+/// may share a state's name. The state's own name is followed by `writeInt(backendStateType)` and
+/// `writeInt(options.size())` (`StateMetaInfoSnapshotReadersWriters.CurrentWriterImpl`, flink-runtime
+/// state/metainfo/StateMetaInfoSnapshotReadersWriters.java:109-111, release-1.20), where a POJO
+/// field name is followed by a presence boolean and a frame length. `BackendStateType` has four
+/// constants, `KEY_VALUE` (0) … `PRIORITY_QUEUE` (3) (StateMetaInfoSnapshot.java:40-44).
+fn state_block_start(data: &[u8], name: &str, header_end: usize) -> Option<usize> {
+    let mut utf = (name.len() as u16).to_be_bytes().to_vec();
+    utf.extend_from_slice(name.as_bytes());
+    let mut from = 5.min(header_end);
+    while let Some(p) = find_bytes(data, &utf, from, header_end) {
+        let after = p + utf.len();
+        let int_at = |i: usize| {
+            data.get(i..i + 4)
+                .map(|b| i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+        };
+        let backend_type = int_at(after);
+        let options = int_at(after + 4);
+        if backend_type.is_some_and(|t| (0..=3).contains(&t))
+            && options.is_some_and(|n| (0..=64).contains(&n))
+        {
+            return Some(p);
+        }
+        from = p + 1;
+    }
+    None
+}
+
 /// A keyed entry extracted from a key group block.
 #[derive(Debug, Clone)]
 pub struct KeyedEntry {
     /// The state index (matches ordering in state metadata).
     pub state_id: u16,
-    /// The deserialized key value (e.g. the keyBy string).
+    /// The key's display form (`parser::value::decode_key`), or `0x` + its bytes in hex when the
+    /// key serializer cannot be decoded. Distinct keys always render distinctly.
     pub key: String,
     /// The key group this entry belongs to.
     pub key_group: u16,
     /// Raw namespace bytes (contains map user key for MAP states, VoidNamespace byte for VALUE).
+    /// Empty for timers, and when the key could not be split from an unknown namespace.
     pub namespace: Vec<u8>,
     /// Raw value bytes (the serialized state value).
     pub value: Vec<u8>,
@@ -779,6 +892,7 @@ pub fn extract_keyed_entries(
     // Without this, a savepoint written with snapshot compression decoded as garbage.
     let compressed = read_keyed_stream_header(data).is_some_and(|h| h.using_key_group_compression);
     let mut inflated = Vec::new();
+    let layouts = extract_entry_layouts(data, header_size);
 
     // Check if offsets are valid: at least one offset points past the header
     let has_valid_offsets = offsets
@@ -833,6 +947,7 @@ pub fn extract_keyed_entries(
                     kg_prefix_len,
                     key_pojo,
                     state_types,
+                    layouts: &layouts,
                     only_state: None,
                 },
                 &mut |e| out.entries.push(e),
@@ -932,6 +1047,8 @@ pub struct KeyGroupParse<'a> {
     pub key_pojo: Option<&'a crate::parser::pojo::PojoInfo>,
     /// State type per stateId ("VALUE", "MAP", "TIMER", …).
     pub state_types: &'a [String],
+    /// Entry layout per stateId ([`extract_entry_layouts`]); a missing one means "unknown".
+    pub layouts: &'a [EntryLayout],
     /// Restrict parsing to a single stateId.
     pub only_state: Option<u16>,
 }
@@ -970,6 +1087,7 @@ pub fn parse_key_group_block(
         kg_prefix_len,
         key_pojo,
         state_types,
+        layouts,
         only_state,
     } = *ctx;
     // Canonical savepoint format (FullSnapshotAsyncWriter): each state with entries gets one run.
@@ -1085,82 +1203,107 @@ fn read_be_i32(data: &[u8], pos: &mut usize) -> Result<i32, BlockDefect> {
     Ok(i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
 }
 
-/// Decode a priority-queue timer element key (Flink `TimerSerializer`):
-/// `[kgPrefix][flipSignBit(ts): long][keyBy key][namespace]`. Returns the keyBy key and the firing
+/// Decode a priority-queue timer element key (Flink `TimerSerializer.serialize`:
+/// `writeLong(flipSignBit(timestamp))`, key, namespace — flink-streaming-java
+/// TimerSerializer.java:147-152, release-1.20), after the key-group prefix
+/// (`HeapKeyValueStateIterator.QueueIterator`, :383). Returns the keyBy key — rendered exactly as
+/// in the keyed states' entries, so a key's timers land in its partition — and the firing
 /// timestamp as 8 big-endian bytes (epoch millis) so it can be rendered like a Date.
-fn read_timer_key(key_bytes: &[u8], kg_prefix_len: usize, key_type: &str) -> (String, Vec<u8>) {
-    use crate::parser::java_deser::JavaReader;
+fn read_timer_key(
+    key_bytes: &[u8],
+    kg_prefix_len: usize,
+    key_type: &str,
+    key_pojo: Option<&crate::parser::pojo::PojoInfo>,
+    layout: Option<&EntryLayout>,
+) -> (String, Vec<u8>) {
     if kg_prefix_len + 8 > key_bytes.len() {
         return (String::new(), Vec::new());
     }
-    let mut r = JavaReader::new(&key_bytes[kg_prefix_len..]);
-    let flipped = r.read_long().unwrap_or(0);
+    let flipped = i64::from_be_bytes(
+        key_bytes[kg_prefix_len..kg_prefix_len + 8]
+            .try_into()
+            .expect("8 bytes"),
+    );
     let ts = flipped ^ i64::MIN; // undo MathUtils.flipSignBit
-    let key = match key_type {
-        "String" => r.read_string_value().unwrap_or_default(),
-        "Long" => r.read_long().map(|v| v.to_string()).unwrap_or_default(),
-        "Int" => r.read_int().map(|v| v.to_string()).unwrap_or_default(),
-        _ => String::new(),
-    };
+    let payload = &key_bytes[kg_prefix_len + 8..];
+    let namespace_len = layout.and_then(|l| l.namespace_len);
+    let (key, _) = split_key(payload, key_type, key_pojo, namespace_len, None);
     (key, ts.to_be_bytes().to_vec())
 }
 
+/// Split an entry's key bytes (`[kgPrefix][key][namespace][map key, for a MAP state]`) into the
+/// key's display form and the namespace bytes (map key included).
 fn read_key_from_bytes(
     key_bytes: &[u8],
     kg_prefix_len: usize,
     key_type: &str,
     key_pojo: Option<&crate::parser::pojo::PojoInfo>,
+    layout: Option<&EntryLayout>,
 ) -> (String, Vec<u8>) {
-    use crate::parser::java_deser::JavaReader;
-
     if kg_prefix_len >= key_bytes.len() {
         return (format!("[{} bytes]", key_bytes.len()), Vec::new());
     }
-    let payload_with_ns = &key_bytes[kg_prefix_len..];
+    let payload = &key_bytes[kg_prefix_len..];
+    let namespace_len = layout.and_then(|l| l.namespace_len);
+    let map_key_type = layout.and_then(|l| l.map_key_type.as_deref());
+    let (key, key_end) = split_key(payload, key_type, key_pojo, namespace_len, map_key_type);
+    (key, payload[key_end..].to_vec())
+}
 
-    // Read key using a reader to know exactly how many bytes the key consumes
-    let mut r = JavaReader::new(payload_with_ns);
-    let key_str = match key_type {
-        "String" => r.read_string_value().ok(),
-        "Long" => r.read_long().ok().map(|v| v.to_string()),
-        "Int" => r.read_int().ok().map(|v| v.to_string()),
-        _ => None,
-    };
+/// Find where the key ends in `payload` (key, then namespace, then a map key for a MAP state) and
+/// render it. Returns the display form and the key's length.
+///
+/// A decoded key is kept only when what follows it is exactly a namespace (plus one map key):
+/// that rejects a decode that stopped early — a POJO with a Kryo field — or read too far. Anything
+/// else is rendered with [`crate::parser::value::opaque_key`] over the key bytes alone, so the
+/// namespace (and a MAP state's map key) never leak into the key and distinct keys never merge.
+fn split_key(
+    payload: &[u8],
+    key_type: &str,
+    key_pojo: Option<&crate::parser::pojo::PojoInfo>,
+    namespace_len: Option<usize>,
+    map_key_type: Option<&str>,
+) -> (String, usize) {
+    use crate::parser::value::{decode_key, decoded_len, opaque_key};
 
-    if let Some(s) = key_str {
-        let key_end = r.position() as usize;
-        let ns_bytes = payload_with_ns[key_end..].to_vec();
-        return (s, ns_bytes);
+    if let Some((key, used)) = decode_key(payload, key_type, key_pojo) {
+        if used <= payload.len() && tail_fits(&payload[used..], namespace_len, map_key_type) {
+            return (key, used);
+        }
     }
-
-    // POJO key: deserialize and extract namespace from remaining bytes
-    if let Some(pojo_info) = key_pojo {
-        let (json, pos) = crate::parser::pojo::deserialize_pojo_to_json_with_pos(
-            payload_with_ns,
-            pojo_info,
-            None,
-        );
-        let ns_bytes = if pos < payload_with_ns.len() {
-            payload_with_ns[pos..].to_vec()
-        } else {
-            Vec::new()
-        };
-        return (json, ns_bytes);
-    }
-
-    // Fallback: extract printable ASCII
-    let ascii: String = payload_with_ns
-        .iter()
-        .filter(|&&b| b >= 0x20 && b < 0x7F)
-        .take(60)
-        .map(|&b| b as char)
-        .collect();
-    let key = if ascii.len() >= 3 {
-        ascii
-    } else {
-        format!("[{} bytes]", payload_with_ns.len())
+    let key_end = match (namespace_len, map_key_type) {
+        // Unknown namespace serializer: the boundary is unknowable; keep every byte in the key.
+        (None, _) => payload.len(),
+        (Some(n), None) => payload.len().saturating_sub(n),
+        // MAP: the map key is a suffix. Take the shortest suffix that decodes as exactly one map
+        // key and is preceded by a well-formed namespace (a 1-byte namespace is always 0x00).
+        (Some(n), Some(mk)) => (n..payload.len())
+            .rev()
+            .find(|&uk| {
+                let ns_start = uk - n;
+                (n != 1 || payload[ns_start] == 0)
+                    && decoded_len(&payload[uk..], mk) == Some(payload.len() - uk)
+            })
+            .map_or(payload.len(), |uk| uk - n),
     };
-    (key, Vec::new())
+    (opaque_key(&payload[..key_end]), key_end)
+}
+
+/// Whether `tail`, the bytes after a decoded key, is a namespace of `namespace_len` bytes followed,
+/// for a MAP state, by exactly one map key.
+fn tail_fits(tail: &[u8], namespace_len: Option<usize>, map_key_type: Option<&str>) -> bool {
+    let Some(n) = namespace_len else {
+        return true; // unknown namespace serializer: nothing to check against
+    };
+    match map_key_type {
+        None => tail.len() == n,
+        Some(mk) => {
+            tail.len() > n
+                && (n != 1 || tail[0] == 0)
+                && crate::parser::value::decoded_len(&tail[n..], mk)
+                    .is_none_or(|l| l == tail.len() - n)
+        }
+    }
 }
 
 fn find_bytes(data: &[u8], needle: &[u8], start: usize, end: usize) -> Option<usize> {
@@ -1206,78 +1349,85 @@ fn extract_key_serializer_type(data: &[u8]) -> String {
         return "?".into();
     }
     let cn = std::str::from_utf8(&data[cn_pos + 2..cn_pos + 2 + cn_len]).unwrap_or("?");
-    snapshot_class_to_type(cn)
+    let base = snapshot_class_to_type(cn);
+    // A Tuple key is typed from its nested field serializers: `Tuple<String,Long>`.
+    if base == "Tuple" {
+        let mut r = crate::parser::java_deser::JavaReader::new(&data[pos..]);
+        if let Some((t, _)) = crate::parser::pojo::read_serializer_snapshot_type(&mut r) {
+            if t.starts_with("Tuple<") {
+                return t;
+            }
+        }
+    }
+    base
+}
+
+/// The serializer a snapshot class belongs to, by exact name: the last `$`-segment of the class's
+/// simple name without its `Snapshot` suffix — `…base.IntSerializer$IntSerializerSnapshot` →
+/// `IntSerializer`, `…base.MapSerializerSnapshot` → `MapSerializer`,
+/// `…ttl.TtlStateFactory$TtlSerializerSnapshot` → `TtlSerializer`.
+pub(crate) fn serializer_name(snapshot_class: &str) -> &str {
+    let simple = snapshot_class.rsplit('.').next().unwrap_or(snapshot_class);
+    let last = simple.rsplit('$').next().unwrap_or(simple);
+    last.strip_suffix("Snapshot").unwrap_or(last)
+}
+
+/// Type name of a leaf (non-composite) serializer, matched on its **exact** serializer name.
+/// Shared with the POJO field parser (`parser::pojo`), so no class is ever aliased by a substring:
+/// `contains("IntSerializer")` used to read `BigIntSerializer` as `Int`, a 4-byte int, and a
+/// BigInteger key `300` showed as `2` (the last byte of its length prefix).
+pub(crate) fn leaf_serializer_type(snapshot_class: &str) -> Option<&'static str> {
+    Some(match serializer_name(snapshot_class) {
+        "StringSerializer" => "String",
+        "IntSerializer" => "Int",
+        "LongSerializer" => "Long",
+        "BooleanSerializer" => "Boolean",
+        "DoubleSerializer" => "Double",
+        "FloatSerializer" => "Float",
+        "ShortSerializer" => "Short",
+        "ByteSerializer" => "Byte",
+        "CharSerializer" => "Char",
+        "BigIntSerializer" => "BigInteger",
+        "BigDecSerializer" => "BigDecimal",
+        "BytePrimitiveArraySerializer" => "byte[]",
+        "IntPrimitiveArraySerializer" => "int[]",
+        "LongPrimitiveArraySerializer" => "long[]",
+        "DoublePrimitiveArraySerializer" => "double[]",
+        "FloatPrimitiveArraySerializer" => "float[]",
+        "ShortPrimitiveArraySerializer" => "short[]",
+        "BooleanPrimitiveArraySerializer" => "boolean[]",
+        "CharPrimitiveArraySerializer" => "char[]",
+        "StringArraySerializer" => "String[]",
+        "LocalDateTimeSerializer" => "LocalDateTime",
+        "LocalDateSerializer" => "LocalDate",
+        "LocalTimeSerializer" => "LocalTime",
+        "InstantSerializer" => "Instant",
+        "DateSerializer" | "SqlDateSerializer" => "Date",
+        "TimestampSerializer" | "SqlTimestampSerializer" => "Timestamp",
+        _ => return None,
+    })
 }
 
 fn snapshot_class_to_type(class: &str) -> String {
-    let short = class.rsplit('.').next().unwrap_or(class);
-    if short.contains("StringSerializer") {
-        "String".into()
-    } else if short.contains("IntSerializer") {
-        "Int".into()
-    } else if short.contains("LongSerializer") {
-        "Long".into()
-    } else if short.contains("BooleanSerializer") {
-        "Boolean".into()
-    } else if short.contains("DoubleSerializer") {
-        "Double".into()
-    } else if short.contains("FloatSerializer") {
-        "Float".into()
-    } else if short.contains("PojoSerializer") {
-        "Pojo".into()
-    } else if short.contains("EnumSerializer") {
-        "Enum".into()
-    } else if short.contains("MapSerializer") {
-        "Map".into()
-    } else if short.contains("ListSerializer") {
-        "List".into()
-    } else if short.contains("BytePrimitiveArraySerializer") {
-        "byte[]".into()
-    } else if short.contains("IntPrimitiveArraySerializer") {
-        "int[]".into()
-    } else if short.contains("LongPrimitiveArraySerializer") {
-        "long[]".into()
-    } else if short.contains("DoublePrimitiveArraySerializer") {
-        "double[]".into()
-    } else if short.contains("FloatPrimitiveArraySerializer") {
-        "float[]".into()
-    } else if short.contains("ShortPrimitiveArraySerializer") {
-        "short[]".into()
-    } else if short.contains("BooleanPrimitiveArraySerializer") {
-        "boolean[]".into()
-    } else if short.contains("CharPrimitiveArraySerializer") {
-        "char[]".into()
-    } else if short.contains("TupleSerializer") {
-        "Tuple".into()
-    } else if short.contains("TtlSerializer") {
-        "Ttl".into()
-    } else if short.contains("KryoSerializer") {
-        "Kryo".into()
-    } else if short.contains("NullableSerializer") {
-        "Nullable".into()
-    } else if short.contains("StringArraySerializer") {
-        "String[]".into()
-    } else if short.contains("ShortSerializer") {
-        "Short".into()
-    } else if short.contains("CharSerializer") {
-        "Char".into()
-    } else if short.contains("ByteSerializer") && !short.contains("Array") {
-        "Byte".into()
-    } else if short.contains("LocalDateTimeSerializer") {
-        "LocalDateTime".into()
-    } else if short.contains("LocalDateSerializer") {
-        "LocalDate".into()
-    } else if short.contains("LocalTimeSerializer") {
-        "LocalTime".into()
-    } else if short.contains("InstantSerializer") {
-        "Instant".into()
-    } else if short.contains("DateSerializer") || short.contains("SqlDateSerializer") {
-        "Date".into()
-    } else if short.contains("TimestampSerializer") || short.contains("SqlTimestampSerializer") {
-        "Timestamp".into()
-    } else {
-        short.replace("Snapshot", "").replace('$', ".")
+    if let Some(t) = leaf_serializer_type(class) {
+        return t.into();
     }
+    let t = match serializer_name(class) {
+        "PojoSerializer" => "Pojo",
+        "EnumSerializer" => "Enum",
+        "MapSerializer" => "Map",
+        // ArrayListSerializer writes the same `int size + elements` as ListSerializer.
+        "ListSerializer" | "ArrayListSerializer" => "List",
+        "TupleSerializer" => "Tuple",
+        "TtlSerializer" => "Ttl",
+        "KryoSerializer" => "Kryo",
+        "NullableSerializer" => "Nullable",
+        _ => {
+            let short = class.rsplit('.').next().unwrap_or(class);
+            return short.replace("Snapshot", "").replace('$', ".");
+        }
+    };
+    t.into()
 }
 
 fn is_valid_state_name(s: &str) -> bool {

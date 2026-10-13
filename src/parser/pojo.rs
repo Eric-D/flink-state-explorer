@@ -239,21 +239,36 @@ fn read_composite_nested_serializers_with_outer(
     r: &mut JavaReader<&[u8]>,
     read_outer: impl FnOnce(&mut JavaReader<&[u8]>),
 ) -> Vec<FieldTypeInfo> {
+    read_composite_nested(r, read_outer).1
+}
+
+/// Upper bound on nested serializers in a composite snapshot: a `Tuple25` has 25.
+const MAX_NESTED_SERIALIZERS: i32 = 25;
+
+/// Read a `CompositeTypeSerializerSnapshot` body (flink-core
+/// `CompositeTypeSerializerSnapshot.writeSnapshot`, release-1.20, CompositeTypeSerializerSnapshot.java:156-158
+/// and :380-384, then `NestedSerializersSnapshotDelegate.writeNestedSerializerSnapshots`,
+/// NestedSerializersSnapshotDelegate.java:105-113). Returns the declared number of nested
+/// serializers and those that could be read, which stop at the first one that cannot.
+fn read_composite_nested(
+    r: &mut JavaReader<&[u8]>,
+    read_outer: impl FnOnce(&mut JavaReader<&[u8]>),
+) -> (usize, Vec<FieldTypeInfo>) {
     let magic1 = r.read_int().unwrap_or(0);
     if magic1 != COMPOSITE_TYPE_SERIALIZER_SNAPSHOT_MAGIC_NUMBER {
-        return Vec::new();
+        return (0, Vec::new());
     }
     let _outer_ver = r.read_int().unwrap_or(0);
     read_outer(r);
 
     let magic2 = r.read_int().unwrap_or(0);
     if magic2 != NESTED_SERIALIZERS_SNAPSHOT_DELEGATE_MAGIC_NUMBER {
-        return Vec::new();
+        return (0, Vec::new());
     }
     let _delegate_ver = r.read_int().unwrap_or(0);
     let num_nested = r.read_int().unwrap_or(0);
-    if num_nested <= 0 || num_nested > 10 {
-        return Vec::new();
+    if num_nested <= 0 || num_nested > MAX_NESTED_SERIALIZERS {
+        return (0, Vec::new());
     }
 
     let mut results = Vec::new();
@@ -263,7 +278,7 @@ fn read_composite_nested_serializers_with_outer(
             None => break,
         }
     }
-    results
+    (num_nested as usize, results)
 }
 
 /// Skip a Flink `LinkedOptionalMapSerializer` map: `writeLong(HEADER) + writeInt(size) + entries`.
@@ -304,6 +319,16 @@ fn read_versioned_snapshot(r: &mut JavaReader<&[u8]>) -> Option<FieldTypeInfo> {
         .unwrap_or(&class_name)
         .to_string();
     interpret_snapshot_class(r, &short)
+}
+
+/// The type of a serializer from its snapshot as `TypeSerializerSnapshotSerializationUtil`
+/// writes it (proxy version, class name, snapshot version, payload), in the vocabulary
+/// [`crate::parser::value::decode_field`] reads: `String`, `Tuple<String,Long>`,
+/// `Enum<Color:RED,GREEN>`, … Returns the type name and, for a POJO, its layout.
+pub fn read_serializer_snapshot_type(
+    r: &mut JavaReader<&[u8]>,
+) -> Option<(String, Option<PojoInfo>)> {
+    read_field_type(r).map(|ft| (ft.type_name, ft.nested_pojo.map(|p| *p)))
 }
 
 /// Read a field type with proxyVersion prefix:
@@ -364,6 +389,26 @@ fn interpret_snapshot_class(r: &mut JavaReader<&[u8]>, short: &str) -> Option<Fi
             format!("Enum<{}>", enum_short)
         } else {
             format!("Enum<{}:{}>", enum_short, constants.join(","))
+        };
+        return Some(FieldTypeInfo {
+            type_name,
+            nested_pojo: None,
+        });
+    }
+
+    // TupleSerializerSnapshot (flink-core java/typeutils/runtime/TupleSerializerSnapshot.java,
+    // release-1.20): a composite whose outer snapshot is `writeUTF(tupleClass.getName())` (:78-81),
+    // nesting one serializer per field (`getFieldSerializers`, :66-68). A tuple whose fields are not
+    // all typed stays a bare `Tuple`, which nothing decodes — a partial field list would misread it.
+    if crate::parser::keyed_state::serializer_name(short) == "TupleSerializer" {
+        let (declared, nested) = read_composite_nested(r, |or| {
+            let _ = or.read_utf(); // tupleClass.getName()
+        });
+        let type_name = if declared > 0 && nested.len() == declared {
+            let fields: Vec<String> = nested.into_iter().map(|f| f.type_name).collect();
+            format!("Tuple<{}>", fields.join(","))
+        } else {
+            "Tuple".to_string()
         };
         return Some(FieldTypeInfo {
             type_name,
@@ -448,61 +493,17 @@ fn interpret_snapshot_class(r: &mut JavaReader<&[u8]>, short: &str) -> Option<Fi
 }
 
 fn snapshot_to_type(short: &str) -> String {
-    if short.contains("StringSerializer") {
-        "String".into()
-    } else if short.contains("IntSerializer") {
-        "Int".into()
-    } else if short.contains("LongSerializer") {
-        "Long".into()
-    } else if short.contains("BooleanSerializer") {
-        "Boolean".into()
-    } else if short.contains("DoubleSerializer") {
-        "Double".into()
-    } else if short.contains("FloatSerializer") {
-        "Float".into()
-    } else if short.contains("ByteSerializer") {
-        "Byte".into()
-    } else if short.contains("ShortSerializer") {
-        "Short".into()
-    } else if short.contains("CharSerializer") {
-        // `CharSerializer$CharSerializerSnapshot` (`char` and `Character` fields alike).
-        "Char".into()
-    } else if short.contains("BytePrimitiveArraySerializer") {
-        "byte[]".into()
-    } else if short.contains("IntPrimitiveArraySerializer") {
-        "int[]".into()
-    } else if short.contains("LongPrimitiveArraySerializer") {
-        "long[]".into()
-    } else if short.contains("DoublePrimitiveArraySerializer") {
-        "double[]".into()
-    } else if short.contains("FloatPrimitiveArraySerializer") {
-        "float[]".into()
-    } else if short.contains("BooleanPrimitiveArraySerializer") {
-        "boolean[]".into()
-    } else if short.contains("ShortPrimitiveArraySerializer") {
-        "short[]".into()
-    } else if short.contains("CharPrimitiveArraySerializer") {
-        "char[]".into()
-    } else if short.contains("ListSerializer") {
+    // Leaf serializers are matched by exact name, in the table shared with the keyed-state header
+    // (a substring match read `BigIntSerializer` as `Int`).
+    if let Some(t) = crate::parser::keyed_state::leaf_serializer_type(short) {
+        return t.into();
+    }
+    if short.contains("ListSerializer") {
         "List<?>".into()
     } else if short.contains("MapSerializer") {
         "Map<?,?>".into()
     } else if short.contains("NullableSerializer") {
         "Nullable<?>".into()
-    } else if short.contains("LocalDateTimeSerializer") {
-        "LocalDateTime".into()
-    } else if short.contains("LocalDateSerializer") {
-        "LocalDate".into()
-    } else if short.contains("LocalTimeSerializer") {
-        "LocalTime".into()
-    } else if short.contains("InstantSerializer") {
-        "Instant".into()
-    } else if short.contains("DateSerializer") || short.contains("SqlDateSerializer") {
-        "Date".into()
-    } else if short.contains("TimestampSerializer") || short.contains("SqlTimestampSerializer") {
-        "Timestamp".into()
-    } else if short.contains("StringArraySerializer") {
-        "String[]".into()
     } else if short.contains("VoidNamespace") || short.contains("VoidSerializer") {
         "Void".into()
     } else {
@@ -520,6 +521,10 @@ fn skip_snapshot_data(r: &mut JavaReader<&[u8]>, short: &str) -> bool {
         || short.contains("ByteSerializer")
         || short.contains("ShortSerializer")
         || short.contains("CharSerializer")
+        // BigIntSerializer / BigDecSerializer snapshots are SimpleTypeSerializerSnapshots: no
+        // payload (SimpleTypeSerializerSnapshot.writeSnapshot, release-1.20, :90-92).
+        || short.contains("BigIntSerializer")
+        || short.contains("BigDecSerializer")
         || short.contains("VoidNamespace")
         || short.contains("VoidSerializer")
         || short.contains("PrimitiveArraySerializer")

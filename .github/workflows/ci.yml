@@ -18,7 +18,7 @@ jobs:
       # Windows is otherwise only built by release.yml, on a tag: catch cfg(windows) breaks here.
       - run: cargo check --target x86_64-pc-windows-gnu --all-targets
       - run: cargo test --lib
-      - run: cargo test --test cache_test --test empty_map_test --test integration_test --test java_deser_test --test metadata_test --test state_handle_test --test kafka_test --test real_savepoint_test --test keyed_block_test --test synth_savepoint_test --test state_file_errors_test --test tui_cap_test --test tui_text_test --test terminal_guard_test --test operator_state_test --test value_decode_test
+      - run: cargo test --test cache_test --test empty_map_test --test integration_test --test java_deser_test --test metadata_test --test state_handle_test --test kafka_test --test real_savepoint_test --test keyed_block_test --test synth_savepoint_test --test state_file_errors_test --test tui_cap_test --test tui_text_test --test terminal_guard_test --test operator_state_test --test value_decode_test --test key_types_test
 
   # Le générateur de fixtures Java n'était pas construit par la CI : un bump Dependabot
   # sur test-flink-job/pom.xml pouvait casser `mvn verify` sans qu'aucun check ne le voie.
