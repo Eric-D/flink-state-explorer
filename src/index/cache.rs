@@ -28,7 +28,11 @@ use crate::error::IndexError;
 ///    `StringValue` strings keep their surrogate pairs (String keys and operator-state elements
 ///    with an emoji used to lose it); POJO keys, rendered by `parser::value`, decode their `char`
 ///    fields and show markers instead of `null` for what could not be decoded.
-pub const CACHE_FORMAT: u32 = 6;
+/// 7: `KeyPartition.key` is rendered by `parser::value::decode_key` (Short, Double, Boolean,
+///    BigInteger, Tuple… keys decoded; undecodable ones as `0x…` hex, namespace split off), so
+///    keys that used to merge into one partition are now distinct; `BigInteger` values no longer
+///    read as `Int`.
+pub const CACHE_FORMAT: u32 = 7;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IndexCache {

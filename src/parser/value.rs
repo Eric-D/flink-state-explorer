@@ -387,6 +387,10 @@ fn decode_scalar(r: &mut JavaReader<&[u8]>, type_name: &str) -> Option<Value> {
         // CharSerializer: `writeChar`, one UTF-16 code unit (`api/common/typeutils/base/
         // CharSerializer.java:66-68`).
         "Char" => r.read_char().ok().map(char_value),
+        // BigIntSerializer / BigDecSerializer (flink-core typeutils/base, release-1.20): see
+        // `read_big_integer`. A null value is written as length 0 and decodes to `null`.
+        "BigInteger" => read_big_integer(r).map(|v| v.map_or(Value::Null, Value::String)),
+        "BigDecimal" => read_big_decimal(r).map(|v| v.map_or(Value::Null, Value::String)),
         // StringSerializer is `StringValue.writeString` (`StringSerializer.java:67-68`), which,
         // unlike most serializers, writes a null String (as length 0): that one is a real null.
         "String" => r
@@ -485,16 +489,6 @@ fn decode_scalar(r: &mut JavaReader<&[u8]>, type_name: &str) -> Option<Value> {
         // Kryo and unknown serializers: cannot decode (and length is unknown → caller stops).
         _ => None,
     }
-}
-
-/// A Java `char` as a one-character string. A lone surrogate (half of a pair, which a `char` may
-/// hold) has no Rust `char` and becomes U+FFFD.
-fn char_value(unit: u16) -> Value {
-    Value::String(
-        char::decode_utf16([unit])
-            .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
-            .collect(),
-    )
 }
 
 /// `TupleSerializer`: the fields back to back, no null flags (`api/java/typeutils/runtime/
@@ -686,7 +680,251 @@ fn decode_map_blob(
     Value::Object(obj)
 }
 
+// --- keys ---------------------------------------------------------------------------------------
+
+/// Decode a keyed-state key: the key serializer's bytes, starting right after the key-group
+/// prefix. Returns the key's display form and the number of bytes the key occupies, or `None`
+/// when the key serializer is not one this decoder reads (the caller then renders the key with
+/// [`opaque_key`]).
+///
+/// The index groups entries by this display form, so it must be **injective**: two distinct keys
+/// must never render alike. Hence:
+/// - scalars render as their value (`String` as-is, numbers and booleans in JSON form, `Char` as
+///   the character, `BigInteger`/`BigDecimal` exactly);
+/// - a `Tuple` renders as compact JSON (`["user-1",1]`), which escapes its strings — a naive
+///   `(a,b)` join would merge `("a,b","c")` with `("a","b,c")`;
+/// - a POJO key keeps its established `{ field: value, … }` rendering;
+/// - a value that decodes to `null` (a `Double` NaN, a field that failed inside a tuple) renders
+///   opaquely over exactly the bytes the key occupies;
+/// - serializers whose rendering drops information (`Timestamp`, `Instant`, `LocalTime` and
+///   `LocalDateTime` print milliseconds only; `byte[]` falls back to `[N bytes]`) are left to
+///   [`opaque_key`].
+pub fn decode_key(
+    bytes: &[u8],
+    key_type: &str,
+    key_pojo: Option<&PojoInfo>,
+) -> Option<(String, usize)> {
+    let mut r = JavaReader::new(bytes);
+    if key_type == "Pojo" {
+        let info = key_pojo?;
+        let v = decode_pojo(&mut r, info, None);
+        return Some((value_to_display(&v), r.position() as usize));
+    }
+    if !key_renders_injectively(key_type) {
+        return None;
+    }
+    let v = decode_field(&mut r, key_type, None, None)?;
+    let used = r.position() as usize;
+    let text = render_key(&v).unwrap_or_else(|| opaque_key(&bytes[..used]));
+    Some((text, used))
+}
+
+/// The display form of a key that could not be decoded: `0x` + the hex of its serialized bytes.
+/// Distinct keys serialize to distinct bytes, so they stay distinct.
+pub fn opaque_key(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(2 + bytes.len() * 2);
+    s.push_str("0x");
+    for b in bytes {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
+}
+
+/// How many bytes one value of `type_name` occupies at the start of `bytes`, if it decodes.
+pub fn decoded_len(bytes: &[u8], type_name: &str) -> Option<usize> {
+    let mut r = JavaReader::new(bytes);
+    decode_field(&mut r, type_name, None, None).map(|_| r.position() as usize)
+}
+
+/// Key serializer types whose decoded form is rendered without losing information. (Enums and
+/// arrays never key a stream: `KeyedStream.validateKeyTypeIsHashable` rejects them,
+/// flink-streaming-java KeyedStream.java:225-237, release-1.20.)
+fn key_renders_injectively(key_type: &str) -> bool {
+    match key_type {
+        "String" | "Long" | "Int" | "Short" | "Byte" | "Char" | "Boolean" | "Float" | "Double"
+        | "BigInteger" | "BigDecimal" | "Date" | "LocalDate" => true,
+        t => t
+            .strip_prefix("Tuple<")
+            .and_then(|s| s.strip_suffix('>'))
+            .is_some_and(|inner| {
+                split_top_level(inner)
+                    .iter()
+                    .all(|f| key_renders_injectively(f.trim()))
+            }),
+    }
+}
+
+/// A decoded key as text, or `None` if any part of it is `null` (not a real key value: Flink
+/// rejects null keys and null tuple fields, so it means "could not be decoded").
+fn render_key(v: &Value) -> Option<String> {
+    fn has_null(v: &Value) -> bool {
+        match v {
+            Value::Null => true,
+            Value::Array(items) => items.iter().any(has_null),
+            Value::Object(map) => map.values().any(has_null),
+            _ => false,
+        }
+    }
+    match v {
+        Value::Null => None,
+        Value::String(s) => Some(s.clone()),
+        Value::Bool(b) => Some(b.to_string()),
+        Value::Number(n) => Some(n.to_string()),
+        composite if has_null(composite) => None,
+        composite => Some(composite.to_string()),
+    }
+}
+
 // --- small helpers ----------------------------------------------------------------------------
+
+/// A `char` as a one-character string; a lone UTF-16 surrogate (which no Rust `char` can hold)
+/// as its Java escape, so it stays distinct from every real character.
+fn char_value(unit: u16) -> Value {
+    match char::from_u32(unit as u32) {
+        Some(c) => Value::String(c.to_string()),
+        None => Value::String(format!("\\u{:04X}", unit)),
+    }
+}
+
+/// Largest `BigInteger` magnitude we render, in bytes (~19 700 decimal digits). Anything larger is
+/// treated as corrupt rather than allocated and converted.
+const MAX_BIG_INTEGER_BYTES: usize = 8192;
+
+/// Read a `BigIntSerializer` value as a decimal string. `None` = could not be read; `Some(None)` =
+/// a null value.
+///
+/// Layout (flink-core `BigIntSerializer.writeBigInteger`/`readBigInteger`, release-1.20,
+/// BigIntSerializer.java:87-131): `writeInt(len)`, where `0` = null and `1`/`2`/`3` are the fast
+/// paths for `BigInteger.ZERO`/`ONE`/`TEN`; otherwise `len - 4` bytes of
+/// `BigInteger.toByteArray()` follow (big-endian two's complement).
+fn read_big_integer(r: &mut JavaReader<&[u8]>) -> Option<Option<String>> {
+    let len = r.read_int().ok()?;
+    match len {
+        0 => Some(None),
+        1 => Some(Some("0".to_string())),
+        2 => Some(Some("1".to_string())),
+        3 => Some(Some("10".to_string())),
+        // `new BigInteger(new byte[0])` throws, so a length of 4 is never written.
+        n if n > 4 && (n as usize - 4) <= MAX_BIG_INTEGER_BYTES => {
+            let bytes = r.read_bytes(n as usize - 4).ok()?;
+            Some(Some(twos_complement_to_decimal(&bytes)))
+        }
+        _ => None,
+    }
+}
+
+/// Read a `BigDecSerializer` value as Java's `BigDecimal.toString()`. `Some(None)` = null.
+///
+/// Layout (flink-core `BigDecSerializer.serialize`/`readBigDecimal`, release-1.20,
+/// BigDecSerializer.java:65-131): the unscaled value as a `BigIntSerializer` BigInteger (null ⇒
+/// null, and nothing follows), then `writeInt(scale)`.
+fn read_big_decimal(r: &mut JavaReader<&[u8]>) -> Option<Option<String>> {
+    let Some(unscaled) = read_big_integer(r)? else {
+        return Some(None);
+    };
+    let scale = r.read_int().ok()?;
+    Some(Some(big_decimal_to_string(&unscaled, scale)))
+}
+
+/// Decimal form of a big-endian two's complement integer (`BigInteger.toByteArray()`).
+fn twos_complement_to_decimal(bytes: &[u8]) -> String {
+    let negative = bytes.first().is_some_and(|b| b & 0x80 != 0);
+    // Magnitude, big-endian base 256: the bytes themselves, or their two's complement negation.
+    let mut mag: Vec<u8> = bytes.to_vec();
+    if negative {
+        for b in mag.iter_mut() {
+            *b = !*b;
+        }
+        for b in mag.iter_mut().rev() {
+            let (v, carry) = b.overflowing_add(1);
+            *b = v;
+            if !carry {
+                break;
+            }
+        }
+    }
+    // Repeated division by 10^9 yields base-10^9 digits, least significant first.
+    const BASE: u64 = 1_000_000_000;
+    let mut start = mag.iter().position(|&b| b != 0).unwrap_or(mag.len());
+    let mut chunks: Vec<u32> = Vec::new();
+    while start < mag.len() {
+        let mut rem: u64 = 0;
+        for b in &mut mag[start..] {
+            let cur = (rem << 8) | *b as u64;
+            *b = (cur / BASE) as u8;
+            rem = cur % BASE;
+        }
+        chunks.push(rem as u32);
+        while start < mag.len() && mag[start] == 0 {
+            start += 1;
+        }
+    }
+    let mut out = String::new();
+    if negative {
+        out.push('-');
+    }
+    match chunks.split_last() {
+        None => out.push('0'),
+        Some((most, rest)) => {
+            out.push_str(&most.to_string());
+            for c in rest.iter().rev() {
+                out.push_str(&format!("{:09}", c));
+            }
+        }
+    }
+    out
+}
+
+/// Java's `BigDecimal.toString()` for `unscaled × 10^-scale` (`unscaled` in decimal, possibly
+/// negative). Java documents this form as one-to-one with `(unscaled, scale)`, which keeps `1.0`
+/// and `1.00` distinct — they are distinct keys, since `BigDecimal.equals` compares the scale.
+///
+/// The algorithm is the one `BigDecimal.toString()`'s Javadoc specifies: with
+/// `adjusted = -scale + (digits - 1)`, plain notation when `scale >= 0 && adjusted >= -6`,
+/// otherwise one digit, the remaining digits after a point, and `E±adjusted`.
+fn big_decimal_to_string(unscaled: &str, scale: i32) -> String {
+    let (negative, digits) = match unscaled.strip_prefix('-') {
+        Some(d) => (true, d),
+        None => (false, unscaled),
+    };
+    let ulen = digits.len() as i64;
+    let scale = scale as i64;
+    let adjusted = -scale + (ulen - 1);
+    let mut out = String::new();
+    if negative {
+        out.push('-');
+    }
+    if scale >= 0 && adjusted >= -6 {
+        if scale == 0 {
+            out.push_str(digits);
+        } else if scale < ulen {
+            let point = (ulen - scale) as usize;
+            out.push_str(&digits[..point]);
+            out.push('.');
+            out.push_str(&digits[point..]);
+        } else {
+            out.push_str("0.");
+            for _ in 0..(scale - ulen) {
+                out.push('0');
+            }
+            out.push_str(digits);
+        }
+    } else {
+        out.push_str(&digits[..1]);
+        if ulen > 1 {
+            out.push('.');
+            out.push_str(&digits[1..]);
+        }
+        if adjusted != 0 {
+            out.push('E');
+            if adjusted > 0 {
+                out.push('+');
+            }
+            out.push_str(&adjusted.to_string());
+        }
+    }
+    out
+}
 
 fn read_len_bytes(r: &mut JavaReader<&[u8]>) -> Option<Vec<u8>> {
     let len = r.read_int().ok()?;

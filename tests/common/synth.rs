@@ -30,13 +30,16 @@
 //!   broadcast map; with compression, everything after the header is one Snappy-framed stream,
 //!   flushed before each recorded offset. `operator_stream_matches_real_flink_streams` in
 //!   `tests/operator_state_test.rs` compares whole streams byte for byte with ones Flink wrote.
+//! - keys and values of the basic serializers (`String`, `Long`, `Int`, `Boolean`, `Double`,
+//!   `Short`, `Byte`, `Float`, `Char`, `BigInteger`), `Tuple`s of them (`TupleSerializerSnapshot`)
+//!   and an opaque user serializer, each with the `hashCode()` of the Java object it stands for.
 
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Scalar serializers this generator can write (keys, values, map keys/values, list elements).
+/// Serializers this generator can write (keys, values, map keys/values, list elements).
 /// `CharArray` is a value only: Java arrays hash by identity, so one is never a key.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Ser {
@@ -45,11 +48,24 @@ pub enum Ser {
     Int,
     Boolean,
     Double,
+    Short,
+    Byte,
+    Float,
     Char,
     CharArray,
+    /// `BigIntSerializer` (java.math.BigInteger).
+    BigInteger,
+    /// `TupleSerializer` over these field serializers (`Tuple2` for two fields, …).
+    Tuple(&'static [Ser]),
+    /// A user serializer the explorer cannot decode, by its snapshot class: a
+    /// `SimpleTypeSerializerSnapshot` subclass (no payload), as a `TypeSerializerSingleton` has.
+    /// Its records are [`Val::Opaque`] bytes.
+    Opaque(&'static str),
 }
 
 impl Ser {
+    /// The snapshot class of a leaf serializer: each is a `SimpleTypeSerializerSnapshot` nested in
+    /// its serializer (flink-core `typeutils/base/<X>Serializer.java`, release-1.20).
     fn snapshot_class(self) -> &'static str {
         match self {
             // Both are `SimpleTypeSerializerSnapshot`s, like the others here (snapshot version 3,
@@ -76,11 +92,28 @@ impl Ser {
             Ser::Double => {
                 "org.apache.flink.api.common.typeutils.base.DoubleSerializer$DoubleSerializerSnapshot"
             }
+            Ser::Short => {
+                "org.apache.flink.api.common.typeutils.base.ShortSerializer$ShortSerializerSnapshot"
+            }
+            Ser::Byte => {
+                "org.apache.flink.api.common.typeutils.base.ByteSerializer$ByteSerializerSnapshot"
+            }
+            Ser::Float => {
+                "org.apache.flink.api.common.typeutils.base.FloatSerializer$FloatSerializerSnapshot"
+            }
+            Ser::Char => {
+                "org.apache.flink.api.common.typeutils.base.CharSerializer$CharSerializerSnapshot"
+            }
+            Ser::BigInteger => {
+                "org.apache.flink.api.common.typeutils.base.BigIntSerializer$BigIntSerializerSnapshot"
+            }
+            Ser::Opaque(class) => class,
+            Ser::Tuple(_) => unreachable!("a tuple snapshot is composite"),
         }
     }
 }
 
-/// A scalar value, serialized the way the matching Flink serializer writes it.
+/// A value, serialized the way the matching Flink serializer writes it.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Val {
     Str(String),
@@ -88,10 +121,23 @@ pub enum Val {
     Int(i32),
     Bool(bool),
     Double(f64),
-    /// A Java `char`: one UTF-16 code unit, possibly half of a surrogate pair.
+    Short(i16),
+    Byte(i8),
+    Float(f32),
+    /// A Java `char`: one UTF-16 code unit.
     Char(u16),
     /// A Java `char[]`.
     Chars(Vec<u16>),
+    /// A `java.math.BigInteger`, as `BigInteger.valueOf` creates it.
+    BigInt(i128),
+    /// A Flink `TupleN` (fields non-null, as `TupleSerializer` requires).
+    Tuple(Vec<Val>),
+    /// The record of a [`Ser::Opaque`] serializer: its bytes, and the `hashCode()` of the Java
+    /// object they stand for.
+    Opaque {
+        bytes: Vec<u8>,
+        hash: i32,
+    },
 }
 
 impl Val {
@@ -102,15 +148,26 @@ impl Val {
     /// The bytes Flink's serializer writes (`StringSerializer` = `StringValue.writeString`).
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
+        self.encode_into(&mut out);
+        out
+    }
+
+    fn encode_into(&self, out: &mut Vec<u8>) {
         match self {
-            Val::Str(s) => write_string_value(&mut out, s),
+            Val::Str(s) => write_string_value(out, s),
             Val::Long(v) => out.extend_from_slice(&v.to_be_bytes()),
             Val::Int(v) => out.extend_from_slice(&v.to_be_bytes()),
             Val::Bool(v) => out.push(*v as u8),
-            Val::Double(v) => out.extend_from_slice(&v.to_bits().to_be_bytes()),
-            // `CharSerializer.serialize` = `writeChar` (`CharSerializer.java:66-68`), high byte
-            // first (`DataOutputSerializer.writeChar`, `DataOutputSerializer.java:167-173`).
-            Val::Char(c) => out.extend_from_slice(&c.to_be_bytes()),
+            // DataOutput.writeDouble = writeLong(doubleToLongBits): NaN is canonical.
+            Val::Double(v) => out.extend_from_slice(&java_double_bits(*v).to_be_bytes()),
+            // ShortSerializer: writeShort (ShortSerializer.java:66-67).
+            Val::Short(v) => out.extend_from_slice(&v.to_be_bytes()),
+            // ByteSerializer: writeByte (ByteSerializer.java:66-67).
+            Val::Byte(v) => out.push(*v as u8),
+            // FloatSerializer: writeFloat = writeInt(floatToIntBits) (FloatSerializer.java:66-67).
+            Val::Float(v) => out.extend_from_slice(&java_float_bits(*v).to_be_bytes()),
+            // CharSerializer: writeChar, 2 bytes (CharSerializer.java:66-67).
+            Val::Char(v) => out.extend_from_slice(&v.to_be_bytes()),
             // `CharPrimitiveArraySerializer.serialize`: `writeInt(length)`, then `writeChar` per
             // element (`CharPrimitiveArraySerializer.java:73-77`).
             Val::Chars(cs) => {
@@ -119,8 +176,29 @@ impl Val {
                     out.extend_from_slice(&c.to_be_bytes());
                 }
             }
+            // BigIntSerializer.writeBigInteger (BigIntSerializer.java:87-112): `writeInt(1|2|3)`
+            // for the ZERO/ONE/TEN constants (compared by reference — and `BigInteger.valueOf`
+            // returns those very constants for 0, 1 and 10), else `writeInt(len + 4)` and
+            // `toByteArray()`.
+            Val::BigInt(v) => match v {
+                0 => out.extend_from_slice(&1i32.to_be_bytes()),
+                1 => out.extend_from_slice(&2i32.to_be_bytes()),
+                10 => out.extend_from_slice(&3i32.to_be_bytes()),
+                v => {
+                    let bytes = big_integer_to_byte_array(*v);
+                    out.extend_from_slice(&(bytes.len() as i32 + 4).to_be_bytes());
+                    out.extend_from_slice(&bytes);
+                }
+            },
+            // TupleSerializer.serialize: each field's serializer in turn, no null flags
+            // (flink-core java/typeutils/runtime/TupleSerializer.java:129-138).
+            Val::Tuple(fields) => {
+                for f in fields {
+                    f.encode_into(out);
+                }
+            }
+            Val::Opaque { bytes, .. } => out.extend_from_slice(bytes),
         }
-        out
     }
 
     /// `hashCode()` of the boxed Java value: what `KeyGroupRangeAssignment` hashes.
@@ -137,30 +215,50 @@ impl Val {
                 }
             }
             Val::Double(d) => {
-                let bits = d.to_bits() as i64;
+                let bits = java_double_bits(*d);
                 (bits ^ ((bits as u64) >> 32) as i64) as i32
             }
-            // `Character.hashCode()` is the char's value.
-            Val::Char(c) => *c as i32,
+            // Short.hashCode / Byte.hashCode / Character.hashCode: `(int) value`.
+            Val::Short(v) => *v as i32,
+            Val::Byte(v) => *v as i32,
+            Val::Char(v) => *v as i32,
             Val::Chars(_) => panic!("a char[] is never a key: Java arrays hash by identity"),
+            // Float.hashCode: floatToIntBits(value).
+            Val::Float(f) => java_float_bits(*f),
+            Val::BigInt(v) => java_big_integer_hash(*v),
+            // Tuple2.hashCode: `31 * f0.hashCode() + f1.hashCode()` (Tuple2.java:173-177); every
+            // TupleN folds its fields the same way.
+            Val::Tuple(fields) => fields
+                .iter()
+                .fold(0i32, |h, f| h.wrapping_mul(31).wrapping_add(f.java_hash())),
+            Val::Opaque { hash, .. } => *hash,
         }
     }
 
-    /// How the explorer renders this value as a key or a JSON scalar.
+    /// How the explorer renders this value as a key (`parser::value::decode_key`).
     pub fn render(&self) -> String {
         match self {
             Val::Str(s) => s.clone(),
             Val::Long(v) => v.to_string(),
             Val::Int(v) => v.to_string(),
             Val::Bool(v) => v.to_string(),
-            Val::Double(v) => v.to_string(),
-            Val::Char(c) => char_string(*c),
+            Val::Short(v) => v.to_string(),
+            Val::Byte(v) => v.to_string(),
+            Val::BigInt(v) => v.to_string(),
+            Val::Char(v) => char_string(*v),
             Val::Chars(_) => self.json().to_string(),
+            // Numbers render in their JSON form (`3.0`, `-0.0`, `1e+300`); NaN and ±Infinity have
+            // none, so they render as the hex of their bytes.
+            Val::Double(d) if !d.is_finite() => opaque(&self.encode()),
+            Val::Float(f) if !f.is_finite() => opaque(&self.encode()),
+            Val::Double(_) | Val::Float(_) => self.json().to_string(),
+            // A tuple renders as compact JSON, which escapes its strings.
+            Val::Tuple(_) => self.json().to_string(),
+            Val::Opaque { bytes, .. } => opaque(bytes),
         }
     }
 
-    /// The explorer's JSON for this value: a `char` is a one-character string, a `char[]` an
-    /// array of them.
+    /// The value as the explorer decodes it (`parser::value::decode_state_value`).
     pub fn json(&self) -> serde_json::Value {
         match self {
             Val::Str(s) => serde_json::Value::String(s.clone()),
@@ -168,18 +266,86 @@ impl Val {
             Val::Int(v) => serde_json::json!(v),
             Val::Bool(v) => serde_json::json!(v),
             Val::Double(v) => serde_json::json!(v),
+            Val::Short(v) => serde_json::json!(v),
+            Val::Byte(v) => serde_json::json!(v),
+            Val::Float(v) => serde_json::json!(v),
             Val::Char(c) => serde_json::Value::String(char_string(*c)),
             Val::Chars(cs) => cs
                 .iter()
                 .map(|c| serde_json::Value::String(char_string(*c)))
                 .collect(),
+            // Exact, as a string: a BigInteger outgrows every JSON number type.
+            Val::BigInt(v) => serde_json::Value::String(v.to_string()),
+            Val::Tuple(fields) => serde_json::Value::Array(fields.iter().map(Val::json).collect()),
+            // Nothing decodes an opaque serializer.
+            Val::Opaque { .. } => serde_json::Value::Null,
         }
     }
 }
 
-/// One UTF-16 unit as a string; a lone surrogate has no Rust `char` and is U+FFFD.
+/// One UTF-16 unit as the explorer renders it: the character, or, for a lone surrogate (no Rust
+/// `char` holds one), its Java escape, so it stays distinct from every real character.
 fn char_string(unit: u16) -> String {
-    String::from_utf16(&[unit]).unwrap_or_else(|_| "\u{FFFD}".to_string())
+    match char::from_u32(unit as u32) {
+        Some(c) => c.to_string(),
+        None => format!("\\u{:04X}", unit),
+    }
+}
+
+/// How the explorer renders a key it cannot decode: `0x` + the hex of its bytes.
+fn opaque(bytes: &[u8]) -> String {
+    let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+    format!("0x{}", hex)
+}
+
+/// `Double.doubleToLongBits`: the raw bits, with every NaN collapsed to the canonical one.
+fn java_double_bits(d: f64) -> i64 {
+    if d.is_nan() {
+        0x7ff8_0000_0000_0000
+    } else {
+        d.to_bits() as i64
+    }
+}
+
+/// `Float.floatToIntBits`: the raw bits, with every NaN collapsed to the canonical one.
+fn java_float_bits(f: f32) -> i32 {
+    if f.is_nan() {
+        0x7fc0_0000
+    } else {
+        f.to_bits() as i32
+    }
+}
+
+/// `BigInteger.toByteArray()`: big-endian two's complement in the minimum number of bytes,
+/// including at least one sign bit.
+fn big_integer_to_byte_array(v: i128) -> Vec<u8> {
+    let bytes = v.to_be_bytes();
+    let mut start = 0;
+    while start < bytes.len() - 1 {
+        let redundant = (bytes[start] == 0x00 && bytes[start + 1] & 0x80 == 0)
+            || (bytes[start] == 0xff && bytes[start + 1] & 0x80 != 0);
+        if !redundant {
+            break;
+        }
+        start += 1;
+    }
+    bytes[start..].to_vec()
+}
+
+/// `BigInteger.hashCode()`: `hashCode = (int)(31 * hashCode + (mag[i] & LONG_MASK))` over the
+/// magnitude's big-endian ints (no leading zero int), times the signum.
+fn java_big_integer_hash(v: i128) -> i32 {
+    let signum = v.signum() as i32;
+    let mag = v.unsigned_abs().to_be_bytes();
+    let words: Vec<u32> = mag
+        .chunks(4)
+        .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+        .skip_while(|&w| w == 0)
+        .collect();
+    let h = words
+        .iter()
+        .fold(0i32, |h, &w| h.wrapping_mul(31).wrapping_add(w as i32));
+    h.wrapping_mul(signum)
 }
 
 /// The kind of a registered state.
@@ -1001,19 +1167,43 @@ fn proxied_snapshot(out: &mut Vec<u8>, snap: Snap) {
 /// version, then `NestedSerializersSnapshotDelegate` writes its own magic, version and the nested
 /// snapshots (versioned, without the proxy version).
 fn versioned_snapshot(out: &mut Vec<u8>, snap: Snap) {
-    let composite = |out: &mut Vec<u8>, class: &str, outer_version: i32, nested: &[Snap]| {
-        write_utf(out, class);
-        out.extend_from_slice(&3i32.to_be_bytes());
-        out.extend_from_slice(&911_108i32.to_be_bytes()); // CompositeTypeSerializerSnapshot.MAGIC_NUMBER
-        out.extend_from_slice(&outer_version.to_be_bytes());
-        out.extend_from_slice(&1_333_245i32.to_be_bytes()); // NestedSerializersSnapshotDelegate.MAGIC_NUMBER
-        out.extend_from_slice(&1i32.to_be_bytes());
-        out.extend_from_slice(&(nested.len() as i32).to_be_bytes());
-        for n in nested {
-            versioned_snapshot(out, *n);
-        }
-    };
+    // `outer` is the composite's own `writeOuterSnapshot` payload, written right after its outer
+    // version (CompositeTypeSerializerSnapshot.java:380-384).
+    let composite =
+        |out: &mut Vec<u8>, class: &str, outer_version: i32, outer: &[u8], nested: &[Snap]| {
+            write_utf(out, class);
+            out.extend_from_slice(&3i32.to_be_bytes());
+            out.extend_from_slice(&911_108i32.to_be_bytes()); // CompositeTypeSerializerSnapshot.MAGIC_NUMBER
+            out.extend_from_slice(&outer_version.to_be_bytes());
+            out.extend_from_slice(outer);
+            out.extend_from_slice(&1_333_245i32.to_be_bytes()); // NestedSerializersSnapshotDelegate.MAGIC_NUMBER
+            out.extend_from_slice(&1i32.to_be_bytes());
+            out.extend_from_slice(&(nested.len() as i32).to_be_bytes());
+            for n in nested {
+                versioned_snapshot(out, *n);
+            }
+        };
     match snap {
+        // TupleSerializerSnapshot (flink-core java/typeutils/runtime/TupleSerializerSnapshot.java):
+        // outer version 2 (:39), outer snapshot `writeUTF(tupleClass.getName())` (:78-81), one
+        // nested snapshot per field serializer (:66-68).
+        Snap::Scalar(Ser::Tuple(fields)) => {
+            let mut outer = Vec::new();
+            write_utf(
+                &mut outer,
+                &format!("org.apache.flink.api.java.tuple.Tuple{}", fields.len()),
+            );
+            let nested: Vec<Snap> = fields.iter().map(|f| Snap::Scalar(*f)).collect();
+            composite(
+                out,
+                "org.apache.flink.api.java.typeutils.runtime.TupleSerializerSnapshot",
+                2,
+                &outer,
+                &nested,
+            )
+        }
+        // SimpleTypeSerializerSnapshot: CURRENT_VERSION 3, no payload
+        // (SimpleTypeSerializerSnapshot.java:47, :90-92).
         Snap::Scalar(s) => {
             write_utf(out, s.snapshot_class());
             out.extend_from_slice(&3i32.to_be_bytes());
@@ -1029,18 +1219,21 @@ fn versioned_snapshot(out: &mut Vec<u8>, snap: Snap) {
             out,
             "org.apache.flink.api.common.typeutils.base.MapSerializerSnapshot",
             1,
+            &[],
             &[Snap::Scalar(k), Snap::Scalar(v)],
         ),
         Snap::List(e) => composite(
             out,
             "org.apache.flink.api.common.typeutils.base.ListSerializerSnapshot",
             1,
+            &[],
             &[Snap::Scalar(e)],
         ),
         Snap::Timer(k) => composite(
             out,
             "org.apache.flink.streaming.api.operators.TimerSerializerSnapshot",
             2,
+            &[],
             &[Snap::Scalar(k), Snap::VoidNamespace],
         ),
     }
