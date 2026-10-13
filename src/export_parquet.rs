@@ -45,7 +45,8 @@ impl ValueColumn {
             "Byte" | "Short" | "Int" | "Long" => ValueColumn::Int64,
             "Float" | "Double" => ValueColumn::Float64,
             "Boolean" => ValueColumn::Boolean,
-            "String" => ValueColumn::Utf8,
+            // A `Char` decodes to a one-character string.
+            "String" | "Char" => ValueColumn::Utf8,
             _ => ValueColumn::Json,
         }
     }
@@ -130,7 +131,9 @@ impl Builders {
         self.namespace_hex.append_option(row.namespace_hex);
 
         // A value that does not fit the column — a `null`, or a number where the serializer said
-        // boolean — becomes NULL rather than a silently coerced wrong value.
+        // boolean — becomes NULL rather than a silently coerced wrong value. So does, in a typed
+        // scalar column, the marker of a value that could not be decoded (`parser::value`): only
+        // bytes that end before the scalar does produce one there.
         match (&mut self.value, kind) {
             (ValueBuilder::Int64(b), _) => b.append_option(row.value.as_i64()),
             (ValueBuilder::Float64(b), _) => b.append_option(row.value.as_f64()),

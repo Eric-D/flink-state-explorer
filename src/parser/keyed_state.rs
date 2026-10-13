@@ -1245,6 +1245,8 @@ fn snapshot_class_to_type(class: &str) -> String {
         "short[]".into()
     } else if short.contains("BooleanPrimitiveArraySerializer") {
         "boolean[]".into()
+    } else if short.contains("CharPrimitiveArraySerializer") {
+        "char[]".into()
     } else if short.contains("TupleSerializer") {
         "Tuple".into()
     } else if short.contains("TtlSerializer") {
@@ -1257,6 +1259,8 @@ fn snapshot_class_to_type(class: &str) -> String {
         "String[]".into()
     } else if short.contains("ShortSerializer") {
         "Short".into()
+    } else if short.contains("CharSerializer") {
+        "Char".into()
     } else if short.contains("ByteSerializer") && !short.contains("Array") {
         "Byte".into()
     } else if short.contains("LocalDateTimeSerializer") {

@@ -464,6 +464,9 @@ fn snapshot_to_type(short: &str) -> String {
         "Byte".into()
     } else if short.contains("ShortSerializer") {
         "Short".into()
+    } else if short.contains("CharSerializer") {
+        // `CharSerializer$CharSerializerSnapshot` (`char` and `Character` fields alike).
+        "Char".into()
     } else if short.contains("BytePrimitiveArraySerializer") {
         "byte[]".into()
     } else if short.contains("IntPrimitiveArraySerializer") {
@@ -582,20 +585,24 @@ pub fn deserialize_pojo_to_json_with_pos(
     let mut r = JavaReader::new(raw);
     let value = crate::parser::value::decode_pojo(&mut r, info, proto_ctx);
     (
-        crate::parser::value::value_to_display(&value),
+        crate::parser::value::value_to_display(&crate::parser::value::value_of(value)),
         r.position() as usize,
     )
 }
 
-/// Read a single field value from the reader. Public for use in tree display.
+/// Read a single field value from the reader, rendered for display. Public for use in tree
+/// display. `Err` is the rendered partial value of a field that could not be fully decoded: the
+/// reader position is then unreliable (see [`crate::parser::value::Decoded`]).
 pub fn read_field_value_pub(
     r: &mut JavaReader<&[u8]>,
     type_name: &str,
     nested: Option<&PojoInfo>,
     proto_ctx: Option<&crate::proto::ProtoContext>,
-) -> Option<String> {
+) -> Result<String, String> {
+    use crate::parser::value::value_to_display;
     crate::parser::value::decode_field(r, type_name, nested, proto_ctx)
-        .map(|v| crate::parser::value::value_to_display(&v))
+        .map(|v| value_to_display(&v))
+        .map_err(|v| value_to_display(&v))
 }
 
 /// Convert epoch milliseconds to ISO 8601 format (UTC).
@@ -639,5 +646,29 @@ pub fn millis_to_iso(millis: i64) -> String {
             "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
             y, m, d, hour, minute, second, ms
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn char_field_serializers_map_to_the_decoder_types() {
+        // The snapshot classes of a `char`/`Character` field and of a `char[]` one (flink-core
+        // release-1.20: CharSerializer.java:94, CharPrimitiveArraySerializer.java:113). Both are
+        // `SimpleTypeSerializerSnapshot`s: nothing follows their version.
+        for (snapshot, expected) in [
+            ("CharSerializer$CharSerializerSnapshot", "Char"),
+            (
+                "CharPrimitiveArraySerializer$CharPrimitiveArraySerializerSnapshot",
+                "char[]",
+            ),
+        ] {
+            let mut r = JavaReader::new(&[][..]);
+            let field = interpret_snapshot_class(&mut r, snapshot).expect("a known snapshot");
+            assert_eq!(field.type_name, expected, "{}", snapshot);
+            assert_eq!(r.position(), 0, "{} has no payload", snapshot);
+        }
     }
 }

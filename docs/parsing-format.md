@@ -185,7 +185,10 @@ Flink uses `StringValue.writeString()`, **NOT** Java's `DataOutput.writeUTF()`:
 └─────────────────────────────────────────────┘
 ```
 
-Variable-length int: 7 bits per byte, high bit = continuation.
+Variable-length int: 7 bits per byte, high bit = continuation. A "char" is a Java `char`, i.e. a
+UTF-16 code unit (`writeString` walks `charAt`): a character outside the BMP (an emoji) is two
+surrogate units, which must be decoded together. `StringSerializer` delegates to `writeString`, so
+a null String is written as a single `0` (unlike most serializers, it accepts null).
 
 ## Header: State Metadata & Serializer Snapshots
 
@@ -286,11 +289,14 @@ byte: flags
     0x01 = IS_NULL (value is null, stop here)
     0x02 = NO_SUBCLASS (exact class match)
     0x04 = IS_SUBCLASS (followed by writeUTF classname)
-    0x08 = IS_TAGGED_SUBCLASS (followed by int tag)
+    0x08 = IS_TAGGED_SUBCLASS (followed by writeByte tag)
 
-For each field (alphabetical order):
+NO_SUBCLASS — for each field (alphabetical order):
     boolean: true = NULL, false = HAS_VALUE
     if HAS_VALUE: fieldSerializer.serialize(value)
+
+IS_SUBCLASS / IS_TAGGED_SUBCLASS — the subclass's own serializer writes the rest
+    (another POJO layout, or Kryo): not described by this snapshot → "[undecodable: subclass …]"
 ```
 
 > **Important**: the boolean convention is **inverted** compared to usual:
@@ -338,7 +344,9 @@ For each: writeVersionedSnapshot(nestedSerializerSnapshot)
 | Float | `writeInt(Float.floatToIntBits(v))` | 4 bytes |
 | Short | `writeShort(value)` | 2 bytes |
 | Byte | `writeByte(value)` | 1 byte |
+| Char | `writeChar(value)` (UTF-16 unit, high byte first) | 2 bytes |
 | String | `StringValue.writeString(value)` | variable |
+| char[] | `writeInt(length) + writeChar(element) * length` | 4 + 2N bytes |
 | byte[] | `writeInt(length) + writeBytes(data)` | 4 + N bytes |
 | String[] | `writeInt(length) + StringValue.writeString(element) * length` | variable |
 

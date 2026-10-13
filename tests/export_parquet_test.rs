@@ -4,6 +4,8 @@
 //! Run with `cargo test --features parquet`. Needs `tests/fixtures/savepoint-gitlab`.
 #![cfg(feature = "parquet")]
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -256,5 +258,40 @@ fn file_is_zstd_compressed() {
             );
         }
     }
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn char_state_is_a_utf8_column_of_one_character_strings() {
+    // A synthetic savepoint (no fixture needed): ValueState<Character>.
+    use common::synth::{self, Item, KeyedOperator, Kind, Ser, Spec, Storage, Val};
+    let mut op =
+        KeyedOperator::new(0x63, 1, 128, Ser::String).state("initial", Kind::Value(Ser::Char));
+    for (key, c) in [("a", 0x41u16), ("e", 0xE9), ("half", 0xD83D)] {
+        op.items.push(Item::Value {
+            state: 0,
+            key: Val::str(key),
+            value: Val::Char(c),
+        });
+    }
+    let mut spec = Spec::new(Storage::Files);
+    spec.operators.push(op);
+    let dir = synth::temp_dir("parquet-char");
+    synth::write_savepoint(&spec, &dir);
+
+    let sp = parser::parse_metadata(&dir.join("_metadata")).unwrap();
+    let path = tmp("char");
+    let mut sink = ParquetSink::create(&path).expect("create sink");
+    export_state_rows(&sp, &dir, None, "initial", None, &mut sink).expect("export");
+    assert_eq!(sink.value_column(), ValueColumn::Utf8);
+    let rows = parquet_rows(&path);
+    assert_eq!(
+        rows,
+        BTreeMap::from([
+            ("a".to_string(), Value::from("A")),
+            ("e".to_string(), Value::from("é")),
+            ("half".to_string(), Value::from("\u{FFFD}")),
+        ])
+    );
     std::fs::remove_file(&path).ok();
 }
