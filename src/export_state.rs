@@ -204,6 +204,24 @@ fn unreadable(errors: &[String]) -> String {
     )
 }
 
+/// Read a whole stream into memory, resolving its handle exactly as [`source_for`] does (inline
+/// bytes, a file relative to the savepoint, an absolute `file:` path, or a segment of a shared
+/// file), with the same checks: a missing, unreadable or truncated file is an error naming it.
+///
+/// For operator-state streams, which the index reads in full like Flink does on restore
+/// (`OperatorStateRestoreOperation`); keyed streams are read one key-group at a time instead.
+pub(crate) fn read_whole_stream(
+    delegate: &StreamStateHandle,
+    savepoint_dir: &Path,
+) -> Result<Vec<u8>, String> {
+    let Some(src) = source_for(delegate, savepoint_dir)? else {
+        return Err("the state handle points at no stream".to_string());
+    };
+    let mut buf = Vec::new();
+    src.read_range(0, src.len(), &mut buf)?;
+    Ok(buf)
+}
+
 /// Unwrap the delegate of a keyed handle, which may itself nest a key-groups handle.
 fn effective_delegate(kg: &KeyGroupsStateHandle) -> &StreamStateHandle {
     match &kg.delegate_handle {

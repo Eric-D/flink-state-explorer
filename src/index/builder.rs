@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::path::Path;
 
 use crate::parser::keyed_state::{
@@ -5,9 +6,11 @@ use crate::parser::keyed_state::{
     extract_value_serializer_types,
 };
 use crate::parser::metadata::{Operator, Savepoint, SubtaskState};
+use crate::parser::operator_state::OperatorStreamElements;
 use crate::parser::pojo::extract_pojo_infos;
 use crate::parser::state_handle::{
-    FileStateHandle, KeyGroupsStateHandle, RelativeFileStateHandle, StateHandle, StreamStateHandle,
+    FileStateHandle, KeyGroupsStateHandle, OperatorStreamStateHandle, RelativeFileStateHandle,
+    StateHandle, StreamStateHandle,
 };
 
 use super::cache::{
@@ -139,7 +142,7 @@ where
     // A keyed operator's state is split across subtasks by key group; merge them all. Up to the
     // cap every key is kept; past it, `spread_quotas` gives each subtask an equal share.
     for sub in &op.subtask_states {
-        collect_operator_states(sub, &mut states);
+        collect_operator_states(sub, savepoint_dir, &mut states);
         match build_keyed_state(
             &sub.managed_keyed_state,
             savepoint_dir,
@@ -250,20 +253,14 @@ fn spread_quotas(available: &[usize], cap: usize) -> Vec<usize> {
 }
 
 /// Collect non-keyed operator states (managed-operator, raw-operator).
-fn collect_operator_states(sub: &SubtaskState, states: &mut Vec<CachedState>) {
-    if let Some(handle) = &sub.managed_operator_state {
-        // Prefer one state per registered operator state (real name + distribution mode +
-        // decoded elements); fall back to a generic dump for non-inline handles.
-        if !push_operator_stream_states(handle, states) {
-            let entries = extract_entries_from_handle(handle);
-            if !entries.is_empty() {
-                states.push(CachedState {
-                    name: format!("managed-operator-subtask{}", sub.subtask_index),
-                    state_type: "managed-operator".to_string(),
-                    entries,
-                });
-            }
-        }
+fn collect_operator_states(
+    sub: &SubtaskState,
+    savepoint_dir: &Path,
+    states: &mut Vec<CachedState>,
+) {
+    // Managed operator state is always an `OperatorStreamStateHandle` (or nothing).
+    if let Some(StateHandle::OperatorStream(os)) = &sub.managed_operator_state {
+        push_operator_stream_states(os, savepoint_dir, states);
     }
     if let Some(handle) = &sub.raw_operator_state {
         let entries = extract_entries_from_handle(handle);
@@ -278,70 +275,83 @@ fn collect_operator_states(sub: &SubtaskState, states: &mut Vec<CachedState>) {
 }
 
 /// Build one `CachedState` per registered operator state, labelled with its distribution mode
-/// (`SPLIT_DISTRIBUTE` / `UNION` / `BROADCAST`) and with decoded element values. Returns false if
-/// the handle isn't an inline `OperatorStream` (the caller then falls back to a generic dump).
-fn push_operator_stream_states(handle: &StateHandle, states: &mut Vec<CachedState>) -> bool {
-    let os = match handle {
-        StateHandle::OperatorStream(os) => os,
-        _ => return false,
+/// (`SPLIT_DISTRIBUTE` / `UNION` / `BROADCAST`) and with one entry per element, holding its
+/// decoded value. The stream is read wherever its delegate keeps it and inflated when written
+/// with snapshot compression (`parser::operator_state`); if it cannot be read, every state with
+/// elements gets a single `[error: …]` entry saying why.
+fn push_operator_stream_states(
+    os: &OperatorStreamStateHandle,
+    savepoint_dir: &Path,
+    states: &mut Vec<CachedState>,
+) {
+    // The stream is only read when some state has elements in it: a handle whose states are
+    // all empty may point at nothing readable.
+    let has_elements = os.partition_offsets.iter().any(|p| !p.offsets.is_empty());
+    let stream = if has_elements {
+        operator_stream_bytes(&os.delegate_handle, savepoint_dir)
+    } else {
+        Ok(Cow::Borrowed(&[][..]))
     };
-    let data = match &os.delegate_handle {
-        StreamStateHandle::ByteStream(bs) => &bs.data,
-        _ => return false,
-    };
-    if os.partition_offsets.is_empty() {
-        return false;
-    }
-    // Every element runs from its offset to the next offset across ALL states (they share the
-    // same byte stream, so per-partition "next offset" would over-read into the next state).
-    let mut boundaries: Vec<usize> = os
-        .partition_offsets
-        .iter()
-        .flat_map(|p| p.offsets.iter().map(|&o| o as usize))
-        .collect();
-    boundaries.push(data.len());
-    boundaries.sort_unstable();
-    boundaries.dedup();
+    let elements = stream
+        .as_deref()
+        .map_err(String::clone)
+        .and_then(|bytes| OperatorStreamElements::new(bytes, &os.partition_offsets));
 
     for part in &os.partition_offsets {
         let is_broadcast = part.mode == 2; // OperatorStateHandle.Mode.BROADCAST
-        let mut entries = Vec::with_capacity(part.offsets.len());
-        for &offset in &part.offsets {
-            let start = (offset as usize).min(data.len());
-            let end = boundaries
+        let entries = match &elements {
+            _ if part.offsets.is_empty() => Vec::new(),
+            Err(e) => vec![decoded_entry(format!("[error: {}]", e))],
+            Ok(elements) => part
+                .offsets
                 .iter()
-                .copied()
-                .find(|&b| b > start)
-                .unwrap_or(data.len())
-                .min(data.len());
-            let elem = &data[start..end];
-            // Kafka connector states get connector-specific decoding; broadcast maps and other
-            // operator-list elements are decoded best-effort.
-            let label = match part.state_name.as_str() {
-                "SourceReaderState" => crate::parser::kafka::decode_source_reader_split(elem),
-                "writer_raw_states" => crate::parser::kafka::decode_writer_state(elem),
-                "streaming_committer_raw_states" => {
-                    crate::parser::kafka::decode_committer_state(elem)
-                }
-                _ if is_broadcast => decode_broadcast_map(elem),
-                _ => None,
-            }
-            .unwrap_or_else(|| decode_operator_element(elem));
-            entries.push(CachedEntry {
-                key: label.into_bytes(),
-                key_group: 0,
-                value_ref: ValueRef::Inline {
-                    data: elem.to_vec(),
-                },
-            });
-        }
+                .map(|&offset| {
+                    decoded_entry(match elements.element(offset) {
+                        Ok(elem) => label_operator_element(&part.state_name, is_broadcast, &elem),
+                        Err(e) => format!("[error: {}]", e),
+                    })
+                })
+                .collect(),
+        };
         states.push(CachedState {
             name: part.state_name.clone(),
             state_type: format!("operator/{}", operator_mode_label(part.mode)),
             entries,
         });
     }
-    true
+}
+
+/// An operator-state stream's bytes: borrowed when inline in `_metadata`, read otherwise.
+fn operator_stream_bytes<'a>(
+    delegate: &'a StreamStateHandle,
+    savepoint_dir: &Path,
+) -> Result<Cow<'a, [u8]>, String> {
+    match delegate {
+        StreamStateHandle::ByteStream(bs) => Ok(Cow::Borrowed(&bs.data)),
+        other => crate::export_state::read_whole_stream(other, savepoint_dir).map(Cow::Owned),
+    }
+}
+
+/// Kafka connector states get connector-specific decoding; broadcast maps and other
+/// operator-list elements are decoded best-effort.
+fn label_operator_element(state_name: &str, is_broadcast: bool, elem: &[u8]) -> String {
+    match state_name {
+        "SourceReaderState" => crate::parser::kafka::decode_source_reader_split(elem),
+        "writer_raw_states" => crate::parser::kafka::decode_writer_state(elem),
+        "streaming_committer_raw_states" => crate::parser::kafka::decode_committer_state(elem),
+        _ if is_broadcast => decode_broadcast_map(elem),
+        _ => None,
+    }
+    .unwrap_or_else(|| decode_operator_element(elem))
+}
+
+/// An operator-state entry: the decoded label is all that is kept.
+fn decoded_entry(label: String) -> CachedEntry {
+    CachedEntry {
+        key: label.into_bytes(),
+        key_group: 0,
+        value_ref: ValueRef::Decoded,
+    }
 }
 
 /// Flink `OperatorStateHandle.Mode` ordinal → name.

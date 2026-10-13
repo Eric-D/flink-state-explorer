@@ -23,7 +23,13 @@
 //!   crate, so only the local `savepoint-compressed` fixture proves compatibility with Flink's
 //!   `SnappyFramedOutputStream`);
 //! - Flink's key-group assignment (`MathUtils.murmurHash` + `KeyGroupRangeAssignment`), so each
-//!   key lands in the key-group and subtask Flink would have chosen.
+//!   key lands in the key-group and subtask Flink would have chosen;
+//! - managed **operator** state (`DefaultOperatorStateBackendSnapshotStrategy`): an
+//!   `OperatorStreamStateHandle` (tag 4, or the file-merging tag 17) whose stream holds the
+//!   `OperatorBackendSerializationProxy` v6 header, then every list state's elements, then every
+//!   broadcast map; with compression, everything after the header is one Snappy-framed stream,
+//!   flushed before each recorded offset. `operator_stream_matches_real_flink_streams` in
+//!   `tests/operator_state_test.rs` compares whole streams byte for byte with ones Flink wrote.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -160,6 +166,74 @@ impl StateDef {
     }
 }
 
+/// A managed operator (non-keyed) state of one subtask.
+#[derive(Clone, Debug)]
+pub enum OpState {
+    /// `ListState<T>` from `getListState` (SPLIT_DISTRIBUTE) or `getUnionListState` (UNION).
+    List {
+        name: String,
+        union: bool,
+        element: Ser,
+        elements: Vec<Val>,
+    },
+    /// `BroadcastState<K, V>` (BROADCAST): the whole map sits at a single offset.
+    Broadcast {
+        name: String,
+        key: Ser,
+        value: Ser,
+        entries: Vec<(Val, Val)>,
+    },
+}
+
+impl OpState {
+    pub fn list(name: &str, element: Ser, elements: Vec<Val>) -> Self {
+        OpState::List {
+            name: name.to_string(),
+            union: false,
+            element,
+            elements,
+        }
+    }
+
+    pub fn union_list(name: &str, element: Ser, elements: Vec<Val>) -> Self {
+        OpState::List {
+            name: name.to_string(),
+            union: true,
+            element,
+            elements,
+        }
+    }
+
+    pub fn broadcast(name: &str, key: Ser, value: Ser, entries: Vec<(Val, Val)>) -> Self {
+        OpState::Broadcast {
+            name: name.to_string(),
+            key,
+            value,
+            entries,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            OpState::List { name, .. } | OpState::Broadcast { name, .. } => name,
+        }
+    }
+
+    /// `OperatorStateHandle.Mode` ordinal, as the handle stores it (`writeByte`).
+    pub fn mode(&self) -> u8 {
+        match self {
+            OpState::List { union: false, .. } => 0, // SPLIT_DISTRIBUTE
+            OpState::List { union: true, .. } => 1,  // UNION
+            OpState::Broadcast { .. } => 2,          // BROADCAST
+        }
+    }
+
+    /// `Mode.toString()`, as the meta-info snapshot's distribution-mode option stores it.
+    fn mode_name(&self) -> &'static str {
+        ["SPLIT_DISTRIBUTE", "UNION", "BROADCAST"][self.mode() as usize]
+    }
+}
+
 /// One logical record of one key in one state. `state` is the index into the operator's
 /// `states`, i.e. the stateId.
 #[derive(Clone, Debug)]
@@ -215,6 +289,7 @@ pub struct KeyedOperator {
     pub parallelism: i32,
     pub max_parallelism: i32,
     pub key: Ser,
+    /// Keyed states; none at all = a non-keyed operator (no keyed-state handle).
     pub states: Vec<StateDef>,
     pub items: Vec<Item>,
     /// Per subtask, the names of the states its header registers (in that order), when they
@@ -222,6 +297,8 @@ pub struct KeyedOperator {
     /// operator can hold different sets in a different order. Items of a state a subtask does not
     /// register are left out of that subtask.
     pub subtask_states: Option<Vec<Vec<String>>>,
+    /// Managed operator states, per subtask index.
+    pub operator_state: BTreeMap<i32, Vec<OpState>>,
 }
 
 impl KeyedOperator {
@@ -234,6 +311,7 @@ impl KeyedOperator {
             states: Vec::new(),
             items: Vec::new(),
             subtask_states: None,
+            operator_state: BTreeMap::new(),
         }
     }
 
@@ -242,12 +320,18 @@ impl KeyedOperator {
         self
     }
 
+    /// Register an operator state on `subtask`.
+    pub fn op_state(mut self, subtask: i32, state: OpState) -> Self {
+        self.operator_state.entry(subtask).or_default().push(state);
+        self
+    }
+
     pub fn id_hex(&self) -> String {
         self.id.iter().map(|b| format!("{:02x}", b)).collect()
     }
 }
 
-/// Where each subtask's keyed-state stream goes.
+/// Where each subtask's state streams (keyed and operator) go.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Storage {
     /// Inside `_metadata` (`ByteStreamStateHandle`), like the Docker-generated fixtures.
@@ -257,6 +341,10 @@ pub enum Storage {
     /// In its own file, referenced by an absolute `FileStateHandle` (tag 2) whose path is written
     /// as Flink's `Path.toString()` does for a local file: `file:/abs/path`.
     AbsoluteFiles,
+    /// Operator state only: every stream is a segment of one shared file
+    /// (`SegmentFileStateHandle` under a file-merging operator handle, tag 17), after a few
+    /// bytes of padding so that no segment starts at 0.
+    Segments,
 }
 
 /// The order of the state runs inside a key-group block.
@@ -293,8 +381,13 @@ impl Spec {
 /// What was written, for assertions.
 #[derive(Debug, Default)]
 pub struct Written {
-    /// `(operator index, subtask index, path)` of every state file (Storage::Files only).
+    /// `(operator index, subtask index, path)` of every keyed-state file (`Storage::Files` and
+    /// `Storage::AbsoluteFiles`).
     pub state_files: Vec<(usize, i32, PathBuf)>,
+    /// The same for operator-state files.
+    pub op_state_files: Vec<(usize, i32, PathBuf)>,
+    /// The shared file of `Storage::Segments`.
+    pub segment_file: Option<PathBuf>,
 }
 
 /// A fresh, empty directory, unique to one call (cargo runs the tests of a binary in parallel)
@@ -337,10 +430,11 @@ pub fn temp_dir(tag: &str) -> TempDir {
 /// `MetadataV4Serializer.serialize` appends after the V3 body, copied from a real savepoint.
 const CHECKPOINT_PROPERTIES: &[u8] = include_bytes!("../data/savepoint-checkpoint-properties.bin");
 
-/// Write `spec` as a savepoint directory (`_metadata` plus, for `Storage::Files`, one state file
-/// per subtask that holds keyed state).
+/// Write `spec` as a savepoint directory (`_metadata` plus, unless `Storage::Inline`, the state
+/// files its handles point at).
 pub fn write_savepoint(spec: &Spec, dir: &Path) -> Written {
     let mut written = Written::default();
+    let mut segments = SegmentFile::new(dir);
     let mut meta = Vec::new();
     meta.extend_from_slice(&0x4960_672Du32.to_be_bytes()); // MetadataSerializers magic
     meta.extend_from_slice(&4i32.to_be_bytes()); // MetadataV4Serializer
@@ -356,45 +450,69 @@ pub fn write_savepoint(spec: &Spec, dir: &Path) -> Written {
         meta.extend_from_slice(&op.parallelism.to_be_bytes()); // one state per subtask
         for subtask in 0..op.parallelism {
             meta.extend_from_slice(&subtask.to_be_bytes());
-            meta.extend_from_slice(&0i32.to_be_bytes()); // no managed operator state
-            meta.extend_from_slice(&0i32.to_be_bytes()); // no raw operator state
-            let (start, end) = range_for_subtask(op.max_parallelism, op.parallelism, subtask);
-            let (stream, offsets) =
-                keyed_stream(op, subtask, start, end, spec.compressed, spec.run_order);
-            meta.push(7); // KeyGroupsSavepointStateHandle
-            meta.extend_from_slice(&start.to_be_bytes());
-            meta.extend_from_slice(&(end - start + 1).to_be_bytes());
-            for off in &offsets {
-                meta.extend_from_slice(&off.to_be_bytes());
-            }
-            match spec.storage {
-                Storage::Inline => {
-                    meta.push(1); // ByteStreamStateHandle
-                    write_utf(&mut meta, &format!("inline-{}-{}", oi, subtask));
-                    meta.extend_from_slice(&(stream.len() as i32).to_be_bytes());
-                    meta.extend_from_slice(&stream);
-                }
-                Storage::Files | Storage::AbsoluteFiles => {
+            // MetadataV2V3SerializerBase.serializeSubtaskState (:274-282): managed, then raw
+            // operator state, each a `serializeSingleton` (:860-872): int count, then the handle.
+            match op.operator_state.get(&subtask).filter(|s| !s.is_empty()) {
+                None => meta.extend_from_slice(&0i32.to_be_bytes()),
+                Some(states) => {
+                    meta.extend_from_slice(&1i32.to_be_bytes());
+                    let (stream, offsets) = operator_stream(states, spec.compressed);
+                    // serializeOperatorStateHandle (:599-641).
+                    let file_merging = spec.storage == Storage::Segments;
+                    meta.push(if file_merging { 17 } else { 4 });
+                    meta.extend_from_slice(&(states.len() as i32).to_be_bytes());
+                    for (state, offs) in states.iter().zip(&offsets) {
+                        write_utf(&mut meta, state.name());
+                        meta.push(state.mode());
+                        meta.extend_from_slice(&(offs.len() as i32).to_be_bytes());
+                        for off in offs {
+                            meta.extend_from_slice(&off.to_be_bytes());
+                        }
+                    }
+                    if file_merging {
+                        write_utf(&mut meta, &dir.join("taskowned").to_string_lossy());
+                        write_utf(&mut meta, &dir.join("shared").to_string_lossy());
+                        meta.push(0); // not an EmptyFileMergingOperatorStreamStateHandle
+                    }
                     let name = format!(
-                        "{:08x}-state-{}-{}",
-                        0x5eed_0000u32 + oi as u32,
+                        "{:08x}-opstate-{}-{}",
+                        0x0b5e_0000u32 + oi as u32,
                         oi,
                         subtask
                     );
-                    let path = dir.join(&name);
-                    std::fs::write(&path, &stream).unwrap();
-                    written.state_files.push((oi, subtask, path.clone()));
-                    if spec.storage == Storage::Files {
-                        meta.push(6); // RelativeFileStateHandle: path, then stateSize
-                        write_utf(&mut meta, &name);
-                        meta.extend_from_slice(&(stream.len() as i64).to_be_bytes());
-                    } else {
-                        // FileStateHandle (MetadataV2V3SerializerBase.java:747-750): stateSize,
-                        // then the path.
-                        meta.push(2);
-                        meta.extend_from_slice(&(stream.len() as i64).to_be_bytes());
-                        write_utf(&mut meta, &format!("file:{}", path.display()));
+                    if let Some(path) =
+                        write_delegate(&mut meta, dir, spec.storage, &name, &stream, &mut segments)
+                    {
+                        written.op_state_files.push((oi, subtask, path));
                     }
+                }
+            }
+            meta.extend_from_slice(&0i32.to_be_bytes()); // no raw operator state
+            if op.states.is_empty() {
+                meta.push(0); // a non-keyed operator: no managed keyed state
+            } else {
+                assert!(
+                    spec.storage != Storage::Segments,
+                    "Storage::Segments covers operator state only"
+                );
+                let (start, end) = range_for_subtask(op.max_parallelism, op.parallelism, subtask);
+                let (stream, offsets) = keyed_stream(op, start, end, spec.compressed);
+                meta.push(7); // KeyGroupsSavepointStateHandle
+                meta.extend_from_slice(&start.to_be_bytes());
+                meta.extend_from_slice(&(end - start + 1).to_be_bytes());
+                for off in &offsets {
+                    meta.extend_from_slice(&off.to_be_bytes());
+                }
+                let name = format!(
+                    "{:08x}-state-{}-{}",
+                    0x5eed_0000u32 + oi as u32,
+                    oi,
+                    subtask
+                );
+                if let Some(path) =
+                    write_delegate(&mut meta, dir, spec.storage, &name, &stream, &mut segments)
+                {
+                    written.state_files.push((oi, subtask, path));
                 }
             }
             meta.push(0); // no raw keyed state
@@ -405,7 +523,209 @@ pub fn write_savepoint(spec: &Spec, dir: &Path) -> Written {
 
     meta.extend_from_slice(CHECKPOINT_PROPERTIES);
     std::fs::write(dir.join("_metadata"), &meta).unwrap();
+    written.segment_file = segments.finish();
     written
+}
+
+/// `MetadataV2V3SerializerBase.serializeStreamStateHandle` (:723-772) for `stream`, stored the
+/// way `storage` says. Returns the file written for it, if it has one of its own.
+fn write_delegate(
+    meta: &mut Vec<u8>,
+    dir: &Path,
+    storage: Storage,
+    name: &str,
+    stream: &[u8],
+    segments: &mut SegmentFile,
+) -> Option<PathBuf> {
+    match storage {
+        Storage::Inline => {
+            meta.push(1); // ByteStreamStateHandle: handle name, int length, bytes
+            write_utf(meta, &format!("inline-{}", name));
+            meta.extend_from_slice(&(stream.len() as i32).to_be_bytes());
+            meta.extend_from_slice(stream);
+            None
+        }
+        Storage::Files => {
+            let path = dir.join(name);
+            std::fs::write(&path, stream).unwrap();
+            meta.push(6); // RelativeFileStateHandle: relative path, long size
+            write_utf(meta, name);
+            meta.extend_from_slice(&(stream.len() as i64).to_be_bytes());
+            Some(path)
+        }
+        Storage::AbsoluteFiles => {
+            let path = dir.join(name);
+            std::fs::write(&path, stream).unwrap();
+            // FileStateHandle (:747-750): long size, then the path as Flink's Path.toString()
+            // writes a local file: with its `file:` scheme.
+            meta.push(2);
+            meta.extend_from_slice(&(stream.len() as i64).to_be_bytes());
+            write_utf(meta, &format!("file:{}", path.display()));
+            Some(path)
+        }
+        Storage::Segments => {
+            // SegmentFileStateHandle: long startPos, long stateSize, int scope, path, logical
+            // file id. Offsets inside a segment are relative to startPos: see
+            // FileMergingCheckpointStateOutputStream.getPos (:125-129) on write and
+            // FsSegmentDataInputStream.seek (:96-99) on read.
+            let start = segments.append(stream);
+            meta.push(15);
+            meta.extend_from_slice(&(start as i64).to_be_bytes());
+            meta.extend_from_slice(&(stream.len() as i64).to_be_bytes());
+            meta.extend_from_slice(&0i32.to_be_bytes()); // CheckpointedStateScope.EXCLUSIVE
+            write_utf(meta, &format!("file:{}", segments.path.display()));
+            write_utf(meta, &format!("logical-{}", name));
+            None
+        }
+    }
+}
+
+/// The one physical file every segment of a `Storage::Segments` savepoint goes into.
+struct SegmentFile {
+    path: PathBuf,
+    data: Vec<u8>,
+}
+
+impl SegmentFile {
+    const PADDING: &'static [u8] = b"padding";
+
+    fn new(dir: &Path) -> Self {
+        SegmentFile {
+            path: dir.join("merged-segments"),
+            data: Self::PADDING.to_vec(),
+        }
+    }
+
+    /// Append `stream` and return where it starts.
+    fn append(&mut self, stream: &[u8]) -> usize {
+        let start = self.data.len();
+        self.data.extend_from_slice(stream);
+        start
+    }
+
+    /// Write the file, if any segment went into it.
+    fn finish(self) -> Option<PathBuf> {
+        (self.data.len() > Self::PADDING.len()).then(|| {
+            std::fs::write(&self.path, &self.data).unwrap();
+            self.path
+        })
+    }
+}
+
+/// One subtask's managed operator-state stream, as `DefaultOperatorStateBackendSnapshotStrategy
+/// .asyncSnapshot` writes it (release-1.20, :165-212): the `OperatorBackendSerializationProxy`
+/// header, then every list state's elements (`PartitionableListState.write`, :110-123), then
+/// every broadcast state's map (`HeapBroadcastState.write`, :109-120). Returns the stream and,
+/// for each of `states` in order, the offsets its handle records.
+///
+/// With `compressed`, everything after the header goes through one `SnappyFramedOutputStream`:
+/// its stream identifier comes first (written by its constructor, snappy-java 1.1.10.4
+/// `SnappyFramedOutputStream.java:253`), and `CompressibleFSDataOutputStream.getPos` (:43-49)
+/// flushes it before each offset is taken, so each element is its own run of chunks (split at
+/// 64 KiB). The chunks come from `snap`: byte-identical to Flink's for data that does not
+/// compress (stored as `0x01` chunks); compressible data becomes `0x00` chunks below a 0.875
+/// ratio where snappy-java uses 0.85, with `snap`'s own encoder output.
+pub fn operator_stream(states: &[OpState], compressed: bool) -> (Vec<u8>, Vec<Vec<i64>>) {
+    let lists: Vec<usize> = (0..states.len())
+        .filter(|&i| matches!(states[i], OpState::List { .. }))
+        .collect();
+    let broadcasts: Vec<usize> = (0..states.len())
+        .filter(|&i| matches!(states[i], OpState::Broadcast { .. }))
+        .collect();
+
+    // OperatorBackendSerializationProxy.write (:97-103): version, compression flag, then the
+    // list states' and the broadcast states' meta info, each group behind a `short` count.
+    let mut s = Vec::new();
+    s.extend_from_slice(&6i32.to_be_bytes());
+    s.push(compressed as u8);
+    for group in [&lists, &broadcasts] {
+        s.extend_from_slice(&(group.len() as u16).to_be_bytes());
+        for &i in group {
+            operator_meta_info(&mut s, &states[i]);
+        }
+    }
+    if compressed {
+        s.extend_from_slice(&SNAPPY_STREAM_IDENTIFIER);
+    }
+
+    let put = |s: &mut Vec<u8>, bytes: &[u8]| {
+        if compressed {
+            s.extend_from_slice(&snappy_chunks(bytes));
+        } else {
+            s.extend_from_slice(bytes);
+        }
+    };
+    let mut offsets = vec![Vec::new(); states.len()];
+    for &i in lists.iter().chain(&broadcasts) {
+        match &states[i] {
+            OpState::List { elements, .. } => {
+                for e in elements {
+                    offsets[i].push(s.len() as i64);
+                    put(&mut s, &e.encode());
+                }
+            }
+            OpState::Broadcast { entries, .. } => {
+                offsets[i].push(s.len() as i64);
+                let mut map = (entries.len() as i32).to_be_bytes().to_vec();
+                for (k, v) in entries {
+                    map.extend(k.encode());
+                    map.extend(v.encode());
+                }
+                put(&mut s, &map);
+            }
+        }
+    }
+    (s, offsets)
+}
+
+/// `StateMetaInfoSnapshotReadersWriters.CurrentWriterImpl.writeStateMetaInfoSnapshot`
+/// (:102-126) for an operator or broadcast state: name, `BackendStateType` ordinal, the
+/// distribution-mode option, then the serializer snapshots. A list state has its element
+/// serializer only (`RegisteredOperatorStateBackendMetaInfo.computeSnapshot`, :175-198); a
+/// broadcast state has `VALUE_SERIALIZER` then `KEY_SERIALIZER`
+/// (`RegisteredBroadcastStateBackendMetaInfo.computeSnapshot`, :205-234 builds a `HashMap`, and
+/// that is its iteration order for those two keys, as Flink-written streams show).
+fn operator_meta_info(out: &mut Vec<u8>, state: &OpState) {
+    write_utf(out, state.name());
+    let backend_state_type: i32 = match state {
+        OpState::List { .. } => 1,      // OPERATOR
+        OpState::Broadcast { .. } => 2, // BROADCAST
+    };
+    out.extend_from_slice(&backend_state_type.to_be_bytes());
+    out.extend_from_slice(&1i32.to_be_bytes()); // one option
+    write_utf(out, "OPERATOR_STATE_DISTRIBUTION_MODE");
+    write_utf(out, state.mode_name());
+    match state {
+        OpState::List { element, .. } => {
+            out.extend_from_slice(&1i32.to_be_bytes());
+            write_utf(out, "VALUE_SERIALIZER");
+            proxied_snapshot(out, Snap::Scalar(*element));
+        }
+        OpState::Broadcast { key, value, .. } => {
+            out.extend_from_slice(&2i32.to_be_bytes());
+            write_utf(out, "VALUE_SERIALIZER");
+            proxied_snapshot(out, Snap::Scalar(*value));
+            write_utf(out, "KEY_SERIALIZER");
+            proxied_snapshot(out, Snap::Scalar(*key));
+        }
+    }
+}
+
+/// The Snappy framing format's stream identifier chunk (snappy-java `SnappyFramed.HEADER_BYTES`).
+pub const SNAPPY_STREAM_IDENTIFIER: [u8; 10] =
+    [0xff, 0x06, 0x00, 0x00, b's', b'N', b'a', b'P', b'p', b'Y'];
+
+/// `data` as the chunks one `SnappyFramedOutputStream` flush emits, without the stream
+/// identifier `snap` writes in front of its first chunk.
+fn snappy_chunks(data: &[u8]) -> Vec<u8> {
+    if data.is_empty() {
+        return Vec::new(); // flushBuffer writes nothing for an empty buffer (:480-489)
+    }
+    let mut enc = snap::write::FrameEncoder::new(Vec::new());
+    enc.write_all(data).unwrap();
+    let framed = enc.into_inner().unwrap();
+    assert_eq!(framed[..10], SNAPPY_STREAM_IDENTIFIER);
+    framed[10..].to_vec()
 }
 
 /// One subtask's keyed-state stream for key-groups `start..=end`: the header, then each
