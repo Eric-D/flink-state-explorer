@@ -52,7 +52,7 @@ class KafkaSavepointGeneratorIT {
             "state.savepoints.dir: file://" + SAVEPOINTS_DIR,
             "state.backend: hashmap",
             // JobManager storage keeps every handle inline: one self-contained _metadata.
-            "state.checkpoint-storage: jobmanager",
+            "execution.checkpointing.storage: jobmanager",
             "taskmanager.numberOfTaskSlots: 4");
 
     private static final Network NETWORK = Network.newNetwork();

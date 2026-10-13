@@ -8,7 +8,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with: { components: clippy, rustfmt, targets: x86_64-pc-windows-gnu }
+        with: { components: 'clippy, rustfmt', targets: x86_64-pc-windows-gnu }
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked
       - run: cargo fmt --all -- --check

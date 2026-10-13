@@ -69,7 +69,12 @@ pure function of the key index (`BigStateJob.*Of`). For performance work:
 **Synthetic savepoints** (`tests/common/synth.rs`) are written byte for byte in Flink's layout
 (`_metadata` v4, keyed-stream header v6, key-group blocks with the metadata-follows flag, inline
 or file-backed, optionally Snappy-compressed, Flink's key-group assignment), so file-backed,
-multi-subtask and compressed paths are tested **in CI** without Docker.
+multi-subtask and compressed paths are tested **in CI** without Docker. State runs inside a
+key-group are written in a non-ascending order by default (`RunOrder::HashLike`), as the heap
+backend does (`HashMap` of states): **never assume runs come in stateId order**. Limits: one
+storage kind per savepoint (production mixes inline and file handles), and the Snappy framing is
+written with the same `snap` crate the reader uses, so only `savepoint-compressed` proves
+compatibility with Flink's `SnappyFramedOutputStream`.
 `tests/synth_savepoint_test.rs` checks the generated header byte for byte against a real one
 (when `savepoint-big` exists). Prefer them for new fixture-free tests.
 
@@ -81,12 +86,12 @@ Gotchas already handled in the pom/IT (don't re-debug):
 - The savepoint is written to `/tmp/flink-savepoints` **inside** the container (the `flink` uid
   9999 can't mkdir `/savepoints` at root-owned `/`) and copied out with the Docker API, so host
   files are owned by you (a bind mount breaks `mvn clean`).
-- The ITs pin `state.checkpoint-storage: jobmanager` (Flink's default without
-  `state.checkpoints.dir`, see `CheckpointStorageLoader.createDefaultCheckpointStorage`): its
+- The ITs pin `execution.checkpointing.storage: jobmanager` (Flink's default without
+  `execution.checkpointing.dir`, see `CheckpointStorageLoader.createDefaultCheckpointStorage`): its
   `MemCheckpointStreamFactory` keeps **every** handle inline → a single self-contained
-  `_metadata`, capped at 5 MiB per handle. `state.storage.fs.memory-threshold` does nothing there
-  (it only applies to filesystem storage, where it is a deprecated alias of
-  `execution.checkpointing.data-inline-threshold`, max 1 MiB). To get state **files**, use
+  `_metadata`, capped at 5 MiB per handle. The inline threshold
+  (`execution.checkpointing.data-inline-threshold`, formerly `state.storage.fs.memory-threshold`)
+  does nothing there: it only applies to filesystem storage, and is at most 1 MiB. To get state **files**, use
   filesystem storage as `BigSavepointGeneratorIT` does, and copy from both JM and TM.
 
 ## Exporting one state (streaming)
@@ -261,8 +266,9 @@ source** (branch `release-1.20`, https://github.com/apache/flink) rather than gu
   (ported `MathUtils.murmurHash` + `KeyGroupRangeAssignment`), and every streamed row falls inside
   its subtask's range. POJO keys are range-checked only: their `hashCode()` is user code.
 - `tests/export_state_stream_test.rs` — streaming export: strict parity with the full JSON export
-  for every non-MAP state, exploded parity for MAP states, the `v6`/compression header, a
-  Snappy-framed key-group, the state filter, and the bounded peak block.
+  for every non-MAP state, exploded parity for MAP states, the `v6`/compression header, and the
+  bounded peak block. (The Snappy-framed key-group and the state filter are in the
+  fixture-free `tests/keyed_block_test.rs`.)
 
 ## Dependencies — IMPORTANT
 

@@ -91,8 +91,8 @@ class BigSavepointGeneratorIT {
                 // which keeps every handle in memory and caps it at 5 MB ("Size of the state is
                 // larger than the maximum permitted memory-backed state") — the fs memory threshold
                 // does not even apply to it. A ~100 MB-per-subtask state needs FileSystemCheckpointStorage.
-                "state.checkpoint-storage: filesystem",
-                "state.checkpoints.dir: file://" + CHECKPOINTS_DIR,
+                "execution.checkpointing.storage: filesystem",
+                "execution.checkpointing.dir: file://" + CHECKPOINTS_DIR,
                 // NO state.storage.fs.memory-threshold override: the default (20 kb) is the point.
                 "jobmanager.memory.process.size: 2g",
                 "taskmanager.memory.process.size: " + tmProcessMemory,

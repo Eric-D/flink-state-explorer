@@ -2,19 +2,26 @@
 //! file-backed, multi-subtask and compressed read paths can be tested without Docker.
 //!
 //! What is reproduced (each verified against Flink release-1.20 and against real savepoints of
-//! `test-flink-job`; `header_matches_a_real_flink_header` in `tests/synth_savepoint_test.rs`
-//! compares the header byte for byte with one Flink wrote):
+//! `test-flink-job`; `tests/synth_savepoint_test.rs` compares the header byte for byte with one
+//! Flink wrote, kept in `tests/data/`):
 //! - `_metadata` v4 (`MetadataV4Serializer`): magic, version, checkpoint id, no master state,
 //!   operators with their subtask states; keyed state as a `KeyGroupsSavepointStateHandle`
 //!   (tag 7) whose delegate is either inline (`ByteStreamStateHandle`, tag 1) or a file next to
-//!   `_metadata` (`RelativeFileStateHandle`, tag 6) — the layout of production savepoints;
+//!   `_metadata` (`RelativeFileStateHandle`, tag 6) — the layout of production savepoints; then
+//!   the Java-serialized `CheckpointProperties` v4 appends (`MetadataV4Serializer.serialize`),
+//!   copied verbatim from a real canonical savepoint (`tests/data/`);
 //! - the keyed-state stream header (`KeyedBackendSerializationProxy` v6): compression flag, key
 //!   serializer snapshot, one `StateMetaInfoSnapshot` per state, keyed states first and timer
 //!   (priority-queue) states after, which fixes the shared stateId space;
 //! - key-group blocks (`FullSnapshotAsyncWriter`): `short stateId`, entries
 //!   `[int keyLen][kgPrefix + key + namespace][int valueLen][value]`, the metadata-follows flag
-//!   (`0x80` on `key[0]`) on the last entry of each state's run, then `END_OF_KEY_GROUP_MARK`;
-//!   with compression, each key-group is its own Snappy-framed stream;
+//!   (`0x80` on `key[0]`) on the last entry of each state's run, then `END_OF_KEY_GROUP_MARK`.
+//!   Runs are **not** in stateId order by default: the heap backend walks a `HashMap` of states
+//!   (`HeapSnapshotResources`, `HeapKeyValueStateIterator`), and real blocks come out as e.g.
+//!   `[2, 0, 1]`, so readers must not assume ascending ids ([`RunOrder`]);
+//!   with compression, each key-group is its own Snappy-framed stream (written with the `snap`
+//!   crate, so only the local `savepoint-compressed` fixture proves compatibility with Flink's
+//!   `SnappyFramedOutputStream`);
 //! - Flink's key-group assignment (`MathUtils.murmurHash` + `KeyGroupRangeAssignment`), so each
 //!   key lands in the key-group and subtask Flink would have chosen.
 
@@ -166,7 +173,7 @@ pub enum Item {
         state: usize,
         key: Val,
         map_key: Val,
-        /// `None` = a null map value (`NullableSerializer` writes only `isNull = true`).
+        /// `None` = a null map value (only possible for String values on the heap backend).
         value: Option<Val>,
     },
     List {
@@ -243,11 +250,22 @@ pub enum Storage {
     Files,
 }
 
+/// The order of the state runs inside a key-group block.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RunOrder {
+    /// Last stateId first, then ascending (`[n-1, 0, 1, ...]`): the shape real heap savepoints
+    /// show (`[2, 0, 1]` on `savepoint-big`). The default, so tests do not bake in an order.
+    HashLike,
+    /// Ascending stateIds.
+    Ascending,
+}
+
 #[derive(Clone, Debug)]
 pub struct Spec {
     pub checkpoint_id: i64,
     pub storage: Storage,
     pub compressed: bool,
+    pub run_order: RunOrder,
     pub operators: Vec<KeyedOperator>,
 }
 
@@ -257,6 +275,7 @@ impl Spec {
             checkpoint_id: 42,
             storage,
             compressed: false,
+            run_order: RunOrder::HashLike,
             operators: Vec::new(),
         }
     }
@@ -269,8 +288,30 @@ pub struct Written {
     pub state_files: Vec<(usize, i32, PathBuf)>,
 }
 
-/// A fresh, empty directory unique to this call (cargo runs tests of one binary in parallel).
-pub fn temp_dir(tag: &str) -> PathBuf {
+/// A fresh, empty directory, unique to one call (cargo runs the tests of a binary in parallel)
+/// and removed when dropped. Derefs to its path.
+pub struct TempDir(PathBuf);
+
+impl std::ops::Deref for TempDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for TempDir {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+pub fn temp_dir(tag: &str) -> TempDir {
     static N: AtomicUsize = AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
         "flink-explorer-synth-{}-{}-{}",
@@ -280,8 +321,12 @@ pub fn temp_dir(tag: &str) -> PathBuf {
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    dir
+    TempDir(dir)
 }
+
+/// The Java-serialized `CheckpointProperties` (a CANONICAL savepoint's) that
+/// `MetadataV4Serializer.serialize` appends after the V3 body, copied from a real savepoint.
+const CHECKPOINT_PROPERTIES: &[u8] = include_bytes!("../data/savepoint-checkpoint-properties.bin");
 
 /// Write `spec` as a savepoint directory (`_metadata` plus, for `Storage::Files`, one state file
 /// per subtask that holds keyed state).
@@ -305,7 +350,7 @@ pub fn write_savepoint(spec: &Spec, dir: &Path) -> Written {
             meta.extend_from_slice(&0i32.to_be_bytes()); // no managed operator state
             meta.extend_from_slice(&0i32.to_be_bytes()); // no raw operator state
             let (start, end) = range_for_subtask(op.max_parallelism, op.parallelism, subtask);
-            let (stream, offsets) = keyed_stream(op, start, end, spec.compressed);
+            let (stream, offsets) = keyed_stream(op, start, end, spec.compressed, spec.run_order);
             meta.push(7); // KeyGroupsSavepointStateHandle
             meta.extend_from_slice(&start.to_be_bytes());
             meta.extend_from_slice(&(end - start + 1).to_be_bytes());
@@ -340,6 +385,7 @@ pub fn write_savepoint(spec: &Spec, dir: &Path) -> Written {
         }
     }
 
+    meta.extend_from_slice(CHECKPOINT_PROPERTIES);
     std::fs::write(dir.join("_metadata"), &meta).unwrap();
     written
 }
@@ -352,6 +398,7 @@ pub fn keyed_stream(
     start: i32,
     end: i32,
     compressed: bool,
+    order: RunOrder,
 ) -> (Vec<u8>, Vec<i64>) {
     let mut stream = header_bytes(op.key, &op.states, compressed);
 
@@ -375,7 +422,11 @@ pub fn keyed_stream(
     for (kg, states) in groups {
         offsets[(kg - start) as usize] = stream.len() as i64;
         let mut block = Vec::new();
-        for (state_id, mut entries) in states {
+        let mut runs: Vec<(usize, Vec<Entry>)> = states.into_iter().collect();
+        if order == RunOrder::HashLike {
+            runs.rotate_right(1);
+        }
+        for (state_id, mut entries) in runs {
             block.extend_from_slice(&(state_id as u16).to_be_bytes());
             let last = entries.len() - 1;
             entries[last].0[0] |= 0x80; // FullSnapshotUtil.setMetaDataFollowsFlagInKey
@@ -419,14 +470,21 @@ fn entry_bytes(op: &KeyedOperator, kg: i32, item: &Item) -> Entry {
             key.extend(k.encode());
             key.push(0); // VoidNamespace
             key.extend(map_key.encode());
-            // HeapKeyValueStateIterator: writeBoolean(userValue == null) then the value.
+            // HeapKeyValueStateIterator.java:360-361: writeBoolean(userValue == null), then
+            // userValueSerializer.serialize(userValue) even when it is null.
             let v = match value {
                 Some(v) => {
                     let mut b = vec![0u8];
                     b.extend(v.encode());
                     b
                 }
-                None => vec![1u8],
+                None => match op.states[item.state()].kind {
+                    // StringValue.writeString(null) writes a single 0 (length 0 = null).
+                    Kind::Map(_, Ser::String) => vec![1u8, 0u8],
+                    // The boxed-primitive serializers throw on null: a heap savepoint cannot
+                    // hold such an entry.
+                    _ => panic!("a heap savepoint cannot hold a null non-String map value"),
+                },
             };
             (key, v)
         }
@@ -466,6 +524,15 @@ fn kg_prefix(kg: i32, max_parallelism: i32) -> Vec<u8> {
 
 /// `KeyedBackendSerializationProxy.write` (version 6).
 pub fn header_bytes(key: Ser, states: &[StateDef], compressed: bool) -> Vec<u8> {
+    // HeapSnapshotResources lists keyed states first, then priority-queue (timer) states, which
+    // is what fixes the shared stateId space.
+    let first_timer = states.iter().position(|s| matches!(s.kind, Kind::Timer));
+    if let Some(t) = first_timer {
+        assert!(
+            states[t..].iter().all(|s| matches!(s.kind, Kind::Timer)),
+            "timer states must come after every keyed state"
+        );
+    }
     let mut h = Vec::new();
     h.extend_from_slice(&6i32.to_be_bytes());
     h.push(compressed as u8);
@@ -642,7 +709,10 @@ pub fn java_string_hash(s: &str) -> i32 {
     h
 }
 
-/// A ready-made operator covering VALUE (Long, String), MAP, LIST and an (empty) timer queue,
+/// The first timer timestamp of [`sample_operator`]: 2026-10-13T00:00:00Z.
+pub const SAMPLE_EPOCH_MS: i64 = 1_791_849_600_000;
+
+/// A ready-made operator covering VALUE (Long, String), MAP, LIST and a timer queue,
 /// with `keys` String keys `key-0000000`.., two subtasks and maxParallelism 128.
 pub fn sample_operator(keys: usize) -> KeyedOperator {
     let mut op = KeyedOperator::new(0x34, 2, 128, Ser::String)
@@ -676,6 +746,14 @@ pub fn sample_operator(keys: usize) -> KeyedOperator {
                 state: 3,
                 key: key.clone(),
                 values: (0..3).map(|j| Val::Long(i as i64 * 10 + j)).collect(),
+            });
+        }
+        if i % 5 == 0 {
+            op.items.push(Item::Timer {
+                state: 4,
+                key: key.clone(),
+                // Non-zero millis: the explorer omits a `.000` fraction.
+                timestamp: SAMPLE_EPOCH_MS + i as i64 * 1000 + 250,
             });
         }
     }
