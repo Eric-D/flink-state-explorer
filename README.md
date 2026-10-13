@@ -39,7 +39,8 @@ payloads. Everything visible in the TUI is also available as a JSON export.
   state, keyed/operator state names + distribution mode, sizes.
 - **Value class** — a state value's fully-qualified Java class (package + name) is surfaced when the
   serializer stores it (POJO/enum).
-- **JSON export** (`E`) — writes `export.json` next to the savepoint with the full decoded model.
+- **JSON export** (`E`) — writes `export.json` next to the savepoint with the decoded model (up to
+  100 000 keys per operator, flagged `truncated` past that; `--export-state` streams every key).
 - **Filtering** — by key prefix, exact match, or key-group range.
 - **Profiles** — per-project proto dirs, patterns, and bindings.
 - **Index caching** — fast reload with staleness detection (auto-rebuilds if stale).
@@ -134,7 +135,7 @@ fail with the file's path and a non-zero exit code.
 | `P` | Profile picker |
 | `H` | Toggle hiding empty operators |
 | `D` | Toggle debug mode (extra type tags, key-groups) |
-| `q` | Quit |
+| `q` / `Ctrl-C` | Quit (`Ctrl-C` also from the filter bar and overlays, and while loading) |
 
 In the detail overlay: `Tab` switches the key/value panel, `↑`/`↓` scroll, `Esc` closes.
 
@@ -144,6 +145,11 @@ Press `E` in the TUI to write `export.json` into the savepoint directory. It mir
 and includes **all** operators (not just keyed ones): an `info` block per operator, the
 `state_descriptors` (with `value_class` when known), and the per-key decoded values. The export and
 the TUI share the same decoder (`src/parser/value.rs`), so they never diverge.
+
+The index behind the TUI and this export keeps at most **100 000 keys per operator**, shared
+between its subtasks. Past that, the TUI says so (`100000 of 1000000 keys shown`) and the export
+sets `truncated: true` at the root and on the operator, with its `stored_keys` and `total_keys`.
+To get every key of a state, use `--export-state`, which streams the savepoint instead.
 
 ## Configuration
 

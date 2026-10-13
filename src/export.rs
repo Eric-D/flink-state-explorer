@@ -93,6 +93,12 @@ fn build_json(index: &IndexCache, proto_ctx: Option<&ProtoContext>) -> Value {
                 None => (Vec::new(), Vec::new()),
             };
 
+            // The index keeps at most `MAX_STORED_PARTITIONS` keys per operator, so `keys` may
+            // hold fewer than the savepoint has: say so rather than look complete.
+            let (total_keys, stored_keys) = op
+                .keyed_state
+                .as_ref()
+                .map_or((0, 0), |ks| (ks.total_keys, ks.stored_keys()));
             json!({
                 "name": op.display_name,
                 "info": Value::Object(info),
@@ -102,13 +108,23 @@ fn build_json(index: &IndexCache, proto_ctx: Option<&ProtoContext>) -> Value {
                 "parallelism": op.parallelism,
                 "operator_states": operator_states,
                 "state_descriptors": descriptors,
+                "total_keys": total_keys,
+                "stored_keys": stored_keys,
+                "truncated": stored_keys < total_keys,
                 "keys": keys
             })
         })
         .collect();
 
+    let truncated = index
+        .operators
+        .iter()
+        .any(|op| op.keyed_state.as_ref().is_some_and(|ks| ks.is_truncated()));
     json!({
         "checkpoint_id": index.checkpoint_id,
+        // True when any operator's `keys` is truncated (see its `truncated`); `--export-state`
+        // streams every key of a state instead.
+        "truncated": truncated,
         "operators": operators
     })
 }
