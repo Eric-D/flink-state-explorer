@@ -93,7 +93,7 @@ Written as the first byte when serializing a POJO value:
 | `0x01` | `IS_NULL` | Value is null (no further data) |
 | `0x02` | `NO_SUBCLASS` | Exact class match (common case) |
 | `0x04` | `IS_SUBCLASS` | Subclass, followed by `writeUTF(className)` |
-| `0x08` | `IS_TAGGED_SUBCLASS` | Tagged subclass, followed by `writeInt(tagId)` |
+| `0x08` | `IS_TAGGED_SUBCLASS` | Registered subclass, followed by `writeByte(tag)` (`PojoSerializer.java:384-385`) |
 | `0x00` | *(heuristic)* | NullableSerializer wrapper `isNull=false` before real flags |
 
 > **Heuristic**: `flags=0x00` is not a valid PojoSerializer flag. When encountered,

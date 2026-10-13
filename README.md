@@ -21,14 +21,18 @@ payloads. Everything visible in the TUI is also available as a JSON export.
 - **Flink 1.20 canonical savepoints** (heap / HashMap backend) — metadata versions 3–5.
 - **Key-first navigation** — Operator → keyBy value → state entries, merged across **all** subtasks.
 - **Broad value decoding** (single decoder shared by the TUI and the JSON export):
-  - scalars (`Int`/`Long`/`Short`/`Float`/`Double`/`Boolean`/`String`), date/time
-    (`Date`/`Timestamp`/`Instant`; `java.time.Local*` are Kryo-serialized by Flink → shown as `[Kryo]`),
+  - scalars (`Int`/`Long`/`Short`/`Float`/`Double`/`Boolean`/`Char`/`String`, emoji included),
+    date/time (`Date`/`Timestamp`/`Instant`; `java.time.Local*` are Kryo-serialized by Flink →
+    shown as `[Kryo]`),
   - `Enum` (resolved to the constant **name**, not the ordinal),
-  - `byte[]`, `String[]`, primitive arrays (`int[]`/`long[]`/`double[]`/…), `Tuple<…>`,
+  - `byte[]`, `String[]`, primitive arrays (`int[]`/`long[]`/`char[]`/`double[]`/…), `Tuple<…>`,
   - **recursive POJOs** (nested POJOs and inner classes) rendered as inline JSON,
   - **keyed `ListState`**, **`MapState`** (keys + values, incl. POJO values),
   - **TTL-wrapped** values (`Ttl<T>`), **broadcast** maps, **window contents**, and **timers**
     (shown as the firing timestamp).
+  - What cannot be decoded is **marked, never `null`**: `[Kryo]`, `[undecodable: <type>]`, and
+    `[not decoded: follows <field>]` for the fields after it (Flink writes no field lengths).
+    `null` always means Flink stored a null.
 - **Kafka connector state** 📨 — source reader splits (topic-partition + offsets), source enumerator
   (assigned partitions), sink writer (`transactionalIdPrefix`), and sink committer (a pending
   `KafkaCommittable`: `transactionalId` + `producerId` + `epoch`). Kafka operators/states are flagged
