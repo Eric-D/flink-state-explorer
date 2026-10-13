@@ -26,12 +26,12 @@ Implementation notes:
 - The savepoint is written inside the container (to `/tmp/flink-savepoints`, which the
   `flink` user can create) and copied out with the Docker API, so host-side files are owned
   by the current user — a bind mount would leave them owned by uid 9999 and break `mvn clean`.
-- The cluster uses JobManager checkpoint storage (`state.checkpoint-storage: jobmanager`,
-  Flink's default when `state.checkpoints.dir` is not set). It returns every state handle
+- The cluster uses JobManager checkpoint storage (`execution.checkpointing.storage:
+  jobmanager`, Flink's default when `execution.checkpointing.dir` is not set). It returns every state handle
   inline, so the savepoint is a single self-contained `_metadata` and no shared JM/TM volume is
-  needed; each handle is capped at 5 MiB. `state.storage.fs.memory-threshold` (now
-  `execution.checkpointing.data-inline-threshold`) only applies to filesystem storage, and is at
-  most 1 MiB.
+  needed; each handle is capped at 5 MiB. The inline threshold
+  (`execution.checkpointing.data-inline-threshold`, formerly `state.storage.fs.memory-threshold`)
+  only applies to filesystem storage, and is at most 1 MiB.
 - `-Dapi.version=1.43` is pinned in the failsafe config: docker-java otherwise uses Docker
   API v1.32, which daemons ≥ 25 reject with *"client version 1.32 is too old"*.
 
@@ -52,7 +52,7 @@ mvn -B -Dbig.savepoint=true -Dit.test=BigSavepointGeneratorIT verify
 ```
 
 What makes it different from the other fixtures:
-- The cluster uses `FileSystemCheckpointStorage` (`state.checkpoint-storage: filesystem`): the
+- The cluster uses `FileSystemCheckpointStorage` (`execution.checkpointing.storage: filesystem`): the
   other ITs sit on the default `JobManagerCheckpointStorage`, which keeps every handle in memory
   and caps it at 5 MB (*"Size of the state is larger than the maximum permitted memory-backed
   state"*), whatever the inline threshold says. That threshold is then left at its default

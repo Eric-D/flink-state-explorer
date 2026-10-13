@@ -804,7 +804,8 @@ pub fn parse_key_group_block(
     // We parse using position-based access to allow "peeking" without consuming.
 
     // Canonical savepoint format (FullSnapshotAsyncWriter):
-    // States are written in stateId order but only for states with entries.
+    // Each state with entries gets one run. Runs are NOT in stateId order on the heap backend
+    // (HeapKeyValueStateIterator walks a HashMap of states; real blocks show e.g. [2, 0, 1]).
     // Per state: [short: stateId] then entries...
     // Per entry: [int: keyLen][keyBytes: kgPrefix+key+namespace][int: valueLen][valueBytes]
 

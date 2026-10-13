@@ -45,8 +45,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *
  * <p>Notes:
  * <ul>
- *   <li>The cluster uses JobManager checkpoint storage ({@code state.checkpoint-storage:
- *       jobmanager}, Flink's default without {@code state.checkpoints.dir}): its
+ *   <li>The cluster uses JobManager checkpoint storage ({@code execution.checkpointing.storage:
+ *       jobmanager}, Flink's default without {@code execution.checkpointing.dir}): its
  *       {@code MemCheckpointStreamFactory} returns every handle inline, whatever the inline
  *       threshold says, so the savepoint is a single self-contained {@code _metadata} produced by
  *       the JobManager — no shared volume between JM and TM is needed. Each handle is capped at
@@ -71,14 +71,14 @@ class SavepointGeneratorIT {
 
     /**
      * Mirrors test-flink-job/docker-compose.yml. JobManager checkpoint storage (Flink's default when
-     * no {@code state.checkpoints.dir} is set, spelled out here) keeps every state handle inline,
+     * no {@code execution.checkpointing.dir} is set, spelled out here) keeps every state handle inline,
      * so the savepoint is one self-contained {@code _metadata}; it caps each handle at 5 MiB.
      */
     private static final String FLINK_PROPERTIES = String.join("\n",
             "jobmanager.rpc.address: jobmanager",
             "state.savepoints.dir: file://" + SAVEPOINTS_DIR,
             "state.backend: hashmap",
-            "state.checkpoint-storage: jobmanager",
+            "execution.checkpointing.storage: jobmanager",
             "taskmanager.numberOfTaskSlots: 4");
 
     private static final Network NETWORK = Network.newNetwork();
