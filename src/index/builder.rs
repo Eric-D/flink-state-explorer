@@ -15,6 +15,13 @@ use super::cache::{
     IndexCache, KeyPartition, StateDescriptor, ValueRef,
 };
 
+/// The index keeps at most this many keys per operator, so that an operator with millions of keys
+/// does not hold every raw value in memory and in the cache file. `CachedKeyedState::total_keys`
+/// still counts every key, the kept ones are spread across subtasks (`spread_quotas`), and the
+/// TUI and the `E` export say when they show fewer keys than the savepoint holds.
+/// `--export-state` streams every key whatever this cap is.
+pub const MAX_STORED_PARTITIONS: usize = 100_000;
+
 pub fn build_index(
     savepoint: &Savepoint,
     metadata_size: u64,
@@ -30,6 +37,25 @@ pub fn build_index(
     )
 }
 
+/// [`build_index`] with an explicit per-operator key cap instead of [`MAX_STORED_PARTITIONS`], so
+/// that tests can exercise the cap without writing 100 000+ keys.
+pub fn build_index_with_cap(
+    savepoint: &Savepoint,
+    metadata_size: u64,
+    metadata_mtime: u64,
+    savepoint_dir: &Path,
+    max_stored_partitions: usize,
+) -> IndexCache {
+    build_index_capped(
+        savepoint,
+        metadata_size,
+        metadata_mtime,
+        savepoint_dir,
+        max_stored_partitions,
+        |_, _, _| {},
+    )
+}
+
 /// Build index with a progress callback called after each operator.
 /// Callback args: (operator_index, operator_name, total_keys_so_far)
 pub fn build_index_with_progress<F>(
@@ -37,6 +63,27 @@ pub fn build_index_with_progress<F>(
     metadata_size: u64,
     metadata_mtime: u64,
     savepoint_dir: &Path,
+    on_progress: F,
+) -> IndexCache
+where
+    F: FnMut(usize, &str, usize),
+{
+    build_index_capped(
+        savepoint,
+        metadata_size,
+        metadata_mtime,
+        savepoint_dir,
+        MAX_STORED_PARTITIONS,
+        on_progress,
+    )
+}
+
+fn build_index_capped<F>(
+    savepoint: &Savepoint,
+    metadata_size: u64,
+    metadata_mtime: u64,
+    savepoint_dir: &Path,
+    max_stored_partitions: usize,
     mut on_progress: F,
 ) -> IndexCache
 where
@@ -48,9 +95,10 @@ where
     for (i, op) in savepoint.operators.iter().enumerate() {
         let name = op.display_name();
         on_progress(i, &name, total_keys);
-        let cached = build_cached_operator(op, savepoint_dir, |keys_so_far| {
-            on_progress(i, &name, total_keys + keys_so_far);
-        });
+        let cached =
+            build_cached_operator(op, savepoint_dir, max_stored_partitions, |keys_so_far| {
+                on_progress(i, &name, total_keys + keys_so_far);
+            });
         if let Some(ks) = &cached.keyed_state {
             total_keys += ks.total_keys;
         }
@@ -72,13 +120,21 @@ where
     }
 }
 
-fn build_cached_operator<F>(op: &Operator, savepoint_dir: &Path, mut on_keys: F) -> CachedOperator
+fn build_cached_operator<F>(
+    op: &Operator,
+    savepoint_dir: &Path,
+    max_stored_partitions: usize,
+    mut on_keys: F,
+) -> CachedOperator
 where
     F: FnMut(usize),
 {
     let mut states = Vec::new();
     let mut keyed_state: Option<CachedKeyedState> = None;
     let mut load_errors = Vec::new();
+    // The keys kept from each subtask so far, in subtask order. Trimmed again after every
+    // subtask, so that no more than `max_stored_partitions` are held from one to the next.
+    let mut kept: Vec<Vec<KeyPartition>> = Vec::new();
 
     // A keyed operator's state is split across subtasks by key group; merge them all so the
     // explorer shows every key, not just the first subtask's.
@@ -88,17 +144,31 @@ where
             &sub.managed_keyed_state,
             savepoint_dir,
             op.max_parallelism,
+            max_stored_partitions,
             &mut on_keys,
         ) {
-            Ok(Some(ks)) => match keyed_state {
-                None => keyed_state = Some(ks),
-                Some(ref mut acc) => merge_keyed_state(acc, ks),
-            },
+            Ok(Some(mut ks)) => {
+                kept.push(std::mem::take(&mut ks.partitions));
+                let available: Vec<usize> = kept.iter().map(Vec::len).collect();
+                for (partitions, quota) in kept
+                    .iter_mut()
+                    .zip(spread_quotas(&available, max_stored_partitions))
+                {
+                    partitions.truncate(quota);
+                }
+                match keyed_state {
+                    None => keyed_state = Some(ks),
+                    Some(ref mut acc) => merge_keyed_state(acc, ks),
+                }
+            }
             Ok(None) => {}
             // Recorded rather than skipped: the other subtasks still load, and the TUI says the
             // key set is partial instead of passing it off as complete.
             Err(e) => load_errors.push(e),
         }
+    }
+    if let Some(ks) = keyed_state.as_mut() {
+        ks.partitions = kept.into_iter().flatten().collect();
     }
 
     // Compute keyed state data size
@@ -128,8 +198,9 @@ where
     }
 }
 
-/// Merge one subtask's keyed state into the accumulator. Subtasks own disjoint key groups, so
-/// partitions are simply appended; per-state entry counts are summed; descriptors are shared.
+/// Merge one subtask's keyed state into the accumulator. Subtasks own disjoint key groups, so key
+/// counts and per-state entry counts are summed; descriptors are shared. Partitions are not merged
+/// here: `build_cached_operator` takes them from every subtask, with [`spread_quotas`].
 fn merge_keyed_state(acc: &mut CachedKeyedState, other: CachedKeyedState) {
     acc.total_keys += other.total_keys;
     for od in &other.descriptors {
@@ -137,12 +208,43 @@ fn merge_keyed_state(acc: &mut CachedKeyedState, other: CachedKeyedState) {
             d.entry_count += od.entry_count;
         }
     }
-    const MAX_STORED_PARTITIONS: usize = 100_000;
-    if acc.partitions.len() < MAX_STORED_PARTITIONS {
-        let room = MAX_STORED_PARTITIONS - acc.partitions.len();
-        acc.partitions
-            .extend(other.partitions.into_iter().take(room));
+}
+
+/// How many of their keys the subtasks may keep when `cap` keys are stored in all, given that
+/// subtask `i` holds `available[i]`: an equal share each, where a subtask with fewer keys than its
+/// share keeps them all and leaves the rest to the others (max-min fairness). Every subtask that
+/// has keys therefore keeps some — at least one while `cap` is no smaller than the number of such
+/// subtasks — instead of the first subtasks filling the cap. A quota never exceeds
+/// `available[i]`, so applying this again after each new subtask only ever trims what is held.
+fn spread_quotas(available: &[usize], cap: usize) -> Vec<usize> {
+    if available.iter().sum::<usize>() <= cap {
+        return available.to_vec();
     }
+    let filled = |level: usize| available.iter().map(|&a| a.min(level)).sum::<usize>();
+    // The highest level that fits: filled(level) <= cap < filled(level + 1).
+    let (mut level, mut hi) = (0usize, available.iter().copied().max().unwrap_or(0));
+    while level < hi {
+        let mid = level + (hi - level).div_ceil(2);
+        if filled(mid) <= cap {
+            level = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let mut quotas: Vec<usize> = available.iter().map(|&a| a.min(level)).collect();
+    // What is left is smaller than the number of subtasks above the level (that is what
+    // `cap < filled(level + 1)` says): one more key each to the first of them.
+    let mut left = cap - filled(level);
+    for (quota, &a) in quotas.iter_mut().zip(available) {
+        if left == 0 {
+            break;
+        }
+        if a > level {
+            *quota += 1;
+            left -= 1;
+        }
+    }
+    quotas
 }
 
 /// Collect non-keyed operator states (managed-operator, raw-operator).
@@ -305,6 +407,7 @@ fn build_keyed_state<F>(
     handle: &StateHandle,
     savepoint_dir: &Path,
     max_parallelism: i32,
+    max_stored_partitions: usize,
     on_keys: &mut F,
 ) -> Result<Option<CachedKeyedState>, String>
 where
@@ -505,11 +608,11 @@ where
     }
 
     let total_keys = partitions_map.len();
-    // Limit stored partitions to avoid huge memory/cache for operators with millions of keys
-    const MAX_STORED_PARTITIONS: usize = 100_000;
+    // Keep at most the cap from this subtask (its smallest keys); `build_cached_operator` then
+    // shares the cap between subtasks. `total_keys` still counts every key.
     let partitions: Vec<KeyPartition> = partitions_map
         .into_iter()
-        .take(MAX_STORED_PARTITIONS)
+        .take(max_stored_partitions)
         .map(|(key, (kg, values, _))| KeyPartition {
             key,
             key_group: kg,
@@ -774,5 +877,72 @@ fn value_ref_from_stream(handle: &StreamStateHandle) -> Option<ValueRef> {
             data: bs.data.clone(),
         }),
         StreamStateHandle::Null | StreamStateHandle::EmptySegment => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::spread_quotas;
+
+    #[test]
+    fn quotas_keep_everything_under_the_cap() {
+        assert_eq!(spread_quotas(&[3, 0, 5], 10), vec![3, 0, 5]);
+        assert_eq!(spread_quotas(&[], 10), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn quotas_share_the_cap_between_subtasks() {
+        // Equal shares; the remainder goes to the first subtasks above the level.
+        assert_eq!(spread_quotas(&[100, 100, 100], 10), vec![4, 3, 3]);
+        // A small subtask keeps all of its keys and leaves its unused share to the others.
+        assert_eq!(spread_quotas(&[2, 100, 100], 10), vec![2, 4, 4]);
+        // Subtask 0 no longer fills the cap on its own (#13).
+        assert_eq!(spread_quotas(&[10, 10], 10), vec![5, 5]);
+        // Empty subtasks get nothing; every other one keeps at least one key.
+        assert_eq!(spread_quotas(&[0, 1000, 0, 1], 3), vec![0, 2, 0, 1]);
+    }
+
+    #[test]
+    fn quotas_fill_the_cap_exactly_and_never_exceed_what_is_held() {
+        let cases: [&[usize]; 5] = [
+            &[7, 3, 9, 1, 0, 12],
+            &[1, 1, 1, 1],
+            &[500, 581],
+            &[5, 1000, 3, 999, 0, 2],
+            &[0, 0, 4],
+        ];
+        for available in cases {
+            let total: usize = available.iter().sum();
+            let holders = available.iter().filter(|&&a| a > 0).count();
+            for cap in 0..=total + 2 {
+                let quotas = spread_quotas(available, cap);
+                assert_eq!(
+                    quotas.iter().sum::<usize>(),
+                    cap.min(total),
+                    "{available:?} cap {cap}"
+                );
+                for (q, a) in quotas.iter().zip(available) {
+                    assert!(q <= a, "{available:?} cap {cap}: {quotas:?}");
+                    if *a > 0 && cap >= holders {
+                        assert!(*q > 0, "{available:?} cap {cap}: {quotas:?}");
+                    }
+                }
+
+                // As `build_cached_operator` uses it: one subtask at a time, each trimming what
+                // the previous ones kept. The cap is still filled, and still from every subtask.
+                let mut held: Vec<usize> = Vec::new();
+                for &a in available {
+                    held.push(a.min(cap));
+                    held = spread_quotas(&held, cap);
+                }
+                assert_eq!(held.iter().sum::<usize>(), cap.min(total));
+                for (h, a) in held.iter().zip(available) {
+                    assert!(h <= a);
+                    if *a > 0 && cap >= holders {
+                        assert!(*h > 0, "{available:?} cap {cap}: incremental {held:?}");
+                    }
+                }
+            }
+        }
     }
 }

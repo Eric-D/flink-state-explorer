@@ -14,7 +14,9 @@ use crate::error::IndexError;
 ///    subtask's range.
 /// 2: `CachedOperator.load_errors`; the file starts with a fixed header (see [`save_cache`]) that
 ///    is checked before the body is decoded.
-pub const CACHE_FORMAT: u32 = 2;
+/// 3: past `MAX_STORED_PARTITIONS` keys, the stored keys are shared between subtasks instead of
+///    coming from the first subtasks only.
+pub const CACHE_FORMAT: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IndexCache {
@@ -133,7 +135,16 @@ impl CachedOperator {
         }
         if let Some(ks) = &self.keyed_state {
             v.push(("Key type".to_string(), ks.key_type.clone()));
-            v.push(("Keys".to_string(), ks.total_keys.to_string()));
+            let keys = if ks.is_truncated() {
+                format!(
+                    "{} ({} shown; --export-state reads them all)",
+                    ks.total_keys,
+                    ks.stored_keys()
+                )
+            } else {
+                ks.total_keys.to_string()
+            };
+            v.push(("Keys".to_string(), keys));
             let names: Vec<&str> = ks.descriptors.iter().map(|d| d.name.as_str()).collect();
             v.push((
                 "Keyed states".to_string(),
@@ -161,6 +172,18 @@ pub struct CachedKeyedState {
     pub total_keys: usize,
     /// Key serializer type (e.g. "String", "Pojo", "Long")
     pub key_type: String,
+}
+
+impl CachedKeyedState {
+    /// Keys held in `partitions`: at most `index::builder::MAX_STORED_PARTITIONS`.
+    pub fn stored_keys(&self) -> usize {
+        self.partitions.len()
+    }
+
+    /// Whether the index holds fewer keys than the savepoint has (the per-operator cap applied).
+    pub fn is_truncated(&self) -> bool {
+        self.partitions.len() < self.total_keys
+    }
 }
 
 /// Metadata for a single registered keyed state.

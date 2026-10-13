@@ -1,18 +1,17 @@
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::Parser;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
-use crossterm::ExecutableCommand;
+use crossterm::event::{self, Event, KeyEventKind};
 use ratatui::prelude::*;
 use ratatui::Terminal;
 
 use flink_explorer::error::{AppError, UiError};
-use flink_explorer::tui::app::App;
+use flink_explorer::tui::app::{is_interrupt, App};
 use flink_explorer::tui::loading::{LoadingScreen, LoadingStep};
+use flink_explorer::tui::terminal::{restore_terminal, TerminalGuard};
 
 #[derive(Parser)]
 #[command(
@@ -91,22 +90,14 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<(), AppError> {
-    // Enter TUI immediately so we can show loading progress
-    enable_raw_mode().map_err(UiError::Init)?;
-    io::stdout()
-        .execute(EnterAlternateScreen)
-        .map_err(UiError::Init)?;
+    // Enter TUI immediately so we can show loading progress. The guard installs a panic hook
+    // before raw mode is enabled, and restores the terminal however this function is left.
+    let _guard = TerminalGuard::enter().map_err(UiError::Init)?;
 
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).map_err(UiError::Init)?;
 
-    let result = load_and_run(cli, &mut terminal);
-
-    // Always restore terminal
-    disable_raw_mode().ok();
-    io::stdout().execute(LeaveAlternateScreen).ok();
-
-    result
+    load_and_run(cli, &mut terminal)
 }
 
 fn load_and_run(
@@ -119,12 +110,38 @@ fn load_and_run(
     let mut app = App::new_with_progress(cli.savepoint_dir, cli.no_cache, |step| {
         loading.advance(step);
         let _ = loading.render(terminal);
+        // Building the index cannot be cancelled, so a Ctrl-C ends the process here (raw mode
+        // turned it into a key event: no SIGINT does it for us).
+        if take_queued_input() {
+            restore_terminal(); // process::exit skips the guard's Drop
+            std::process::exit(130);
+        }
     })?;
 
     loading.advance(LoadingStep::Done);
     loading.render(terminal)?;
+    if take_queued_input() {
+        return Ok(());
+    }
 
     app.run_with_terminal(terminal)
+}
+
+/// Read every input event already queued, without blocking, and say whether one was Ctrl-C. The
+/// others are dropped on purpose: keys typed while the index loads would otherwise be replayed
+/// on a tree the user has not seen yet.
+fn take_queued_input() -> bool {
+    let mut interrupted = false;
+    while matches!(event::poll(Duration::ZERO), Ok(true)) {
+        match event::read() {
+            Ok(Event::Key(key)) if key.kind == KeyEventKind::Press && is_interrupt(&key) => {
+                interrupted = true
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    interrupted
 }
 
 /// Parse `_metadata` without building the (fully in-memory) index.
