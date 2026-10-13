@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -11,7 +12,9 @@ use crate::error::IndexError;
 ///
 /// 1: `KeyPartition.key_group` became the **absolute** key-group instead of the index within the
 ///    subtask's range.
-pub const CACHE_FORMAT: u32 = 1;
+/// 2: `CachedOperator.load_errors`; the file starts with a fixed header (see [`save_cache`]) that
+///    is checked before the body is decoded.
+pub const CACHE_FORMAT: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IndexCache {
@@ -21,9 +24,16 @@ pub struct IndexCache {
     pub savepoint_version: u32,
     pub master_states: Vec<String>,
     pub operators: Vec<CachedOperator>,
-    /// See [`CACHE_FORMAT`]. Last field so that a cache written before it existed hits EOF on
-    /// decode and is rebuilt rather than silently mis-read.
+    /// See [`CACHE_FORMAT`]. Also in the file header, which is what [`load_cache`] checks first;
+    /// kept last so that a body written before it existed hits EOF on decode.
     pub cache_format: u32,
+}
+
+impl IndexCache {
+    /// True when some state file could not be read, i.e. the index is partial.
+    pub fn has_load_errors(&self) -> bool {
+        self.operators.iter().any(|op| !op.load_errors.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -46,6 +56,10 @@ pub struct CachedOperator {
     pub states: Vec<CachedState>,
     /// Structured keyed state data (key-first pivot).
     pub keyed_state: Option<CachedKeyedState>,
+    /// One message per state file of this operator that could not be read — missing, unreadable
+    /// or shorter than its handle records — naming the file. Non-empty means `keyed_state` lacks
+    /// those subtasks' keys.
+    pub load_errors: Vec<String>,
 }
 
 impl CachedOperator {
@@ -103,6 +117,17 @@ impl CachedOperator {
                 format!("{} bytes", self.keyed_state_size),
             ),
         ];
+        if !self.load_errors.is_empty() {
+            // Right after the size it explains: the bytes are there, the keys are not.
+            v.push((
+                "Load errors".to_string(),
+                format!(
+                    "{} state file(s) could not be read, their keys are missing: {}",
+                    self.load_errors.len(),
+                    crate::state_file::summarize(&self.load_errors, 3)
+                ),
+            ));
+        }
         if let Some(info) = &self.coordinator_info {
             v.push(("Source enumerator".to_string(), info.clone()));
         }
@@ -197,12 +222,37 @@ pub enum ValueRef {
     Inline { data: Vec<u8> },
 }
 
-const CACHE_FILE_NAME: &str = ".flink-explorer-cache";
+pub const CACHE_FILE_NAME: &str = ".flink-explorer-cache";
 
-/// Save the index cache to disk next to the savepoint directory.
+const CACHE_MAGIC: [u8; 4] = *b"FXIC";
+const HEADER_LEN: usize = 4 + 4 + 8 + 8;
+
+/// The fixed-size prefix of a cache file: magic, [`CACHE_FORMAT`], then the `_metadata` size and
+/// mtime the index was built from, all big-endian. Everything [`load_cache`] needs to call a cache
+/// stale, without decoding a body that can run to hundreds of megabytes.
+fn header(format: u32, metadata_size: u64, metadata_mtime: u64) -> [u8; HEADER_LEN] {
+    let mut h = [0u8; HEADER_LEN];
+    h[..4].copy_from_slice(&CACHE_MAGIC);
+    h[4..8].copy_from_slice(&format.to_be_bytes());
+    h[8..16].copy_from_slice(&metadata_size.to_be_bytes());
+    h[16..].copy_from_slice(&metadata_mtime.to_be_bytes());
+    h
+}
+
+/// Whether a freshly built index may be written to the cache: never when the user asked for no
+/// cache, and never when some state file could not be read. Staleness only looks at `_metadata`,
+/// so a partial index, once cached, would still be served after the files were repaired.
+pub fn may_save_cache(index: &IndexCache, no_cache: bool) -> bool {
+    !no_cache && !index.has_load_errors()
+}
+
+/// Save the index cache to disk next to the savepoint directory: [`header`], then the postcard
+/// body.
 pub fn save_cache(cache: &IndexCache, savepoint_dir: &Path) -> Result<(), IndexError> {
     let cache_path = savepoint_dir.join(CACHE_FILE_NAME);
-    let encoded = postcard::to_allocvec(cache).map_err(|e| IndexError::Encode(e.to_string()))?;
+    let head = header(CACHE_FORMAT, cache.metadata_size, cache.metadata_mtime).to_vec();
+    let encoded =
+        postcard::to_extend(cache, head).map_err(|e| IndexError::Encode(e.to_string()))?;
     fs::write(&cache_path, &encoded).map_err(|e| IndexError::WriteCache {
         path: cache_path,
         source: e,
@@ -210,21 +260,38 @@ pub fn save_cache(cache: &IndexCache, savepoint_dir: &Path) -> Result<(), IndexE
     Ok(())
 }
 
-/// Load the index cache from disk. Returns `StaleCache` if metadata stats
-/// don't match.
+/// Load the index cache from disk. Returns `StaleCache` — having read only the header — if it was
+/// built from another `_metadata` or by a build with another [`CACHE_FORMAT`] (a cache older than
+/// the header is stale too).
 pub fn load_cache(
     savepoint_dir: &Path,
     current_metadata_size: u64,
     current_metadata_mtime: u64,
 ) -> Result<IndexCache, IndexError> {
     let cache_path = savepoint_dir.join(CACHE_FILE_NAME);
-    let data = fs::read(&cache_path).map_err(|e| IndexError::ReadCache {
+    let read_error = |e: std::io::Error| IndexError::ReadCache {
         path: cache_path.clone(),
         source: e,
-    })?;
+    };
+    let mut file = fs::File::open(&cache_path).map_err(read_error)?;
+    let mut head = [0u8; HEADER_LEN];
+    match file.read_exact(&mut head) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Err(IndexError::StaleCache)
+        }
+        Err(e) => return Err(read_error(e)),
+    }
+    if head != header(CACHE_FORMAT, current_metadata_size, current_metadata_mtime) {
+        return Err(IndexError::StaleCache);
+    }
+
+    let mut data = Vec::new();
+    file.read_to_end(&mut data).map_err(read_error)?;
     let cache: IndexCache =
         postcard::from_bytes(&data).map_err(|e| IndexError::Decode(e.to_string()))?;
 
+    // The body repeats what the header says; a disagreement means the file is not what it claims.
     if cache.metadata_size != current_metadata_size
         || cache.metadata_mtime != current_metadata_mtime
         || cache.cache_format != CACHE_FORMAT

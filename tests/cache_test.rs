@@ -1,6 +1,8 @@
+use flink_explorer::error::IndexError;
 use flink_explorer::index::cache::{
-    load_cache, save_cache, CachedEntry, CachedKeyedState, CachedOperator, CachedState, IndexCache,
-    KeyPartition, StateDescriptor, ValueRef, CACHE_FORMAT,
+    load_cache, may_save_cache, save_cache, CachedEntry, CachedKeyedState, CachedOperator,
+    CachedState, IndexCache, KeyPartition, StateDescriptor, ValueRef, CACHE_FILE_NAME,
+    CACHE_FORMAT,
 };
 
 fn make_test_cache() -> IndexCache {
@@ -64,6 +66,7 @@ fn make_test_cache() -> IndexCache {
                 total_keys: 1,
                 key_type: "String".to_string(),
             }),
+            load_errors: vec![],
         }],
     }
 }
@@ -95,4 +98,85 @@ fn cache_stale_detection() {
     assert!(result.is_err());
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn temp_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "flink-explorer-test-{}-{}",
+        tag,
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Staleness is decided from the fixed header, before the body — which can run to hundreds of
+/// megabytes — is decoded: with a body that cannot decode, a stale cache is still `StaleCache`,
+/// and only a fresh one reaches the decoder.
+#[test]
+fn a_stale_cache_is_rejected_without_decoding_its_body() {
+    let cache = make_test_cache();
+    let dir = temp_dir("header");
+    save_cache(&cache, &dir).unwrap();
+    let path = dir.join(CACHE_FILE_NAME);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let body_len = postcard::to_allocvec(&cache).unwrap().len();
+    let header_len = bytes.len() - body_len;
+    assert!(header_len > 0, "the file starts with a header");
+    for b in &mut bytes[header_len..] {
+        *b = 0xff;
+    }
+    std::fs::write(&path, &bytes).unwrap();
+
+    assert!(matches!(
+        load_cache(&dir, 1024, 1711900000),
+        Err(IndexError::Decode(_))
+    ));
+    assert!(matches!(
+        load_cache(&dir, 1024, 9999999),
+        Err(IndexError::StaleCache)
+    ));
+    assert!(matches!(
+        load_cache(&dir, 2048, 1711900000),
+        Err(IndexError::StaleCache)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A cache written before the header existed — a bare postcard body — or cut short is stale, even
+/// when its body would decode and match.
+#[test]
+fn a_cache_without_the_header_is_stale() {
+    let cache = make_test_cache();
+    let dir = temp_dir("headerless");
+    let path = dir.join(CACHE_FILE_NAME);
+
+    std::fs::write(&path, postcard::to_allocvec(&cache).unwrap()).unwrap();
+    assert!(matches!(
+        load_cache(&dir, 1024, 1711900000),
+        Err(IndexError::StaleCache)
+    ));
+
+    std::fs::write(&path, b"FX").unwrap();
+    assert!(matches!(
+        load_cache(&dir, 1024, 1711900000),
+        Err(IndexError::StaleCache)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn only_a_complete_index_may_be_cached() {
+    let mut cache = make_test_cache();
+    assert!(may_save_cache(&cache, false));
+    assert!(!may_save_cache(&cache, true), "--no-cache must not write");
+    cache.operators[0]
+        .load_errors
+        .push("/sp/state-0: No such file or directory (os error 2)".to_string());
+    assert!(cache.has_load_errors());
+    assert!(
+        !may_save_cache(&cache, false),
+        "a partial index was cacheable"
+    );
 }

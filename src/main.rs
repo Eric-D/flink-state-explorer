@@ -136,14 +136,26 @@ fn parse_savepoint(cli: &Cli) -> Result<flink_explorer::parser::Savepoint, Strin
 
 fn list_states(cli: &Cli) -> Result<(), String> {
     let savepoint = parse_savepoint(cli)?;
-    let states = flink_explorer::export_state::list_states(&savepoint, &cli.savepoint_dir);
-    if states.is_empty() {
-        eprintln!("No keyed state found in {}", cli.savepoint_dir.display());
-        return Ok(());
+    let listing = flink_explorer::export_state::list_states(&savepoint, &cli.savepoint_dir);
+    if !listing.states.is_empty() {
+        println!("{:<34} {:<10} STATE", "OPERATOR", "TYPE");
+        for (op, name, state_type) in &listing.states {
+            println!("{:<34} {:<10} {}", op, state_type, name);
+        }
     }
-    println!("{:<34} {:<10} STATE", "OPERATOR", "TYPE");
-    for (op, name, state_type) in states {
-        println!("{:<34} {:<10} {}", op, state_type, name);
+    // What could be read is listed; what could not makes the run fail, so that a script never
+    // takes a partial list (or none at all) for the savepoint's content.
+    if !listing.errors.is_empty() {
+        for e in &listing.errors {
+            eprintln!("Error: {}", e);
+        }
+        return Err(format!(
+            "{} state file(s) could not be read, so this list may be incomplete",
+            listing.errors.len()
+        ));
+    }
+    if listing.states.is_empty() {
+        eprintln!("No keyed state found in {}", cli.savepoint_dir.display());
     }
     Ok(())
 }

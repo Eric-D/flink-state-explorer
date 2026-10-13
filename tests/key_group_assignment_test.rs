@@ -156,7 +156,7 @@ fn index_export_reports_the_key_group_flink_assigned() {
 #[test]
 fn streamed_key_groups_fall_inside_their_subtask_range() {
     let sp = savepoint();
-    let states = list_states(&sp, Path::new(SAVEPOINT_DIR));
+    let states = list_states(&sp, Path::new(SAVEPOINT_DIR)).states;
     let mut checked = 0;
 
     for (op_hex, state, _) in &states {

@@ -75,11 +75,16 @@ binaries to **GitHub Releases** — see the
 # Open with a specific profile (for proto decoding)
 ./target/release/flink-explorer -p my-profile /path/to/savepoint-dir
 
-# Skip the index cache (always re-parse)
+# Skip the index cache (always re-parse; .flink-explorer-cache is neither read nor written)
 ./target/release/flink-explorer --no-cache /path/to/savepoint-dir
 ```
 
 `flink-explorer --help` lists the flags: `-p/--profile <name>`, `--no-cache`.
+
+A state file that is missing, unreadable or shorter than `_metadata` says is never taken for
+"no state": the operator is flagged `⚠ N state file(s) not read` (details under `i`), the other
+subtasks still load, and such a partial index is not cached. `--list-states` and `--export-state`
+fail with the file's path and a non-zero exit code.
 
 ## TUI Layout
 
