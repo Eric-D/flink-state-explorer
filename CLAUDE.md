@@ -44,7 +44,7 @@ cd test-flink-job && mvn verify          # builds shaded jar, then generates the
 cd .. && cargo test                      # Rust tests read the fixtures below
 ```
 
-Three ITs generate three fixtures (all gitignored): `SavepointGeneratorIT` → `savepoint-gitlab`
+Three ITs generate three fixtures (all gitignored), plus an opt-in fourth: `SavepointGeneratorIT` → `savepoint-gitlab`
 (all state types, via `ClusterJob`) and → `savepoint-compressed` (the same job run with
 `compress`, i.e. `ExecutionConfig.setUseSnapshotCompression`, so each key-group is an independent
 Snappy-framed stream — the only fixture covering the compressed read path; both tests share one
@@ -57,6 +57,22 @@ sink's default `transaction.timeout.ms` (1h) exceeds the broker's `transaction.m
 (15min) → set to 600000 in `KafkaJob`; the connector pulls an older `jackson-core` onto the test
 classpath → pinned to 2.17.2 in the pom.
 
+`BigSavepointGeneratorIT` (skipped unless `-Dbig.savepoint=true`) → `savepoint-big`: `BigStateJob`,
+1M String keys × (ValueState<Long>, ValueState<String>, MapState<String,Long>), ~211 MB, written
+with **filesystem** checkpoint storage so each subtask's keyed state is a separate file next to
+`_metadata` (`RelativeFileStateHandle`) — the layout of production savepoints. Every value is a
+pure function of the key index (`BigStateJob.*Of`). For performance work:
+`mvn -B -Dbig.savepoint=true -Dit.test=BigSavepointGeneratorIT verify`, then
+`cargo run --release --example bench_index -- tests/fixtures/savepoint-big [build|load|scroll]`
+(the TUI load path, headless, with timings and RSS).
+
+**Synthetic savepoints** (`tests/common/synth.rs`) are written byte for byte in Flink's layout
+(`_metadata` v4, keyed-stream header v6, key-group blocks with the metadata-follows flag, inline
+or file-backed, optionally Snappy-compressed, Flink's key-group assignment), so file-backed,
+multi-subtask and compressed paths are tested **in CI** without Docker.
+`tests/synth_savepoint_test.rs` checks the generated header byte for byte against a real one
+(when `savepoint-big` exists). Prefer them for new fixture-free tests.
+
 Gotchas already handled in the pom/IT (don't re-debug):
 - **Docker API version**: docker-java defaults to API v1.32 which Docker ≥25 rejects
   ("client version 1.32 is too old"). Fixed by `-Dapi.version=1.43` in the failsafe
@@ -65,8 +81,13 @@ Gotchas already handled in the pom/IT (don't re-debug):
 - The savepoint is written to `/tmp/flink-savepoints` **inside** the container (the `flink` uid
   9999 can't mkdir `/savepoints` at root-owned `/`) and copied out with the Docker API, so host
   files are owned by you (a bind mount breaks `mvn clean`).
-- `state.storage.fs.memory-threshold: 20 mb` forces small state inline → a single self-contained
-  `_metadata`.
+- The ITs pin `state.checkpoint-storage: jobmanager` (Flink's default without
+  `state.checkpoints.dir`, see `CheckpointStorageLoader.createDefaultCheckpointStorage`): its
+  `MemCheckpointStreamFactory` keeps **every** handle inline → a single self-contained
+  `_metadata`, capped at 5 MiB per handle. `state.storage.fs.memory-threshold` does nothing there
+  (it only applies to filesystem storage, where it is a deprecated alias of
+  `execution.checkpointing.data-inline-threshold`, max 1 MiB). To get state **files**, use
+  filesystem storage as `BigSavepointGeneratorIT` does, and copy from both JM and TM.
 
 ## Exporting one state (streaming)
 
@@ -220,10 +241,12 @@ source** (branch `release-1.20`, https://github.com/apache/flink) rather than gu
 
 ## Tests
 - `cargo test` — needs `tests/fixtures/savepoint-gitlab/` (run `mvn verify` first). Note that
-  `.github/workflows/ci.yml` runs an **explicit list** of fixture-free tests, so the
-  fixture-dependent ones (`gitlab_savepoint_test`, `decode_e2e_test`, `coverage_audit`,
-  `export_state_stream_test`, `key_group_assignment_test`, `compressed_savepoint_test`) only ever
-  run locally.
+  `.github/workflows/ci.yml` runs an **explicit list** of fixture-free tests (add new ones to it;
+  `tests/synth_savepoint_test.rs` and `tests/keyed_block_test.rs` are the fixture-free home for
+  file-backed / multi-subtask / compressed and block-level cases), so the fixture-dependent ones
+  (`gitlab_savepoint_test`, `decode_e2e_test`, `coverage_audit`, `export_state_stream_test`,
+  `key_group_assignment_test`, `compressed_savepoint_test`, `export_parquet_test`) only ever run
+  locally.
 - `tests/decode_e2e_test.rs` — protobuf, tuples, primitive arrays, full-POJO, scrollbar.
 - `tests/coverage_audit.rs` — dumps the full operator/state inventory + decoded values (diagnostic).
 - `tests/gitlab_savepoint_test.rs` — exhaustive per-state assertions.

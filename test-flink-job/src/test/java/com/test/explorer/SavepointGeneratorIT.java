@@ -45,10 +45,13 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *
  * <p>Notes:
  * <ul>
- *   <li>{@code state.storage.fs.memory-threshold} is raised so the (small) test state is inlined
- *       into {@code _metadata} rather than written as separate files. The savepoint is therefore a
- *       single self-contained {@code _metadata} produced by the JobManager — no shared volume
- *       between JM and TM is needed, and the fixture matches the existing committed ones.</li>
+ *   <li>The cluster uses JobManager checkpoint storage ({@code state.checkpoint-storage:
+ *       jobmanager}, Flink's default without {@code state.checkpoints.dir}): its
+ *       {@code MemCheckpointStreamFactory} returns every handle inline, whatever the inline
+ *       threshold says, so the savepoint is a single self-contained {@code _metadata} produced by
+ *       the JobManager — no shared volume between JM and TM is needed. Each handle is capped at
+ *       5 MiB ("Size of the state is larger than the maximum permitted memory-backed state").
+ *       {@code BigSavepointGeneratorIT} uses filesystem storage instead, to get state files.</li>
  *   <li>The savepoint is copied out of the container with the Docker API, so the host-side files
  *       are owned by the current user (a bind mount would leave them owned by the in-container
  *       {@code flink} user, which breaks {@code mvn clean}).</li>
@@ -66,12 +69,16 @@ class SavepointGeneratorIT {
     private static final String SAVEPOINTS_DIR = "/tmp/flink-savepoints";
     private static final int PARALLELISM = 2;
 
-    /** Mirrors test-flink-job/docker-compose.yml, plus inlining so the savepoint is one file. */
+    /**
+     * Mirrors test-flink-job/docker-compose.yml. JobManager checkpoint storage (Flink's default when
+     * no {@code state.checkpoints.dir} is set, spelled out here) keeps every state handle inline,
+     * so the savepoint is one self-contained {@code _metadata}; it caps each handle at 5 MiB.
+     */
     private static final String FLINK_PROPERTIES = String.join("\n",
             "jobmanager.rpc.address: jobmanager",
             "state.savepoints.dir: file://" + SAVEPOINTS_DIR,
             "state.backend: hashmap",
-            "state.storage.fs.memory-threshold: 20 mb",
+            "state.checkpoint-storage: jobmanager",
             "taskmanager.numberOfTaskSlots: 4");
 
     private static final Network NETWORK = Network.newNetwork();
