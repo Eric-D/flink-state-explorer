@@ -45,6 +45,7 @@ fn cache_with_map(values: Vec<Option<Vec<u8>>>) -> IndexCache {
                 total_keys: 1,
                 key_type: "String".into(),
             }),
+            load_errors: vec![],
         }],
     }
 }

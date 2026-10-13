@@ -115,7 +115,7 @@ fn keyed_stream_header_is_v6_and_uncompressed() {
 #[test]
 fn streaming_matches_full_export() {
     let full = full_export();
-    let states = list_states(&savepoint(), Path::new(SAVEPOINT_DIR));
+    let states = list_states(&savepoint(), Path::new(SAVEPOINT_DIR)).states;
     assert!(!states.is_empty());
 
     let mut compared = 0;
@@ -147,7 +147,7 @@ fn streaming_matches_full_export() {
 #[test]
 fn map_state_explodes_into_one_row_per_entry() {
     let full = full_export();
-    let states = list_states(&savepoint(), Path::new(SAVEPOINT_DIR));
+    let states = list_states(&savepoint(), Path::new(SAVEPOINT_DIR)).states;
     let mut compared = 0;
 
     for (op, name, state_type) in &states {

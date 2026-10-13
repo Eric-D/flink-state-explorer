@@ -130,6 +130,26 @@ Two things to know about the rows:
   `murmurHash(key.hashCode()) % maxParallelism` and against each subtask's computed range — this
   also fixes the TUI's key-group **range filter**, which could not match subtasks past the first.
 
+## State files: never read a broken one as "no state"
+
+Every state file (relative, absolute, or a file-merging segment) is opened through
+`src/state_file.rs`, which returns an error **naming the path** when the file is missing,
+unreadable, or **shorter than the handle's `stateSize`** (`"<path>: truncated: N of M bytes"`;
+Flink records the stream position at close, `-1` if unknown, which skips the length check). Do not
+go back to `fs::read(..).unwrap_or_default()` or `metadata().ok()?`: that turned a lost file into a
+plausible half key set.
+- **Index/TUI**: a subtask that cannot be read is recorded in `CachedOperator.load_errors`, and the
+  other subtasks still load. The operator gets a red `⚠ N state file(s) not read` label, is never
+  hidden by `hide_empty`, and has a `Load errors` line under `i` (and a `load_errors` array in the
+  `E` JSON export). The index does not read segment handles: it reports them as a load error.
+- **Cache**: a build with load errors is never cached (`may_save_cache`), `--no-cache` neither
+  reads nor writes it, and `tui::app::load_index` is where that is decided.
+- **Headless**: `--export-state` fails before writing any row if a file of the target operator
+  cannot be read, and also if another candidate operator has an unreadable file (it may hold the
+  state too; `--operator` scopes it away). The state is resolved from **every** subtask's header,
+  so a bad first file is reported as such, not as "state not found". `--list-states` prints what it
+  could read, then every error on stderr, and exits 2.
+
 ## Decoder architecture — IMPORTANT
 
 **`src/parser/value.rs` is the single source of truth for binary value decoding.** It turns a
@@ -269,6 +289,13 @@ source** (branch `release-1.20`, https://github.com/apache/flink) rather than gu
   for every non-MAP state, exploded parity for MAP states, the `v6`/compression header, and the
   bounded peak block. (The Snappy-framed key-group and the state filter are in the
   fixture-free `tests/keyed_block_test.rs`.)
+- `tests/state_file_errors_test.rs` — fixture-free (CI): a 2-subtask file-backed synthetic
+  savepoint with one state file deleted, truncated or (unix) `chmod 000`. The index records an
+  error naming the file and keeps the other subtask's keys; the TUI keeps and flags the operator;
+  `export_state_ndjson`, `list_states`, `find_state` and the CLI (exit code) fail naming the file;
+  no cache is written after a partial build or with `--no-cache`, which does not read it either.
+- `tests/cache_test.rs` — round trip, staleness decided from the header without decoding the body,
+  header-less (older) caches rejected, `may_save_cache`.
 
 ## Dependencies — IMPORTANT
 
@@ -279,7 +306,9 @@ stay clean.
   removing `tui-tree-widget` also deduped a second `ratatui`).
 - The index cache carries a `cache_format` version (`src/index/cache.rs`): bump it whenever an
   older cache would decode cleanly but hold values this build computes differently — a mismatch, or
-  a cache predating the field, falls back to a full rebuild.
+  a cache predating the field, falls back to a full rebuild. The file starts with a fixed 24-byte
+  header (magic `FXIC`, format, `_metadata` size and mtime), so a stale cache is rejected without
+  decoding its body.
 - The index cache (`src/index/cache.rs`) uses **`postcard`** (not `bincode`, which is unmaintained —
   RUSTSEC-2025-0141, and whose 3.0.0 is a serde-less tombstone). Use
   `postcard = { default-features = false, features = ["use-std"] }` to avoid `heapless →

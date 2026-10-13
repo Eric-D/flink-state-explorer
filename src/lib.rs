@@ -9,4 +9,5 @@ pub mod profile;
 pub mod proto;
 #[cfg(feature = "sst")]
 pub mod sst;
+pub mod state_file;
 pub mod tui;

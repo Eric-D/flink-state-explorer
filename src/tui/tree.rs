@@ -14,6 +14,8 @@ const ENTRY_PAGE_SIZE: usize = 500;
 const PARTITION_PAGE_SIZE: usize = 30;
 /// Marker shown next to Kafka connector operators/states.
 const KAFKA_ICON: &str = "📨 ";
+/// Marker on an operator some of whose state files could not be read (details under `i`).
+const LOAD_ERROR_MARK: &str = "⚠ ";
 
 /// Whether an operator-state name is a Kafka connector state (source reader / sink writer+committer).
 fn is_kafka_state(name: &str) -> bool {
@@ -66,6 +68,8 @@ struct OperatorSnapshot {
     states: Vec<StateSnapshot>,
     /// Structured keyed state
     keyed: Option<KeyedSnapshot>,
+    /// State files of this operator that could not be read: its key set is partial.
+    load_errors: usize,
 }
 
 impl OperatorSnapshot {
@@ -197,6 +201,7 @@ impl TreeView {
                     operator_type: shorten_operator_type(&op.identifier_name),
                     states,
                     keyed,
+                    load_errors: op.load_errors.len(),
                 }
             })
             .collect();
@@ -223,7 +228,9 @@ impl TreeView {
 
         for (op_idx, op) in self.operators.iter().enumerate() {
             let child_count = op.child_count();
-            if self.hide_empty && child_count == 0 {
+            // An operator whose files could not be read may look empty only because of that:
+            // hiding it would hide the error too.
+            if self.hide_empty && child_count == 0 && op.load_errors == 0 {
                 continue;
             }
             let op_expanded = self
@@ -264,6 +271,14 @@ impl TreeView {
                 format!("⯈ {}{}{} ({})", icon, op.display_name, type_tag, key_label)
             } else {
                 format!("⯈ {}{}{}", icon, op.display_name, type_tag)
+            };
+            let label = if op.load_errors > 0 {
+                format!(
+                    "{}  {}{} state file(s) not read (i: details)",
+                    label, LOAD_ERROR_MARK, op.load_errors
+                )
+            } else {
+                label
             };
 
             let op_path = op.display_name.clone();
@@ -822,6 +837,9 @@ impl TreeView {
                         .add_modifier(Modifier::BOLD)
                 } else {
                     match node.level {
+                        NodeLevel::Operator if node.label.contains(LOAD_ERROR_MARK) => {
+                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+                        }
                         NodeLevel::Operator => Style::default()
                             .fg(Color::Yellow)
                             .add_modifier(Modifier::BOLD),
