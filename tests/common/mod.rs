@@ -2,5 +2,6 @@
 //! subset of these, hence the `dead_code` allowance.
 #![allow(dead_code)]
 
+pub mod keyed;
 pub mod synth;
 pub mod tui;

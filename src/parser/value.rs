@@ -86,7 +86,9 @@ pub fn decode_state_value(
     if bytes.is_empty() {
         return Value::Null;
     }
-    // MAP values are stored as the index blob, not raw Flink bytes — decode them specially.
+    // A `Map<..>` value type: the per-key blob below. The reader and both exports decode MAP state
+    // entries one at a time with `decode_map_entry` instead; nothing in this crate builds the blob
+    // any more (the in-memory index that did is gone), so this only serves direct callers.
     if value_type.starts_with("Map<") {
         return decode_map_blob(bytes, value_type, pojo_info, proto);
     }
@@ -607,9 +609,9 @@ pub fn split_map_types(value_type: &str) -> (String, String) {
 ///
 /// `namespace` is `VoidNamespace(1 byte) + serialized map key` and `value` is
 /// `NullableSerializer(isNull byte) + serialized value`, per the layout in
-/// `docs/parsing-format.md`. Shared by [`decode_map_blob`] (which walks the blob the index
-/// builder assembles per key) and by the streaming single-state export, which emits one row per
-/// entry — so both read map bytes through the same code.
+/// `docs/parsing-format.md`. Shared by [`decode_map_blob`] (which walks a per-key blob
+/// of entries) and by the reader and the streaming single-state export, which see one entry at a
+/// time — so every path reads map bytes through the same code.
 ///
 /// A map key that cannot be decoded is its marker followed by `#<fallback_key>`, which keeps the
 /// keys of one map apart.

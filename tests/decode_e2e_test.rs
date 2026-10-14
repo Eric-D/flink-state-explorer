@@ -1,34 +1,35 @@
 //! End-to-end decoder tests against the generated savepoint: protobuf-in-POJO, tuples, primitive
 //! arrays, and high-cardinality (scrollbar) coverage. All go through the production decode path
-//! (`parser::value` via `export::export_json`). That the TUI renders the same values is proved by
+//! (`parser::value` via the `StateReader` and `export::export_json`). That the TUI renders the same values is proved by
 //! `tests/tui_parity_test.rs` (synthetic, in CI) and `tests/tui_gitlab_parity_test.rs` (fixture).
+mod common;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
-use flink_explorer::index::builder::build_index;
-use flink_explorer::index::cache::IndexCache;
 use flink_explorer::parser;
 use flink_explorer::profile::storage::ProtoPattern;
 use flink_explorer::proto::{compiler::compile_protos, ProtoContext};
+use flink_explorer::reader::StateReader;
 use serde_json::Value;
 
 const SAVEPOINT_DIR: &str = "tests/fixtures/savepoint-gitlab";
 
-fn load_index() -> IndexCache {
+fn dir() -> &'static Path {
     let dir = Path::new(SAVEPOINT_DIR);
-    let metadata_path = dir.join("_metadata");
     assert!(
-        metadata_path.exists(),
+        dir.join("_metadata").exists(),
         "run `cd test-flink-job && mvn verify` first"
     );
-    let savepoint = parser::parse_metadata(&metadata_path).expect("parse metadata");
-    let meta = std::fs::metadata(&metadata_path).unwrap();
-    build_index(&savepoint, meta.len(), 0u64, dir)
+    dir
 }
 
-/// Export the whole index to JSON (optionally with a proto context) and return the parsed value.
-/// Uses a unique temp file so parallel tests don't clobber each other.
-fn export(index: &IndexCache, proto: Option<&ProtoContext>) -> Value {
+/// Export the whole savepoint to JSON through the reader (optionally decoding protobuf with a
+/// proto context) and return the parsed value. Uses a unique temp file so parallel tests don't
+/// clobber each other, and never writes into the fixture.
+fn export(proto: Option<&ProtoContext>) -> Value {
     use std::sync::atomic::{AtomicU32, Ordering};
     static N: AtomicU32 = AtomicU32::new(0);
     let tmp = std::env::temp_dir().join(format!(
@@ -36,7 +37,23 @@ fn export(index: &IndexCache, proto: Option<&ProtoContext>) -> Value {
         std::process::id(),
         N.fetch_add(1, Ordering::Relaxed)
     ));
-    flink_explorer::export::export_json(index, proto, &tmp).expect("export_json");
+    let mut reader = StateReader::open(dir()).unwrap();
+    if let Some(ctx) = proto {
+        reader = reader.with_proto(Arc::new(ProtoContext {
+            pool: ctx.pool.clone(),
+            bindings: ctx.bindings.clone(),
+            patterns: ctx.patterns.clone(),
+        }));
+    }
+    let summaries = flink_explorer::operators::summarize(reader.savepoint(), dir());
+    flink_explorer::export::export_json(
+        &reader,
+        &summaries,
+        &tmp,
+        &AtomicBool::new(false),
+        &mut |_| {},
+    )
+    .expect("export_json");
     let v = serde_json::from_str(&std::fs::read_to_string(&tmp).unwrap()).unwrap();
     std::fs::remove_file(&tmp).ok();
     v
@@ -58,7 +75,7 @@ fn first_state_value(json: &Value, state: &str) -> Option<Value> {
 
 #[test]
 fn tuples_decode() {
-    let json = export(&load_index(), None);
+    let json = export(None);
     let t2 = first_state_value(&json, "tuple2-state").expect("tuple2-state");
     let t3 = first_state_value(&json, "tuple3-state").expect("tuple3-state");
     // Tuple2<String, Long>
@@ -78,7 +95,7 @@ fn tuples_decode() {
 
 #[test]
 fn primitive_arrays_decode() {
-    let json = export(&load_index(), None);
+    let json = export(None);
     let int_arr = first_state_value(&json, "int-array").expect("int-array");
     // int[]{1, 2, 3, value.length()} → first three are 1,2,3
     let a = int_arr.as_array().expect("int-array is array");
@@ -95,7 +112,7 @@ fn primitive_arrays_decode() {
     // AggregatingState accumulator double[]{sum, count}
     let avg = first_state_value(&json, "running-average").expect("running-average");
     assert!(
-        avg.as_array().map_or(false, |a| a.len() == 2),
+        avg.as_array().is_some_and(|a| a.len() == 2),
         "double[] accumulator: {}",
         avg
     );
@@ -103,7 +120,7 @@ fn primitive_arrays_decode() {
 
 #[test]
 fn pojo_value_state_fully_decodes() {
-    let json = export(&load_index(), None);
+    let json = export(None);
     // SimpleEvent: id (String), createdAt (Date), eventType (Enum), active (bool), timestamp (long)
     let se = first_state_value(&json, "simple-event").expect("simple-event");
     assert!(se["id"].is_string(), "id decoded: {}", se);
@@ -122,7 +139,7 @@ fn pojo_value_state_fully_decodes() {
 
 #[test]
 fn lists_and_string_array_decode() {
-    let json = export(&load_index(), None);
+    let json = export(None);
     // Keyed ListState: delimiter-separated elements.
     let large = first_state_value(&json, "large-list").expect("large-list");
     let la = large.as_array().expect("large-list is array");
@@ -139,9 +156,9 @@ fn lists_and_string_array_decode() {
 
     let logs = first_state_value(&json, "log-entries").expect("log-entries");
     assert!(
-        logs.as_array().map_or(false, |a| a
+        logs.as_array().is_some_and(|a| a
             .iter()
-            .any(|v| v.as_str().map_or(false, |s| s.starts_with("Entry at")))),
+            .any(|v| v.as_str().is_some_and(|s| s.starts_with("Entry at")))),
         "log-entries should be strings: {}",
         logs
     );
@@ -164,7 +181,7 @@ fn lists_and_string_array_decode() {
 
 #[test]
 fn maps_decode_keys_and_values() {
-    let json = export(&load_index(), None);
+    let json = export(None);
     // Map<String,String>: real keys and values.
     let m = first_state_value(&json, "simple-string-map").expect("simple-string-map");
     let obj = m.as_object().expect("map is object");
@@ -175,7 +192,7 @@ fn maps_decode_keys_and_values() {
     );
     assert!(
         obj.values()
-            .any(|v| v.as_str().map_or(false, |s| !s.is_empty())),
+            .any(|v| v.as_str().is_some_and(|s| !s.is_empty())),
         "map values: {}",
         m
     );
@@ -209,9 +226,12 @@ fn maps_decode_keys_and_values() {
 
 #[test]
 fn operator_state_names_modes_values() {
-    let index = load_index();
+    let ops = flink_explorer::operators::summarize(
+        &parser::parse_metadata(&dir().join("_metadata")).unwrap(),
+        dir(),
+    );
     let mut modes = std::collections::HashMap::new();
-    for op in &index.operators {
+    for op in &ops {
         for s in &op.states {
             modes.insert(s.name.clone(), s.state_type.clone());
         }
@@ -229,8 +249,7 @@ fn operator_state_names_modes_values() {
         Some("operator/BROADCAST")
     );
     // Operator list-state elements decode to strings.
-    let op = index
-        .operators
+    let op = ops
         .iter()
         .find(|o| o.states.iter().any(|s| s.name == "operator-buffer"))
         .unwrap();
@@ -239,8 +258,8 @@ fn operator_state_names_modes_values() {
         .iter()
         .find(|s| s.name == "operator-buffer")
         .unwrap();
-    assert!(!s.entries.is_empty(), "operator-buffer has elements");
-    let first = String::from_utf8_lossy(&s.entries[0].key);
+    assert!(!s.elements.is_empty(), "operator-buffer has elements");
+    let first = &s.elements[0].label;
     assert!(
         first.starts_with('"'),
         "element decoded as string, got {}",
@@ -250,13 +269,13 @@ fn operator_state_names_modes_values() {
 
 #[test]
 fn operator_info_in_export() {
-    let json = export(&load_index(), None);
+    let json = export(None);
     let ops = json["operators"].as_array().unwrap();
     // Every operator carries an info block with a 32-hex OperatorID (uuid).
     assert!(
         ops.iter().all(|o| o["info"]["OperatorID (uuid)"]
             .as_str()
-            .map_or(false, |s| s.len() == 32)),
+            .is_some_and(|s| s.len() == 32)),
         "every operator has a 32-hex OperatorID"
     );
     // The export now includes operators with NO keyed state (sources/sinks/operator-state).
@@ -297,12 +316,12 @@ fn operator_info_in_export() {
 
 #[test]
 fn windows_and_timers_decode() {
-    let json = export(&load_index(), None);
+    let json = export(None);
 
     // Window contents: the buffered window elements (a non-empty list).
     let wc = first_state_value(&json, "window-contents").expect("window-contents");
     assert!(
-        wc.as_array().map_or(false, |a| !a.is_empty()),
+        wc.as_array().is_some_and(|a| !a.is_empty()),
         "window-contents non-empty: {}",
         wc
     );
@@ -332,21 +351,13 @@ fn windows_and_timers_decode() {
 
 #[test]
 fn high_cardinality_for_scrollbar() {
-    let index = load_index();
-    let proto_op = index
-        .operators
-        .iter()
-        .find(|o| {
-            o.keyed_state.as_ref().map_or(false, |k| {
-                k.descriptors.iter().any(|d| d.name == "proto-event")
-            })
-        })
-        .expect("proto-event operator");
-    let ks = proto_op.keyed_state.as_ref().unwrap();
+    let ops = common::keyed::operators(dir());
+    let (_, ks) =
+        common::keyed::find_with_state(&ops, "proto-event").expect("proto-event operator");
     assert!(
-        ks.total_keys >= 600,
+        ks.keys.len() >= 600,
         "expected >=600 keys for the scrollbar, got {}",
-        ks.total_keys
+        ks.keys.len()
     );
 }
 
@@ -373,7 +384,7 @@ fn protobuf_in_pojo_decodes_with_profile() {
         }],
     };
 
-    let json = export(&load_index(), Some(&ctx));
+    let json = export(Some(&ctx));
     let pe = first_state_value(&json, "proto-event").expect("proto-event");
     // className must round-trip; protoBytes must now be the DECODED message, not "[N bytes]".
     assert_eq!(
@@ -395,14 +406,14 @@ fn protobuf_in_pojo_decodes_with_profile() {
 
 #[test]
 fn ttl_and_broadcast_decode() {
-    let json = export(&load_index(), None);
+    let json = export(None);
 
     // TTL: value_type Ttl<Long> → { _ttlLastAccess: <iso>, value: <user value> }.
     let ttl = first_state_value(&json, "ttl-counter").expect("ttl-counter");
     assert!(
         ttl["_ttlLastAccess"]
             .as_str()
-            .map_or(false, |s| s.ends_with('Z')),
+            .is_some_and(|s| s.ends_with('Z')),
         "TTL lastAccess timestamp decoded: {}",
         ttl
     );
@@ -509,20 +520,19 @@ fn assert_all_fields_pojo(v: &Value, ctx: &str) {
 
 #[test]
 fn all_fields_pojo_decodes_past_its_char_fields_or_says_why_not() {
-    // Index path (the JSON export, and the TUI's data).
-    let index = load_index();
-    let json = export(&index, None);
+    // Reader path (the JSON export, and the TUI's data).
+    let json = export(None);
     let mut seen = 0;
     for op in json["operators"].as_array().unwrap() {
         for k in op["keys"].as_array().unwrap() {
             let key = k["key"].as_str().unwrap_or("?");
             if let Some(v) = k["states"].get("all-fields-pojo").filter(|v| !v.is_null()) {
-                assert_all_fields_pojo(v, &format!("index all-fields-pojo {}", key));
+                assert_all_fields_pojo(v, &format!("reader all-fields-pojo {}", key));
                 seen += 1;
             }
             if let Some(m) = k["states"].get("all-fields-map").filter(|v| !v.is_null()) {
                 for (mk, v) in m.as_object().expect("a map") {
-                    assert_all_fields_pojo(v, &format!("index all-fields-map {} {}", key, mk));
+                    assert_all_fields_pojo(v, &format!("reader all-fields-map {} {}", key, mk));
                     seen += 1;
                 }
             }
@@ -555,28 +565,22 @@ fn all_fields_pojo_decodes_past_its_char_fields_or_says_why_not() {
     }
 
     // The TUI's display string, through the same decoder: values and markers, no `null`.
-    let op = index
-        .operators
+    let ops = common::keyed::operators(dir);
+    let (_, ks) = common::keyed::find_with_state(&ops, "all-fields-pojo").unwrap();
+    let pi = StateReader::open(dir)
+        .unwrap()
+        .value_pojo(&ks.op_hex, "all-fields-pojo")
+        .unwrap()
+        .expect("POJO info");
+    let key = ks
+        .keys
         .iter()
-        .find(|o| {
-            o.keyed_state
-                .as_ref()
-                .is_some_and(|k| k.descriptors.iter().any(|d| d.name == "all-fields-pojo"))
-        })
-        .unwrap();
-    let ks = op.keyed_state.as_ref().unwrap();
-    let si = ks
-        .descriptors
-        .iter()
-        .position(|d| d.name == "all-fields-pojo")
-        .unwrap();
-    let pi = ks.descriptors[si]
-        .pojo_info
-        .as_ref()
-        .expect("POJO info")
-        .to_pojo_info();
-    let raw = ks.partitions[0].values[si].as_deref().expect("a value");
-    let shown = parser::pojo::deserialize_pojo_to_json(raw, &pi, None);
+        .find(|k| ks.raw(&k.key, "all-fields-pojo").is_some())
+        .expect("a key with a value")
+        .key
+        .clone();
+    let raw = ks.raw(&key, "all-fields-pojo").unwrap();
+    let shown = parser::pojo::deserialize_pojo_to_json(&raw, &pi, None);
     for part in [
         "charArray: [\"X\", \"Y\", \"Z\"]",
         "charBoxed: \"Z\"",
@@ -596,7 +600,7 @@ fn all_fields_pojo_decodes_past_its_char_fields_or_says_why_not() {
 
 #[test]
 fn value_class_in_export() {
-    let json = export(&load_index(), None);
+    let json = export(None);
     let mut classes = std::collections::HashMap::new();
     for op in json["operators"].as_array().unwrap() {
         for d in op["state_descriptors"].as_array().unwrap() {
