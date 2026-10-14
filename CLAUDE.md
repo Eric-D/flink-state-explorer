@@ -153,6 +153,37 @@ plausible half key set.
   output is written to `<path>.partial` and renamed on success, so a failed export never
   truncates a previous one. Operator-state files are handled by #27.
 
+## TUI: key cap, text, terminal
+
+- **Key cap.** The index (`src/index/builder.rs`) stores at most `MAX_STORED_PARTITIONS` (100 000)
+  keys per operator; `CachedKeyedState::total_keys` still counts every key (`stored_keys()`,
+  `is_truncated()`). The kept keys are shared between subtasks by `spread_quotas` (equal shares,
+  max-min fair: a subtask with fewer keys than its share keeps them all), re-applied after each
+  subtask, so the kept partitions never exceed ~2 × cap between subtasks (each subtask's full key
+  map is still built first — #24 removes that); each subtask gives its lexicographically smallest
+  keys, and the kept set is sorted once, so paging reads in key order. It used to fill the cap from subtask 0, so past the cap the other subtasks' keys
+  were unreachable. `build_index_with_cap` takes the cap as an argument (tests use a small one).
+  The structural fix (no cap at all) is #24.
+- **Paging** is bounded by the **stored** partitions (`KeyedSnapshot::visible_count`): bounding it
+  by the savepoint's key count indexed past the end and panicked. Every count shown makes the cap
+  explicit: operator row `100000 of 1000000 keys shown` (`N match in S of T keys shown` under a
+  filter, which only searches stored keys), the pager rows, a trailing `… N more keys not indexed`
+  row, `i` info (`Keys`), the `S` summary, and the `E` export (`truncated` at the root and per
+  operator, plus `stored_keys` / `total_keys`). `--export-state` streams every key regardless.
+  Pager rows are recognized by `FlatNode::is_pager`, not by an arrow anywhere in the label (a key
+  may contain `↓`).
+- **Text.** Shorten display text only through `src/tui/text.rs` (`width`, `truncate_to_width`,
+  `ellipsize`): it measures terminal columns and cuts on a `char` boundary. `&s[..n]` on display
+  text panicked as soon as `n` fell inside `é`, CJK or an emoji. Widths come from ratatui's own
+  `Span::width` (unicode-width), so no extra dependency.
+- **Terminal.** `tui::terminal::TerminalGuard` installs a panic hook **before** raw mode is
+  enabled (restore the terminal, then chain to the previous hook, so the message prints on the
+  normal screen), and its `Drop` restores raw mode, the alternate screen and the cursor on every
+  other way out. Ctrl-C (`app::is_interrupt`) quits from any mode: raw mode delivers it as a key
+  event, so `App::handle_key` takes the whole `KeyEvent`. While the index loads, `main.rs` checks
+  for it at each progress step (exit 130; the build is not cancellable), and keys typed meanwhile
+  are dropped instead of replayed.
+
 ## Decoder architecture — IMPORTANT
 
 **`src/parser/value.rs` is the single source of truth for binary value decoding.** It turns a
@@ -181,8 +212,10 @@ Enum (as name), nested POJO, `byte[]`/`String[]`, primitive arrays
 (`window-contents`) and **timers** (priority-queue states `_timer_state/...`, shown as the firing
 timestamp), **TTL-wrapped values** (`Ttl<T>` → `{ _ttlLastAccess, value }`, via `TtlSerializer`),
 and **broadcast maps** (best-effort String key/value). Keyed state is merged across **all** subtasks
-(full key set), and the key-group parser handles the shared keyed/priority-queue stateId space
-(terminating on `END_OF_KEY_GROUP_MARK`).
+(full key count; the index *stores* at most 100 000 keys per operator, see "TUI: key cap, text,
+terminal"),
+and the key-group parser handles the shared keyed/priority-queue stateId space (terminating on
+`END_OF_KEY_GROUP_MARK`).
 
 **Kafka connector** state is decoded (`src/parser/kafka.rs`, verified against
 https://github.com/apache/flink-connector-kafka): source **reader splits** (`SourceReaderState` →
@@ -271,7 +304,8 @@ source** (branch `release-1.20`, https://github.com/apache/flink) rather than gu
 - `cargo test` — needs `tests/fixtures/savepoint-gitlab/` (run `mvn verify` first). Note that
   `.github/workflows/ci.yml` runs an **explicit list** of fixture-free tests (add new ones to it;
   `tests/synth_savepoint_test.rs` and `tests/keyed_block_test.rs` are the fixture-free home for
-  file-backed / multi-subtask / compressed and block-level cases), so the fixture-dependent ones
+  file-backed / multi-subtask / compressed and block-level cases, `tests/tui_*_test.rs` for the
+  TUI over ratatui's `TestBackend`), so the fixture-dependent ones
   (`gitlab_savepoint_test`, `decode_e2e_test`, `coverage_audit`, `export_state_stream_test`,
   `key_group_assignment_test`, `compressed_savepoint_test`, `export_parquet_test`) only ever run
   locally.
@@ -299,6 +333,19 @@ source** (branch `release-1.20`, https://github.com/apache/flink) rather than gu
   no cache is written after a partial build or with `--no-cache`, which does not read it either.
 - `tests/cache_test.rs` — round trip, staleness decided from the header without decoding the body,
   header-less (older) caches rejected, `may_save_cache`.
+- `tests/tui_cap_test.rs` (fixture-free, CI) — the key cap: a `TestBackend` pages a hand-built
+  capped `IndexCache` to the end and back without panicking, with both counts on the operator,
+  pager, filter and trailing rows; on synthetic multi-subtask savepoints the kept keys come from
+  every subtask in equal shares (each subtask's smallest), a small subtask keeps all its keys, and
+  the `E` export carries `truncated` / `stored_keys` / `total_keys`. Also: a key containing `↓` is
+  not taken for the pager.
+- `tests/tui_text_test.rs` (fixture-free, CI) — `TestBackend` renders of long non-ASCII values (é,
+  CJK, Greek, `☕`) at 80 and 120 columns, with and without debug labels, and of the loading screen
+  with a non-ASCII operator name; Ctrl-C quits from the tree, the filter input and the overlays.
+  The width/truncation unit tests (every width, 4-byte emoji included) live in `src/tui/text.rs`.
+- `tests/terminal_guard_test.rs` (fixture-free, CI) — the panic hook restores the terminal before
+  the previous hook prints, including for a panic inside `enter` (i.e. right after raw mode), and
+  restores exactly once. One test only: panic hooks are process-global.
 
 ## Dependencies — IMPORTANT
 

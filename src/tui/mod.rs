@@ -4,4 +4,6 @@ pub mod filter;
 pub mod hex_view;
 pub mod loading;
 pub mod profile_picker;
+pub mod terminal;
+pub mod text;
 pub mod tree;

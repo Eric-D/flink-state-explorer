@@ -7,6 +7,7 @@ use crate::index::cache::{CachedPojoInfo, IndexCache, StateDescriptor};
 use crate::parser::pojo::{PojoField, PojoInfo};
 use crate::proto::ProtoContext;
 use crate::tui::filter::AppliedFilter;
+use crate::tui::text;
 
 /// Maximum number of entry keys to hold in memory at once (virtual scroll window).
 const ENTRY_PAGE_SIZE: usize = 500;
@@ -48,6 +49,16 @@ struct FlatNode {
     has_children: bool,
 }
 
+impl FlatNode {
+    /// Whether this is the `↑`/`↓` pager row of a keyed operator. Matched on what the row *is*,
+    /// not on the arrow appearing anywhere: a key or an operator name may contain `↓` itself.
+    fn is_pager(&self, arrow: char) -> bool {
+        self.level == NodeLevel::State
+            && self.state_idx.is_none()
+            && self.label.trim_start().starts_with(arrow)
+    }
+}
+
 pub struct TreeView {
     nodes: Vec<FlatNode>,
     list_state: ListState,
@@ -78,7 +89,12 @@ impl OperatorSnapshot {
     /// reader splits, writer/committer states) have no keyed partitions, so they must be counted
     /// here too — otherwise `hide_empty` would hide them and their decoded state entirely.
     fn child_count(&self) -> usize {
-        self.keyed.as_ref().map_or(0, |k| k.visible_count()) + self.states.len()
+        self.keyed.as_ref().map_or(0, |k| {
+            // A capped operator stays listed under a filter that matched none of its stored keys:
+            // the key may be among the ones not indexed, and the row saying so must be reachable.
+            let unsearched = (k.filtered_indices.is_some() && k.hidden_keys() > 0) as usize;
+            k.visible_count() + unsearched
+        }) + self.states.len()
     }
 
     /// A Kafka connector operator (source or sink), detected from its operator-state names.
@@ -88,11 +104,50 @@ impl OperatorSnapshot {
 }
 
 impl KeyedSnapshot {
-    /// Number of partitions visible (filtered or total).
+    /// Number of partitions that can be browsed: the filter's matches, or every **stored**
+    /// partition. Never the savepoint's key count: past the index cap, the keys beyond
+    /// `partitions` are not in memory, and paging up to that count indexed past the end.
     fn visible_count(&self) -> usize {
         match &self.filtered_indices {
             Some(indices) => indices.len(),
-            None => self.total_partitions,
+            None => self.partitions.len(),
+        }
+    }
+
+    /// Keys of the savepoint that the index did not keep (0 below the cap).
+    fn hidden_keys(&self) -> usize {
+        self.total_partitions.saturating_sub(self.partitions.len())
+    }
+
+    /// The key count on the operator row. Past the cap it gives both numbers, and with a filter
+    /// it says the filter searched only the stored keys.
+    fn count_label(&self) -> String {
+        let visible = self.visible_count();
+        let (stored, total) = (self.partitions.len(), self.total_partitions);
+        match (&self.filtered_indices, self.hidden_keys() > 0) {
+            (Some(_), true) => format!("{} match in {} of {} keys shown", visible, stored, total),
+            (None, true) => format!("{} of {} keys shown", stored, total),
+            _ if visible != total => format!("{}/{} keys", visible, total),
+            _ => format!("{} keys", total),
+        }
+    }
+
+    /// Appended to the pager rows past the cap, so that `n / stored` is not read as the whole.
+    fn pager_note(&self) -> String {
+        if self.hidden_keys() == 0 {
+            String::new()
+        } else if self.filtered_indices.is_some() {
+            format!(
+                " (filter searched {} of {} keys)",
+                self.partitions.len(),
+                self.total_partitions
+            )
+        } else {
+            format!(
+                " ({} of {} keys shown)",
+                self.partitions.len(),
+                self.total_partitions
+            )
         }
     }
 }
@@ -100,7 +155,9 @@ impl KeyedSnapshot {
 /// Keyed state snapshot for display.
 struct KeyedSnapshot {
     descriptors: Vec<StateDescriptor>,
+    /// The keys the index stored: at most `index::builder::MAX_STORED_PARTITIONS`.
     partitions: Vec<PartitionSnapshot>,
+    /// The savepoint's key count, which may exceed `partitions.len()`.
     total_partitions: usize,
     partition_offset: usize,
     /// Key serializer type (e.g. "String", "Pojo")
@@ -240,7 +297,6 @@ impl TreeView {
                 .map(|n| n.expanded)
                 .unwrap_or(false);
 
-            let visible_keys = op.keyed.as_ref().map_or(0, |k| k.visible_count());
             let total_keys = op.keyed.as_ref().map_or(0, |k| k.total_partitions);
             let desc_count = op.keyed.as_ref().map_or(0, |k| k.descriptors.len());
             let key_type_tag = if self.debug_mode {
@@ -251,11 +307,14 @@ impl TreeView {
             } else {
                 String::new()
             };
-            let key_label = if visible_keys != total_keys {
-                format!("{}/{} keys{}", visible_keys, total_keys, key_type_tag)
-            } else {
-                format!("{} keys{}", total_keys, key_type_tag)
-            };
+            let key_label = format!(
+                "{}{}",
+                op.keyed
+                    .as_ref()
+                    .map(|k| k.count_label())
+                    .unwrap_or_default(),
+                key_type_tag
+            );
             let type_tag = if self.debug_mode && !op.operator_type.is_empty() {
                 format!(" [{}]", op.operator_type)
             } else {
@@ -301,6 +360,7 @@ impl TreeView {
             if let Some(keyed) = &op.keyed {
                 let base = op.states.len();
                 let visible_count = keyed.visible_count();
+                let pager_note = keyed.pager_note();
 
                 // Build the list of partition indices to show on this page
                 let page_start = keyed.partition_offset.min(visible_count);
@@ -310,7 +370,13 @@ impl TreeView {
                 if page_start > 0 {
                     nodes.push(FlatNode {
                         level: NodeLevel::State,
-                        label: format!("  ↑ {}-{} / {}", page_start + 1, page_end, visible_count),
+                        label: format!(
+                            "  ↑ {}-{} / {}{}",
+                            page_start + 1,
+                            page_end,
+                            visible_count,
+                            pager_note
+                        ),
                         path: op_path.clone(),
                         op_idx,
                         state_idx: None,
@@ -325,7 +391,10 @@ impl TreeView {
                         Some(indices) => indices[vi],
                         None => vi,
                     };
-                    let part = &keyed.partitions[pi];
+                    // `visible_count` is bounded by the stored partitions, so this always holds.
+                    let Some(part) = keyed.partitions.get(pi) else {
+                        continue;
+                    };
                     let state_idx = base + pi;
                     let expanded =
                         self.is_expanded(NodeLevel::State, op_idx, Some(state_idx), None);
@@ -383,8 +452,10 @@ impl TreeView {
                                 .entry_descs
                                 .get(ei)
                                 .map_or(false, |(_, _)| lbl.contains('{'));
-                            let is_expandable =
-                                is_map || is_list || (has_pojo && lbl.len() > max_inline);
+                            // Columns, not bytes: a byte count overstates non-ASCII text, and
+                            // cutting at one panicked inside a multi-byte character.
+                            let too_wide = text::width(lbl) > max_inline;
+                            let is_expandable = is_map || is_list || (has_pojo && too_wide);
                             let entry_expanded = is_expandable
                                 && self.is_expanded(
                                     NodeLevel::Entry,
@@ -394,8 +465,8 @@ impl TreeView {
                                 );
 
                             // Truncate long labels
-                            let display_lbl = if !entry_expanded && lbl.len() > max_inline {
-                                format!("{}...}}", &lbl[..max_inline.saturating_sub(4)])
+                            let display_lbl = if !entry_expanded && too_wide {
+                                text::ellipsize(lbl, max_inline, "...}").into_owned()
                             } else {
                                 lbl.clone()
                             };
@@ -495,7 +566,29 @@ impl TreeView {
                 if remaining > 0 {
                     nodes.push(FlatNode {
                         level: NodeLevel::State,
-                        label: format!("  ↓ {}-{} / {}", page_start + 1, page_end, visible_count),
+                        label: format!(
+                            "  ↓ {}-{} / {}{}",
+                            page_start + 1,
+                            page_end,
+                            visible_count,
+                            pager_note
+                        ),
+                        path: op_path.clone(),
+                        op_idx,
+                        state_idx: None,
+                        entry_idx: None,
+                        expanded: false,
+                        has_children: false,
+                    });
+                } else if keyed.hidden_keys() > 0 {
+                    // The end of the stored keys is not the end of the operator's keys.
+                    nodes.push(FlatNode {
+                        level: NodeLevel::State,
+                        label: format!(
+                            "  … {} more keys not indexed (not shown, not searched by /); \
+                             --export-state reads them all",
+                            keyed.hidden_keys()
+                        ),
                         path: op_path.clone(),
                         op_idx,
                         state_idx: None,
@@ -697,7 +790,7 @@ impl TreeView {
                 return;
             }
             let prev = &self.nodes[selected - 1];
-            if prev.label.contains('↑') {
+            if prev.is_pager('↑') {
                 // Scroll backward — cursor stays on same visual position
                 self.scroll_partitions(prev.op_idx, false);
             } else {
@@ -712,7 +805,7 @@ impl TreeView {
                 return;
             }
             let next = &self.nodes[selected + 1];
-            if next.label.contains('↓') {
+            if next.is_pager('↓') {
                 // Scroll forward — cursor stays on same visual position
                 let op_idx = next.op_idx;
                 self.scroll_partitions(op_idx, true);
@@ -1579,8 +1672,7 @@ fn format_raw_value(raw: &[u8], val_type: &str, auto_date: bool) -> String {
             use crate::parser::java_deser::JavaReader;
             let mut r = JavaReader::new(raw);
             match r.read_string_value() {
-                Ok(s) if !s.is_empty() && s.len() > 80 => format!("{}...", &s[..77]),
-                Ok(s) if !s.is_empty() => s,
+                Ok(s) if !s.is_empty() => text::ellipsize(&s, 80, "...").into_owned(),
                 _ => {
                     // Type may be wrong (misassociated). Try best-effort by size.
                     best_effort_format(raw, auto_date)

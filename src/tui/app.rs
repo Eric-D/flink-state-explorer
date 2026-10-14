@@ -2,7 +2,7 @@ use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use ratatui::Terminal;
@@ -136,7 +136,7 @@ impl App {
             if event::poll(Duration::from_millis(100)).map_err(UiError::Event)? {
                 if let Event::Key(key) = event::read().map_err(UiError::Event)? {
                     if key.kind == KeyEventKind::Press {
-                        self.handle_key(key.code);
+                        self.handle_key(key);
                     }
                 }
             }
@@ -147,7 +147,20 @@ impl App {
         }
     }
 
-    fn handle_key(&mut self, code: KeyCode) {
+    /// Whether the last key handled asked to quit (`q`, or Ctrl-C from anywhere).
+    pub fn should_quit(&self) -> bool {
+        self.should_quit
+    }
+
+    /// Handle one key press. The whole event is needed, not just its code: Ctrl-C arrives here as
+    /// `c` + CONTROL (raw mode turns it into a key event instead of SIGINT) and must quit from
+    /// any overlay or input, where a plain `c` would be typed or ignored.
+    pub fn handle_key(&mut self, key: KeyEvent) {
+        if is_interrupt(&key) {
+            self.should_quit = true;
+            return;
+        }
+        let code = key.code;
         // Profile picker takes priority
         if self.profile_picker.visible {
             if let Some(action) = self.profile_picker.handle_key(code) {
@@ -269,7 +282,23 @@ impl App {
         let proto_ctx = self.tree_view.proto_context();
         match crate::export::export_json(&self.index, proto_ctx, &output) {
             Ok(count) => {
-                self.set_status(format!("Exported {} keys to {}", count, output.display()));
+                let total: usize = self
+                    .index
+                    .operators
+                    .iter()
+                    .filter_map(|op| op.keyed_state.as_ref())
+                    .map(|ks| ks.total_keys)
+                    .sum();
+                self.set_status(if count < total {
+                    format!(
+                        "Exported {} of {} keys to {} (truncated: index cap; --export-state reads them all)",
+                        count,
+                        total,
+                        output.display()
+                    )
+                } else {
+                    format!("Exported {} keys to {}", count, output.display())
+                });
             }
             Err(e) => {
                 self.set_status(format!("Export failed: {}", e));
@@ -522,6 +551,27 @@ impl App {
         let list = List::new(items);
         frame.render_widget(list, inner);
     }
+}
+
+/// Ctrl-C, as a key event: in raw mode the terminal sends it to us instead of raising SIGINT.
+/// Consume every event in `events` and say whether one was a Ctrl-C press. The others are
+/// dropped on purpose: keys typed while the index loads would otherwise be replayed on a tree the
+/// user has not seen yet. `main` feeds it the events queued at each loading step.
+pub fn drain_is_interrupt(events: impl IntoIterator<Item = crossterm::event::Event>) -> bool {
+    let mut interrupted = false;
+    for event in events {
+        if let crossterm::event::Event::Key(key) = event {
+            if key.kind == crossterm::event::KeyEventKind::Press && is_interrupt(&key) {
+                interrupted = true;
+            }
+        }
+    }
+    interrupted
+}
+
+pub fn is_interrupt(key: &KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
 }
 
 fn centered_popup(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
@@ -841,6 +891,19 @@ fn build_summary_entries(index: &IndexCache) -> Vec<String> {
 
     lines.push("--- Keyed State ---".to_string());
     lines.push(format!("  Total keys:         {}", total_keys));
+    let stored_keys: usize = index
+        .operators
+        .iter()
+        .filter_map(|o| o.keyed_state.as_ref())
+        .map(|k| k.stored_keys())
+        .sum();
+    if stored_keys < total_keys {
+        lines.push(format!(
+            "  Keys shown:         {} (the index keeps at most {} per operator)",
+            stored_keys,
+            crate::index::builder::MAX_STORED_PARTITIONS
+        ));
+    }
     lines.push(format!(
         "  Registered states:  {} (VALUE:{} MAP:{} LIST:{} other:{})",
         total_states, value_count, map_count, list_count, other_count
