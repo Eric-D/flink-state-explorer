@@ -94,6 +94,7 @@ fn index_of(keyed: CachedKeyedState) -> IndexCache {
             coordinator_info: None,
             states: Vec::new(),
             keyed_state: Some(keyed),
+            load_errors: Vec::new(),
         }],
         cache_format: flink_explorer::index::cache::CACHE_FORMAT,
     }
