@@ -217,6 +217,11 @@ pub struct KeyedOperator {
     pub key: Ser,
     pub states: Vec<StateDef>,
     pub items: Vec<Item>,
+    /// Per subtask, the names of the states its header registers (in that order), when they
+    /// differ from `states`: Flink registers a state lazily, on first access, so subtasks of one
+    /// operator can hold different sets in a different order. Items of a state a subtask does not
+    /// register are left out of that subtask.
+    pub subtask_states: Option<Vec<Vec<String>>>,
 }
 
 impl KeyedOperator {
@@ -228,6 +233,7 @@ impl KeyedOperator {
             key,
             states: Vec::new(),
             items: Vec::new(),
+            subtask_states: None,
         }
     }
 
@@ -248,6 +254,9 @@ pub enum Storage {
     Inline,
     /// In its own file next to `_metadata` (`RelativeFileStateHandle`), like production.
     Files,
+    /// In its own file, referenced by an absolute `FileStateHandle` (tag 2) whose path is written
+    /// as Flink's `Path.toString()` does for a local file: `file:/abs/path`.
+    AbsoluteFiles,
 }
 
 /// The order of the state runs inside a key-group block.
@@ -350,7 +359,8 @@ pub fn write_savepoint(spec: &Spec, dir: &Path) -> Written {
             meta.extend_from_slice(&0i32.to_be_bytes()); // no managed operator state
             meta.extend_from_slice(&0i32.to_be_bytes()); // no raw operator state
             let (start, end) = range_for_subtask(op.max_parallelism, op.parallelism, subtask);
-            let (stream, offsets) = keyed_stream(op, start, end, spec.compressed, spec.run_order);
+            let (stream, offsets) =
+                keyed_stream(op, subtask, start, end, spec.compressed, spec.run_order);
             meta.push(7); // KeyGroupsSavepointStateHandle
             meta.extend_from_slice(&start.to_be_bytes());
             meta.extend_from_slice(&(end - start + 1).to_be_bytes());
@@ -364,7 +374,7 @@ pub fn write_savepoint(spec: &Spec, dir: &Path) -> Written {
                     meta.extend_from_slice(&(stream.len() as i32).to_be_bytes());
                     meta.extend_from_slice(&stream);
                 }
-                Storage::Files => {
+                Storage::Files | Storage::AbsoluteFiles => {
                     let name = format!(
                         "{:08x}-state-{}-{}",
                         0x5eed_0000u32 + oi as u32,
@@ -373,10 +383,18 @@ pub fn write_savepoint(spec: &Spec, dir: &Path) -> Written {
                     );
                     let path = dir.join(&name);
                     std::fs::write(&path, &stream).unwrap();
-                    written.state_files.push((oi, subtask, path));
-                    meta.push(6); // RelativeFileStateHandle
-                    write_utf(&mut meta, &name);
-                    meta.extend_from_slice(&(stream.len() as i64).to_be_bytes());
+                    written.state_files.push((oi, subtask, path.clone()));
+                    if spec.storage == Storage::Files {
+                        meta.push(6); // RelativeFileStateHandle: path, then stateSize
+                        write_utf(&mut meta, &name);
+                        meta.extend_from_slice(&(stream.len() as i64).to_be_bytes());
+                    } else {
+                        // FileStateHandle (MetadataV2V3SerializerBase.java:747-750): stateSize,
+                        // then the path.
+                        meta.push(2);
+                        meta.extend_from_slice(&(stream.len() as i64).to_be_bytes());
+                        write_utf(&mut meta, &format!("file:{}", path.display()));
+                    }
                 }
             }
             meta.push(0); // no raw keyed state
@@ -395,12 +413,36 @@ pub fn write_savepoint(spec: &Spec, dir: &Path) -> Written {
 /// `FullSnapshotAsyncWriter`).
 pub fn keyed_stream(
     op: &KeyedOperator,
+    subtask: i32,
     start: i32,
     end: i32,
     compressed: bool,
     order: RunOrder,
 ) -> (Vec<u8>, Vec<i64>) {
-    let mut stream = header_bytes(op.key, &op.states, compressed);
+    // This subtask's states, and each operator-level state index -> this subtask's stateId.
+    let (states, ids): (Vec<StateDef>, Vec<Option<usize>>) = match &op.subtask_states {
+        None => (op.states.clone(), (0..op.states.len()).map(Some).collect()),
+        Some(per) => {
+            let names = &per[subtask as usize];
+            let states = names
+                .iter()
+                .map(|n| {
+                    op.states
+                        .iter()
+                        .find(|s| &s.name == n)
+                        .unwrap_or_else(|| panic!("unknown state {}", n))
+                        .clone()
+                })
+                .collect();
+            let ids = op
+                .states
+                .iter()
+                .map(|s| names.iter().position(|n| n == &s.name))
+                .collect();
+            (states, ids)
+        }
+    };
+    let mut stream = header_bytes(op.key, &states, compressed);
 
     // key-group -> stateId -> [(key bytes, value bytes)], in insertion order per run.
     let mut groups: BTreeMap<i32, BTreeMap<usize, Vec<Entry>>> = BTreeMap::new();
@@ -409,11 +451,14 @@ pub fn keyed_stream(
         if kg < start || kg > end {
             continue;
         }
+        let Some(state_id) = ids[item.state()] else {
+            continue;
+        };
         let (k, v) = entry_bytes(op, kg, item);
         groups
             .entry(kg)
             .or_default()
-            .entry(item.state())
+            .entry(state_id)
             .or_default()
             .push((k, v));
     }

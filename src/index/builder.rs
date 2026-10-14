@@ -78,21 +78,26 @@ where
 {
     let mut states = Vec::new();
     let mut keyed_state: Option<CachedKeyedState> = None;
+    let mut load_errors = Vec::new();
 
     // A keyed operator's state is split across subtasks by key group; merge them all so the
     // explorer shows every key, not just the first subtask's.
     for sub in &op.subtask_states {
         collect_operator_states(sub, &mut states);
-        if let Some(ks) = build_keyed_state(
+        match build_keyed_state(
             &sub.managed_keyed_state,
             savepoint_dir,
             op.max_parallelism,
             &mut on_keys,
         ) {
-            match keyed_state {
+            Ok(Some(ks)) => match keyed_state {
                 None => keyed_state = Some(ks),
                 Some(ref mut acc) => merge_keyed_state(acc, ks),
-            }
+            },
+            Ok(None) => {}
+            // Recorded rather than skipped: the other subtasks still load, and the TUI says the
+            // key set is partial instead of passing it off as complete.
+            Err(e) => load_errors.push(e),
         }
     }
 
@@ -119,6 +124,7 @@ where
             .and_then(|cs| crate::parser::kafka::decode_enumerator_state(cs)),
         states,
         keyed_state,
+        load_errors,
     }
 }
 
@@ -293,20 +299,21 @@ fn decode_operator_element(bytes: &[u8]) -> String {
 }
 
 /// Build structured keyed state from a keyed state handle.
-/// Returns None if the handle has no parseable keyed state data.
+/// Returns `Ok(None)` if the handle has no parseable keyed state data, and `Err` — naming the
+/// file — if its state file is missing, unreadable or shorter than the handle records.
 fn build_keyed_state<F>(
     handle: &StateHandle,
     savepoint_dir: &Path,
     max_parallelism: i32,
     on_keys: &mut F,
-) -> Option<CachedKeyedState>
+) -> Result<Option<CachedKeyedState>, String>
 where
     F: FnMut(usize),
 {
     let kg = match handle {
         StateHandle::KeyGroups(kg) => kg,
-        StateHandle::Null => return None,
-        _ => return None,
+        StateHandle::Null => return Ok(None),
+        _ => return Ok(None),
     };
 
     // Unwrap delegate: may be direct ByteStream/Relative, or nested KeyGroups
@@ -317,19 +324,38 @@ where
     let data: Vec<u8> = match effective_delegate {
         StreamStateHandle::ByteStream(bs) => bs.data.clone(),
         StreamStateHandle::Relative(rel) => {
-            let file_path = savepoint_dir.join(&rel.relative_path);
-            std::fs::read(&file_path).unwrap_or_default()
+            crate::state_file::read(&savepoint_dir.join(&rel.relative_path), rel.state_size)?
         }
-        _ => return None,
+        StreamStateHandle::File(f) => {
+            crate::state_file::read(&crate::state_file::local_path(&f.file_path)?, f.state_size)?
+        }
+        // File-merging segments are only read by the streaming export; say so rather than show
+        // the operator as if it had no keys.
+        StreamStateHandle::Segment(seg) => {
+            return Err(format!(
+                "{}: segment state handle (file merging) is not read by the index; use \
+                 --export-state",
+                seg.file_path
+            ))
+        }
+        _ => return Ok(None),
     };
 
     if data.is_empty() {
-        return None;
+        return Ok(None);
     }
+    let what = match effective_delegate {
+        StreamStateHandle::Relative(rel) => {
+            savepoint_dir.join(&rel.relative_path).display().to_string()
+        }
+        StreamStateHandle::File(f) => f.file_path.clone(),
+        _ => "inline keyed state".to_string(),
+    };
+    crate::state_file::check_offsets(&what, &kg.offsets, kg.start_key_group, data.len() as u64)?;
 
     let state_metas = extract_state_metadata(&data);
     if state_metas.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let pojo_infos = extract_pojo_infos(&data);
@@ -491,12 +517,12 @@ where
         })
         .collect();
 
-    Some(CachedKeyedState {
+    Ok(Some(CachedKeyedState {
         descriptors,
         partitions,
         total_keys,
         key_type: key_type.to_string(),
-    })
+    }))
 }
 
 /// Derive header size from the key-group offsets array.
@@ -525,10 +551,11 @@ fn keyed_state_handle_size(handle: &StateHandle) -> u64 {
     match handle {
         StateHandle::KeyGroups(kg) => match &kg.delegate_handle {
             StreamStateHandle::ByteStream(bs) => bs.data.len() as u64,
-            StreamStateHandle::Relative(rel) => rel.state_size as u64,
-            StreamStateHandle::File(f) => f.state_size as u64,
+            // Flink records -1 when it could not tell the size: count it as unknown (0).
+            StreamStateHandle::Relative(rel) => rel.state_size.max(0) as u64,
+            StreamStateHandle::File(f) => f.state_size.max(0) as u64,
             StreamStateHandle::KeyGroups(nested) => match &nested.delegate_handle {
-                StreamStateHandle::Relative(rel) => rel.state_size as u64,
+                StreamStateHandle::Relative(rel) => rel.state_size.max(0) as u64,
                 StreamStateHandle::ByteStream(bs) => bs.data.len() as u64,
                 _ => 0,
             },

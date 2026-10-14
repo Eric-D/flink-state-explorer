@@ -146,7 +146,7 @@ fn index_path_decodes_compressed_key_groups() {
 #[test]
 fn streaming_export_matches_the_index_path_on_compressed_bytes() {
     let sp = savepoint(COMPRESSED);
-    let states = list_states(&sp, Path::new(COMPRESSED));
+    let states = list_states(&sp, Path::new(COMPRESSED)).states;
     assert!(!states.is_empty());
     let index = index_keys(COMPRESSED);
 

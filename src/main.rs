@@ -136,14 +136,26 @@ fn parse_savepoint(cli: &Cli) -> Result<flink_explorer::parser::Savepoint, Strin
 
 fn list_states(cli: &Cli) -> Result<(), String> {
     let savepoint = parse_savepoint(cli)?;
-    let states = flink_explorer::export_state::list_states(&savepoint, &cli.savepoint_dir);
-    if states.is_empty() {
-        eprintln!("No keyed state found in {}", cli.savepoint_dir.display());
-        return Ok(());
+    let listing = flink_explorer::export_state::list_states(&savepoint, &cli.savepoint_dir);
+    if !listing.states.is_empty() {
+        println!("{:<34} {:<10} STATE", "OPERATOR", "TYPE");
+        for (op, name, state_type) in &listing.states {
+            println!("{:<34} {:<10} {}", op, state_type, name);
+        }
     }
-    println!("{:<34} {:<10} STATE", "OPERATOR", "TYPE");
-    for (op, name, state_type) in states {
-        println!("{:<34} {:<10} {}", op, state_type, name);
+    // What could be read is listed; what could not makes the run fail, so that a script never
+    // takes a partial list (or none at all) for the savepoint's content.
+    if !listing.errors.is_empty() {
+        for e in &listing.errors {
+            eprintln!("Error: {}", e);
+        }
+        return Err(format!(
+            "{} state file(s) could not be read, so this list may be incomplete",
+            listing.errors.len()
+        ));
+    }
+    if listing.states.is_empty() {
+        eprintln!("No keyed state found in {}", cli.savepoint_dir.display());
     }
     Ok(())
 }
@@ -189,22 +201,29 @@ fn export_state(cli: &Cli) -> Result<(), String> {
                 &mut w,
             )?
         }
-        "ndjson" => {
-            let file = std::fs::File::create(&path)
-                .map_err(|e| format!("create {}: {}", path.display(), e))?;
+        // Written to a side file and renamed on success, so a failed export (e.g. a state file
+        // went missing) never truncates a previous good export at `path`.
+        "ndjson" => write_then_rename(&path, |tmp| {
+            let file = std::fs::File::create(tmp)
+                .map_err(|e| format!("create {}: {}", tmp.display(), e))?;
             let mut w = io::BufWriter::new(file);
-            flink_explorer::export_state::export_state_ndjson(
+            let stats = flink_explorer::export_state::export_state_ndjson(
                 &savepoint,
                 &cli.savepoint_dir,
                 cli.operator.as_deref(),
                 state,
                 proto.as_ref(),
                 &mut w,
-            )?
-        }
-        "parquet" => {
+            )?;
+            io::Write::flush(&mut w).map_err(|e| format!("write {}: {}", tmp.display(), e))?;
+            Ok(stats)
+        })?,
+        "parquet" if to_stdout => {
             export_state_parquet(cli, &savepoint, state, proto.as_ref(), &path, to_stdout)?
         }
+        "parquet" => write_then_rename(&path, |tmp| {
+            export_state_parquet(cli, &savepoint, state, proto.as_ref(), tmp, false)
+        })?,
         _ => unreachable!("format validated above"),
     };
 
@@ -225,6 +244,27 @@ fn export_state(cli: &Cli) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// Run `write` against `<path>.partial`, then move it over `path` only if it succeeded.
+fn write_then_rename<T>(
+    path: &Path,
+    write: impl FnOnce(&Path) -> Result<T, String>,
+) -> Result<T, String> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".partial");
+    let tmp = PathBuf::from(tmp);
+    match write(&tmp) {
+        Ok(v) => {
+            std::fs::rename(&tmp, path)
+                .map_err(|e| format!("rename {} to {}: {}", tmp.display(), path.display(), e))?;
+            Ok(v)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
 }
 
 #[cfg(feature = "parquet")]
