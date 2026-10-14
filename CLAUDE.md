@@ -209,7 +209,16 @@ reads whole key-group blocks located by `KeyGroupsStateHandle.offsets`, nothing 
 - `scan(op, &cursor, byte_budget, &mut |key| bool) -> ScanPage { matches, next, .., unreadable }`:
   whole blocks until their stored size reaches the budget (at least one block per call), at most
   `DEFAULT_SCAN_MATCH_LIMIT` (1000, `with_scan_match_limit`) matches per call (it stops mid-block,
-  `next` at the following key).
+  `next` at the following key). `scan_with(op, &cursor, &ScanOptions { byte_budget, max_matches,
+  last_key_group }, pred)` gives those limits per call and stops after `last_key_group` (a range
+  search; `cursor_at(op, kg)` is the cursor a range starts at, named by the subtask holding `kg`);
+- `count(op, &cursor, byte_budget) -> CountPage { states: [StateCount { state, keys, entries }],
+  keys, next, .. }`: whole blocks from the cursor's key-group (its ordinal is ignored), counting
+  per state the keys holding it and its entries (= `--export-state` rows: one per value, per MAP
+  entry, per timer), merged by state **name** (ids are per subtask); no value decoded, not cached;
+- `progress(op, at, first, last) -> Progress { key_groups_done/total, bytes_done/total }` from the
+  offsets alone (no I/O): everything before `at`'s key-group is done; `proto()` exposes the proto
+  context so a client (the web download) decodes the same way.
 
 **Errors** are `reader::ReaderError` (`Display`, `std::error::Error`, `From<ReaderError> for
 String` so `?` into `String` still works): `Metadata`, `UnknownOperator`/`NoKeyedState`/`NotFound`
@@ -301,8 +310,8 @@ key-group per request. Feature `web` is **on by default** (users take the releas
   `getrandom::fill`, compared in constant time. HEAD: body dropped, `Content-Length` kept.
 - **Escaping is a type invariant** (`html.rs`): `Html` grows only by `text()`/`display()`
   (escaped) or `raw(&'static str)` (templates). Never add a constructor taking a runtime `String`
-  unescaped. No data in `<script>`: `assets/app.js` is static (focus `/` → lookup, expand/collapse
-  all) and every page works without it. Paths from `_metadata` are never served: the only files are
+  unescaped. No data in `<script>`: `assets/app.js` is static (focus `/` → lookup, expand/collapse all, search continuation, count polling — data only through `textContent`, URLs only
+  if they are this server's paths) and every page works without it. Paths from `_metadata` are never served: the only files are
   the two `include_str!` assets.
 - **Values**: rendered from the reader's `serde_json::Value` (`<details>` tree, leaves through
   `value_to_display`), raw namespace/value bytes as a hex dump (first 4 KiB). Nothing in `web`
@@ -319,7 +328,7 @@ key-group per request. Feature `web` is **on by default** (users take the releas
   file, not 404. `ReaderError` maps to the status (`From<ReaderError> for Fail`):
   UnknownOperator/NoKeyedState/NotFound 404, AmbiguousOperator/BadCursor 400, the rest 500.
   Path segments are decoded with `url_decode_path` (`+` stays `+`); `/op/` (empty prefix) is 404.
-- **Routes** (`pages.rs`): `/`, `/op/<id>`, `/op/<id>/keys`, `/op/<id>/state?name=`,
+- **Routes** (`pages.rs`; search/count/download in `tools.rs`): `/`, `/op/<id>`, `/op/<id>/keys`, `/op/<id>/state?name=`,
   `/op/<id>/key?at=<cursor>` (a page of one from that cursor, which must be that key's own
   position, else 404), `/op/<id>/lookup?key=` (`get`: Found → key view, Absent → key-group and
   subtask, NeedsScan → says so), `/op/<id>/entries?at=&state=&offset=&limit=`,
@@ -339,7 +348,50 @@ key-group per request. Feature `web` is **on by default** (users take the releas
   warning + JSON + 500 key position, a capped key and its entries view (`with_entry_limit(1)`),
   503 past `MAX_CONNECTIONS` idle connections and recovery, parallel requests past the read
   permits all 200. Each guard was
-  reverted once to check its test fails. #23 (search, counts, downloads) builds on these routes.
+  reverted once to check its test fails.
+- **Search, counts, downloads (#23, `tools.rs`, `jobs.rs`)**. `/op/<id>/search` + `/api/…`:
+  one `scan_with` per request — `q` 1..=256 chars (`MAX_QUERY_CHARS`), `mode` glob/substring/exact
+  (`crate::glob`: the pure matcher moved out of `tui/filter.rs`, which now imports it; `?` is one
+  *character*, it used to be one byte), `from`/`to` key-group range, `budget` 1..=64 MiB stored
+  bytes (default 4 MiB), `limit` 1..=1000 (default 100), `cursor` (must lie in the range). The
+  JSON carries `matches` (`key`, `key_group`, `subtask`, `position`, `href`, `summary`), `next`,
+  `next_api`, `next_page`, `done`, `progress` (`Progress` from `_metadata`), `unreadable`. The
+  HTML page renders one request and a "Next page of results" link; `app.js` reads `data-api` on
+  `#search-status`, fetches `next_api` until `done`, Stop, or 10 000 rows, appending with
+  `textContent` only and following only server paths (`ownPath`). A `NeedsScan` lookup links to
+  `search?mode=exact` (JSON: `scan`). `/op/<id>/count` + `/api/…`: `CountJobs` (one per operator,
+  in `App`, kept for the session) run `StateReader::count` steps of `WebOptions::count_step_bytes`
+  (4 MiB) on a `std::thread`, checking an `AtomicBool` between steps; a GET starts the job if
+  there is none, `?cancel=1` cancels (idempotent; 404 if none), `?restart=1` starts again a job
+  that is not running (polling never restarts a cancelled one); dropping `App` cancels all. Pages
+  show `≥ N (counting… x %)` (`tools::count_text`) until `done`; rows carry `data-state` and
+  `app.js` polls `[data-count-api]` once a second. `/op/<id>/download?state=&format=`:
+  `Response.stream: Option<Streamed>` (a `StreamFn` writing to `dyn Write + Send`), produced in
+  `http.rs` on a second `spawn_blocking` that **takes the read permit** (a download counts as a
+  read until it ends) and writes 64 KiB chunks into a bounded `mpsc` (4 in flight, `blocking_send`
+  — a slow client back-pressures the export); the first message decides the status (data → `200`
+  chunked, a failure first → `500` naming it), `ChannelBody` ends cleanly only on `Chunk::Done`,
+  otherwise errs so hyper aborts the connection (no final chunk); a client gone makes the writer
+  fail and the export stop. The body is `export_state_rows` + `NdjsonSink` / `ParquetSink`
+  (`--features parquet`, else 400): byte-identical to `--export-state -o -`; a malformed key-group
+  aborts the transfer. `Content-Disposition: attachment; filename="<8 hex>-<state>.<ext>"`
+  (`download_filename`: `[A-Za-z0-9._-]`, no leading dot or `..`, ≤ 100 chars). HEAD drops the
+  stream unrun. `WebOptions` (`start_with_options`) exists for tests (`count_step_pause`).
+  **Tests**: `tests/web_tools_test.rs` (CI): a glob/substring search with `budget=1&limit=3` over
+  many continuations returns every match exactly once and the same order as one request; the HTML
+  chain of next-page links does too; a hostile query and key render escaped; ranges across the
+  subtask boundary; parameter bounds (400s); the opaque-key one-click scan; counts == export rows
+  (and distinct keys) per state, inline+compressed and files; a throttled job shows `≥`/counting,
+  is cancelled and stays so, restarts; NDJSON downloads == `export_state_ndjson` byte for byte
+  (multi-chunk, inline+compressed and files), Parquet == `ParquetSink` (with the feature),
+  filenames sanitised, a lost file → `500` not `200`, 403 without session, every key found by
+  lookup and an empty key-group answered with 0 blocks. Reverted once each (range stop,
+  first-message status, cancel check, mid-block resume ordinal, filename sanitising): each fails.
+  **Measured** on `savepoint-big` (release): full-operator search 43 requests 1.6 s, exact scan
+  1.6 s, a 2-key-group range 0.3 s, count of all states 1.5 s (1M keys, big-stats 2.5M entries),
+  NDJSON downloads 155 MB in 0.8 s and 412 MB in 2.7 s, identical sha256 to the CLI export; peak
+  RSS 35 MB through all of it; a cancel stops within one 4 MiB step; an aborted download stops
+  the export at once.
 
 ## TUI: key cap, text, terminal
 
@@ -634,7 +686,7 @@ source** (branch `release-1.20`, https://github.com/apache/flink) rather than gu
   `tests/keyed_block_test.rs` are the fixture-free home for file-backed / multi-subtask /
   compressed, operator-state, key-type and block-level cases, `tests/tui_*_test.rs` for the TUI
   over ratatui's `TestBackend`, `tests/state_reader_test.rs` and `tests/key_group_test.rs` for the
-  reader and the key-group assignment, `tests/web_test.rs` for `--web`), so the fixture-dependent ones
+  reader and the key-group assignment, `tests/web_test.rs` and `tests/web_tools_test.rs` for `--web`), so the fixture-dependent ones
   (`gitlab_savepoint_test`, `decode_e2e_test`, `coverage_audit`, `export_state_stream_test`,
   `key_group_assignment_test`, `compressed_savepoint_test`, `export_parquet_test`,
   `tui_gitlab_parity_test`, `state_reader_fixture_test`, `state_reader_big_test`) only ever run

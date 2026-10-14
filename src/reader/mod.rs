@@ -361,6 +361,70 @@ pub struct ScanPage {
     pub unreadable: Vec<Unreadable>,
 }
 
+/// How far one [`StateReader::scan_with`] may go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanOptions {
+    /// Stop once the stored size of the blocks visited reaches this (at least one block is
+    /// always visited, so a scan always moves).
+    pub byte_budget: u64,
+    /// Stop at this many matches (mid-block: `next` is then the following key); 0 is taken as 1.
+    pub max_matches: usize,
+    /// Do not go past this absolute key-group (inclusive); `None` = to the end.
+    pub last_key_group: Option<u16>,
+}
+
+/// Where a scan or count is, in the operator's key-groups and stored bytes, as `_metadata`'s
+/// offsets give them (no I/O): what is done is every key-group before the cursor's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Progress {
+    pub key_groups_done: u64,
+    pub key_groups_total: u64,
+    /// Stored size of the non-empty key-groups done / in the range.
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+}
+
+impl Progress {
+    /// Done, in percent of the bytes (of the key-groups when the range holds no bytes).
+    pub fn percent(&self) -> f64 {
+        let (done, total) = if self.bytes_total > 0 {
+            (self.bytes_done, self.bytes_total)
+        } else {
+            (self.key_groups_done, self.key_groups_total)
+        };
+        if total == 0 {
+            100.0
+        } else {
+            done as f64 * 100.0 / total as f64
+        }
+    }
+}
+
+/// Exact counts of one keyed state over part of an operator, from [`StateReader::count`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateCount {
+    pub state: Arc<str>,
+    /// Keys holding at least one entry of the state.
+    pub keys: u64,
+    /// Entries stored: one per value, per MAP entry, per timer — what `--export-state` writes
+    /// one row for.
+    pub entries: u64,
+}
+
+/// What one [`StateReader::count`] call counted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CountPage {
+    /// Per state, in order of first appearance.
+    pub states: Vec<StateCount>,
+    /// Distinct keys (a key is in one key-group, so counts of disjoint pages add up).
+    pub keys: u64,
+    /// The next key-group to count; `None` when the whole operator has been counted.
+    pub next: Option<Cursor>,
+    pub stats: ReadStats,
+    pub malformed: Vec<String>,
+    pub unreadable: Vec<Unreadable>,
+}
+
 /// The answer of [`StateReader::get`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum Lookup {
@@ -1681,6 +1745,169 @@ impl<'a> StateReader<'a> {
         byte_budget: u64,
         matches: &mut dyn FnMut(&str) -> bool,
     ) -> Result<ScanPage, ReaderError> {
+        let opts = ScanOptions {
+            byte_budget,
+            max_matches: self.scan_match_limit,
+            last_key_group: None,
+        };
+        self.scan_with(op, cursor, &opts, matches)
+    }
+
+    /// The proto context values are decoded with, if any (for a client that must decode the
+    /// same way, e.g. a download through [`crate::export_state`]).
+    pub fn proto(&self) -> Option<&ProtoContext> {
+        self.proto.as_deref()
+    }
+
+    /// The cursor of the first key at or after absolute key-group `key_group` (ordinal 0 of it,
+    /// named by the subtask that holds it), for a scan restricted to a key-group range.
+    pub fn cursor_at(&self, op: &str, key_group: u16) -> Result<Cursor, ReaderError> {
+        let op_index = self.operator_index(op)?;
+        let ctx = self.context(op_index);
+        let operator = &self.savepoint.operators[op_index];
+        let subtask = match ctx.unit_of(key_group as i32) {
+            Some(u) => ctx.unit_subtask(u),
+            None => subtask_for_key_group(
+                operator.max_parallelism,
+                operator.parallelism,
+                key_group as i32,
+            ),
+        };
+        Ok(Cursor {
+            subtask,
+            key_group,
+            ordinal: 0,
+        })
+    }
+
+    /// How far `at` is in key-groups `first..=last` (`last` `None` = the operator's last), from
+    /// `_metadata`'s offsets alone: every key-group before `at`'s is done; `at` `None` = all.
+    pub fn progress(
+        &self,
+        op: &str,
+        at: Option<&Cursor>,
+        first: u16,
+        last: Option<u16>,
+    ) -> Result<Progress, ReaderError> {
+        let op_index = self.operator_index(op)?;
+        let ctx = self.context(op_index);
+        let max_p = self.savepoint.operators[op_index].max_parallelism.max(1) as i64;
+        let first = first as i64;
+        let last = last.map(|l| l as i64).unwrap_or(i64::MAX).min(max_p - 1);
+        let mut p = Progress::default();
+        if last < first {
+            return Ok(p);
+        }
+        let done_below = at.map(|c| c.key_group as i64).unwrap_or(i64::MAX);
+        p.key_groups_total = (last - first + 1) as u64;
+        p.key_groups_done = (done_below.min(last + 1) - first).max(0) as u64;
+        for s in &ctx.streams {
+            for i in 0..s.offsets.len() {
+                let kg = s.start_key_group as i64 + i as i64;
+                if kg < first || kg > last {
+                    continue;
+                }
+                if let Some((start, end)) = s.block_range(i) {
+                    p.bytes_total += end - start;
+                    if kg < done_below {
+                        p.bytes_done += end - start;
+                    }
+                }
+            }
+        }
+        Ok(p)
+    }
+
+    /// Count each state's keys and entries in whole blocks from `cursor`'s key-group on (its
+    /// ordinal is ignored), until their stored size reaches `byte_budget` (at least one block per
+    /// call). No value is decoded; memory is one block (not cached). Unreadable key-groups are
+    /// listed and skipped, as by a page.
+    pub fn count(
+        &self,
+        op: &str,
+        cursor: &Cursor,
+        byte_budget: u64,
+    ) -> Result<CountPage, ReaderError> {
+        let ctx = self.context(self.operator_index(op)?);
+        self.check_cursor(ctx, cursor)?;
+        let mut page = CountPage {
+            states: Vec::new(),
+            keys: 0,
+            next: None,
+            stats: ReadStats::default(),
+            malformed: Vec::new(),
+            unreadable: Vec::new(),
+        };
+        let mut pos = ctx.seek(cursor.key_group as i32, 0);
+        let mut visited = 0usize;
+        // (stateId, entries of the current key), reused per key.
+        let mut per_key: Vec<(u16, u64)> = Vec::new();
+        loop {
+            if !matches!(pos, Position::End) && visited > 0 && page.stats.block_bytes >= byte_budget
+            {
+                page.next = ctx.cursor_of(&pos);
+                return Ok(page);
+            }
+            match pos {
+                Position::End => return Ok(page),
+                Position::Unreadable(unit, from) => {
+                    page.unreadable.push(ctx.unreadable(unit, from));
+                    visited += 1;
+                    pos = ctx.seek(ctx.unit_range(unit).1 + 1, 0);
+                }
+                Position::Block(si, kg, _) => {
+                    let s = &ctx.streams[si];
+                    match self.grouped(ctx, si, kg, false, &mut page.stats) {
+                        Err(e) => page.unreadable.push(Self::unreadable_block(s, kg, e)),
+                        Ok(None) => {}
+                        Ok(Some(block)) => {
+                            let header = s.header.as_ref().expect("grouped checked it");
+                            page.malformed.extend(block.defect.iter().cloned());
+                            for raw in &block.keys {
+                                page.keys += 1;
+                                per_key.clear();
+                                for e in &raw.entries {
+                                    match per_key.iter_mut().find(|(id, _)| *id == e.state_id) {
+                                        Some((_, n)) => *n += 1,
+                                        None => per_key.push((e.state_id, 1)),
+                                    }
+                                }
+                                for &(id, n) in &per_key {
+                                    let label = Self::state_label(header, id);
+                                    match page.states.iter_mut().find(|c| c.state == label) {
+                                        Some(c) => {
+                                            c.keys += 1;
+                                            c.entries += n;
+                                        }
+                                        None => page.states.push(StateCount {
+                                            state: label,
+                                            keys: 1,
+                                            entries: n,
+                                        }),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    visited += 1;
+                    pos = ctx.seek(kg + 1, 0);
+                }
+            }
+        }
+    }
+
+    /// [`StateReader::scan`] with its limits given per call ([`ScanOptions`]): a byte budget, a
+    /// match cap, and an optional last key-group (a search restricted to a key-group range).
+    pub fn scan_with(
+        &self,
+        op: &str,
+        cursor: &Cursor,
+        opts: &ScanOptions,
+        matches: &mut dyn FnMut(&str) -> bool,
+    ) -> Result<ScanPage, ReaderError> {
+        let byte_budget = opts.byte_budget;
+        let max_matches = opts.max_matches.max(1);
+        let last = opts.last_key_group.map(i32::from).unwrap_or(i32::MAX);
         let ctx = self.context(self.operator_index(op)?);
         self.check_cursor(ctx, cursor)?;
         let mut page = ScanPage {
@@ -1693,9 +1920,15 @@ impl<'a> StateReader<'a> {
         let mut pos = ctx.seek(cursor.key_group as i32, cursor.ordinal);
         let mut visited = 0usize;
         loop {
+            // Past the range: the scan is over.
+            if let Position::Block(_, kg, _) | Position::Unreadable(_, kg) = pos {
+                if kg > last {
+                    pos = Position::End;
+                }
+            }
             if !matches!(pos, Position::End)
                 && ((visited > 0 && page.stats.block_bytes >= byte_budget)
-                    || page.matches.len() >= self.scan_match_limit)
+                    || page.matches.len() >= max_matches)
             {
                 page.next = ctx.cursor_of(&pos);
                 return Ok(page);
@@ -1717,7 +1950,7 @@ impl<'a> StateReader<'a> {
                             let header = s.header.as_ref().expect("grouped checked it");
                             page.malformed.extend(block.defect.iter().cloned());
                             for (ord, raw) in block.keys.iter().enumerate().skip(ordinal as usize) {
-                                if page.matches.len() >= self.scan_match_limit {
+                                if page.matches.len() >= max_matches {
                                     page.next = Some(Cursor {
                                         subtask: s.subtask_index,
                                         key_group: kg as u16,
