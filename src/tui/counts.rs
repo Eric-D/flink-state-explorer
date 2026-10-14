@@ -87,7 +87,17 @@ pub fn load(cache_dir: &Path, savepoint_dir: &Path) -> Option<HashMap<String, us
     Some(counts)
 }
 
-/// Write the counts of `savepoint_dir` (through a side file, renamed). Only complete counts
+/// A side file for `path` no other writer uses at the same time: two explorers on one savepoint
+/// (or two saves in one process) each write their own, and the last rename wins whole.
+pub fn temp_file(path: &Path) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".{}-{}.partial", std::process::id(), n));
+    PathBuf::from(tmp)
+}
+
+/// Write the counts of `savepoint_dir` (through a side file of its own, synced, then renamed). Only complete counts
 /// should be saved: a count that met an unreadable key-group is a lower bound.
 pub fn save(
     cache_dir: &Path,
@@ -98,9 +108,7 @@ pub fn save(
     std::fs::create_dir_all(cache_dir)
         .map_err(|e| format!("create {}: {}", cache_dir.display(), e))?;
     let path = cache_file(cache_dir, savepoint_dir);
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".partial");
-    let tmp = PathBuf::from(tmp);
+    let tmp = temp_file(&path);
     let write = || -> std::io::Result<()> {
         let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
         for h in &head {
@@ -109,9 +117,18 @@ pub fn save(
         for (hex, n) in counts {
             writeln!(f, "{} {}", hex, n)?;
         }
-        f.flush()
+        f.flush()?;
+        // On disk before the rename makes it the cache: a crash then leaves the old file or the
+        // new one, never a truncated one under the real name.
+        f.get_ref().sync_all()
     };
-    write().map_err(|e| format!("write {}: {}", tmp.display(), e))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("rename {}: {}", tmp.display(), e))?;
-    Ok(path)
+    let result = write()
+        .map_err(|e| format!("write {}: {}", tmp.display(), e))
+        .and_then(|()| {
+            std::fs::rename(&tmp, &path).map_err(|e| format!("rename {}: {}", tmp.display(), e))
+        });
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result.map(|()| path)
 }

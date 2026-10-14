@@ -28,6 +28,9 @@ pub struct AppOptions {
     pub count_keys: bool,
     /// Stored bytes one count step reads (0: [`crate::tui::jobs::COUNT_STEP_BYTES`]).
     pub count_step_bytes: u64,
+    /// Stored bytes the search reads between two reports (0:
+    /// [`crate::tui::tree::SEARCH_STEP_BYTES`]).
+    pub search_step_bytes: u64,
 }
 
 impl AppOptions {
@@ -42,6 +45,7 @@ impl AppOptions {
             },
             count_keys: true,
             count_step_bytes: crate::tui::jobs::COUNT_STEP_BYTES,
+            search_step_bytes: crate::tui::tree::SEARCH_STEP_BYTES,
         }
     }
 }
@@ -72,6 +76,10 @@ pub struct App {
     /// False once the pass met an unreadable key-group: the counts are then not cached.
     count_complete: bool,
     export_job: Option<Job<ExportMsg>>,
+    /// The export's last progress report, while it runs.
+    export_progress: Option<crate::export::ExportProgress>,
+    /// A `q` was pressed while the export ran: the next `q` aborts it and quits.
+    quit_armed: bool,
 }
 
 impl App {
@@ -162,6 +170,9 @@ impl App {
             let _ = reader.states(&s.operator_id_hex());
         }
         let mut tree_view = TreeView::new(Arc::new(reader), summaries);
+        if options.search_step_bytes > 0 {
+            tree_view.set_search_step_bytes(options.search_step_bytes);
+        }
         if let Some(ctx) = proto {
             tree_view.note_proto_context(ctx);
         }
@@ -188,6 +199,8 @@ impl App {
             counted: Vec::new(),
             count_complete: true,
             export_job: None,
+            export_progress: None,
+            quit_armed: false,
         };
         app.load_cached_counts();
         if app.options.count_keys {
@@ -270,9 +283,7 @@ impl App {
 
     /// Whether a background job (count or export) is running, or a search.
     pub fn busy(&self) -> bool {
-        self.counting()
-            || self.export_job.as_ref().is_some_and(|j| j.is_running())
-            || self.tree_view.searching()
+        self.counting() || self.exporting() || self.tree_view.searching()
     }
 
     /// Wait for the count pass to finish, then apply what it found (tests).
@@ -318,7 +329,7 @@ impl App {
 
     /// Apply what the background jobs reported since the last call.
     pub fn poll_jobs(&mut self) {
-        if let Some(job) = &self.count_job {
+        if let Some(job) = self.count_job.as_mut() {
             let finished = !job.is_running();
             let msgs = job.drain();
             for m in msgs {
@@ -329,13 +340,14 @@ impl App {
                 self.save_counts();
             }
         }
-        if let Some(job) = &self.export_job {
+        if let Some(job) = self.export_job.as_mut() {
             let finished = !job.is_running();
             let msgs = job.drain();
             let output = self.export_path();
             for m in msgs {
                 match m {
-                    ExportMsg::Progress(n) => self.set_status(format!("Exporting… {} keys", n)),
+                    // Shown by the status bar whenever no message is.
+                    ExportMsg::Progress(p) => self.export_progress = Some(p),
                     ExportMsg::Done(Ok(s)) if s.errors.is_empty() => {
                         self.set_status(format!("Exported {} keys to {}", s.keys, output.display()))
                     }
@@ -351,8 +363,44 @@ impl App {
             }
             if finished {
                 self.export_job = None;
+                self.export_progress = None;
+                self.quit_armed = false;
             }
         }
+    }
+
+    /// Whether the `E` export is running.
+    pub fn exporting(&self) -> bool {
+        self.export_job.as_ref().is_some_and(|j| j.is_running())
+    }
+
+    /// "Exporting… N keys, operator a/b".
+    fn export_progress_text(&self) -> String {
+        match self.export_progress {
+            Some(p) => format!(
+                "Exporting… {} keys, operator {}/{}",
+                p.keys,
+                (p.operators_done + 1).min(p.operators),
+                p.operators
+            ),
+            None => "Exporting…".to_string(),
+        }
+    }
+
+    /// `q`: quit — but while an export runs, quitting would abort it, so the first `q` only
+    /// says so, and a second one (with no other key between) aborts it and quits. Ctrl-C quits
+    /// at once.
+    fn quit_or_confirm(&mut self) {
+        if self.exporting() && !self.quit_armed {
+            self.quit_armed = true;
+            self.set_status(format!(
+                "{} — q again to abort the export and quit, or wait for it",
+                self.export_progress_text()
+            ));
+            return;
+        }
+        self.should_quit = true;
+        self.shutdown();
     }
 
     /// Save the counts when every keyed operator was counted exactly and nothing was unreadable
@@ -368,14 +416,11 @@ impl App {
         let _ = crate::tui::counts::save(dir, &self.savepoint_dir, &self.counted);
     }
 
-    /// One turn of background work, between frames: apply the jobs' reports, and run one step
-    /// of the search when one is going on. Returns whether the search goes on.
+    /// One turn of the event loop, between frames: apply what the background jobs (count,
+    /// export, search) reported, without waiting for them. Returns whether a search goes on.
     pub fn tick(&mut self) -> bool {
         self.poll_jobs();
-        self.tree_view.searching()
-            && self
-                .tree_view
-                .search_step(crate::tui::tree::SEARCH_STEP_BYTES)
+        self.tree_view.poll_search()
     }
 
     /// Draw the whole screen into `frame` (any backend: tests use `TestBackend`).
@@ -401,8 +446,10 @@ impl App {
     ) -> Result<(), AppError> {
         let mut last_draw = std::time::Instant::now() - Duration::from_secs(1);
         loop {
-            // A search runs a step per turn; between steps keys are read without waiting, so
-            // `q`, Esc and Ctrl-C answer at once. Frames are drawn at most every 50 ms meanwhile.
+            // The count, the export and the search run on worker threads: a turn only applies
+            // what they reported, so keys are answered while they run — `Esc` stops a search
+            // and Ctrl-C everything between two blocks they read (one key-group is read whole).
+            // While a search runs, frames are drawn every 50 ms to show its matches.
             let searching = self.tick();
             if !searching || last_draw.elapsed() >= Duration::from_millis(50) {
                 terminal
@@ -412,7 +459,7 @@ impl App {
             }
 
             let wait = if searching {
-                Duration::ZERO
+                Duration::from_millis(50)
             } else {
                 Duration::from_millis(100)
             };
@@ -443,7 +490,8 @@ impl App {
         }
     }
 
-    /// Whether the last key handled asked to quit (`q`, or Ctrl-C from anywhere).
+    /// Whether the last key handled asked to quit (`q` — twice while an export runs — or Ctrl-C
+    /// from anywhere).
     pub fn should_quit(&self) -> bool {
         self.should_quit
     }
@@ -458,6 +506,8 @@ impl App {
             return;
         }
         let code = key.code;
+        // A `q` asking to confirm is confirmed by the very next key only.
+        let quit_armed = std::mem::take(&mut self.quit_armed);
         // Profile picker takes priority
         if self.profile_picker.visible {
             if let Some(action) = self.profile_picker.handle_key(code) {
@@ -517,8 +567,8 @@ impl App {
 
         match code {
             KeyCode::Char('q') => {
-                self.should_quit = true;
-                self.shutdown();
+                self.quit_armed = quit_armed;
+                self.quit_or_confirm();
             }
             KeyCode::Char('/') => self.filter.activate(),
             KeyCode::Char('P') => self.profile_picker.open(),
@@ -780,6 +830,9 @@ impl App {
             "Tab:mode  Enter:apply  Esc:cancel"
         } else if let (None, Some(p)) = (&self.status_message, self.tree_view.search_percent()) {
             searching = format!("Searching keys… {}%  Esc:stop  q:quit", p);
+            &searching
+        } else if let (None, true) = (&self.status_message, self.exporting()) {
+            searching = format!("{}  q q:abort and quit", self.export_progress_text());
             &searching
         } else {
             self.status_message.as_deref().unwrap_or(default_shortcuts)

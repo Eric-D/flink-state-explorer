@@ -394,6 +394,7 @@ fn no_counts_are_cached_after_a_partial_count() {
         cache_dir: Some(cache.to_path_buf()),
         count_keys: true,
         count_step_bytes: 0,
+        search_step_bytes: 0,
     };
     std::fs::remove_file(&files[1]).unwrap();
     let mut app = App::open(dir.to_path_buf(), options(), |_| {}).unwrap();

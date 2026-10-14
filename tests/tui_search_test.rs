@@ -105,12 +105,13 @@ fn a_glob_filter_scans_the_keys_step_by_step() {
     let mut tree = open_tree(&dir);
     tree.jump_first();
     tree.expand();
+    // One block per report (a 1-byte step): it takes several reports, each showing progress.
+    tree.set_search_step_bytes(1);
     tree.apply_filter(&Some(AppliedFilter::Pattern("USER-0*7".to_string())));
     assert!(tree.searching(), "a glob is searched, not looked up");
-    // One block per step (a 1-byte budget): it takes several steps, each showing progress.
     let mut steps = 0;
     let mut progress_seen = false;
-    while tree.search_step(1) {
+    while tree.search_step() {
         steps += 1;
         if operator_row(&mut tree).contains("searching ") {
             progress_seen = true;
@@ -229,6 +230,7 @@ fn ctrl_c_stops_the_count() {
         cache_dir: None,
         count_keys: true,
         count_step_bytes: 1, // one key-group per step: thousands of steps
+        search_step_bytes: 0,
     };
     let mut app = App::open(dir.to_path_buf(), options.clone(), |_| {}).unwrap();
     assert!(app.counting());
@@ -253,11 +255,17 @@ fn ctrl_c_stops_the_count() {
     assert_eq!(app.tree().key_count(0), Some(KeyCount::Exact(20_000)));
 }
 
-/// Ctrl-C during a search quits and ends it; `Esc` ends it and keeps what it found.
+/// Ctrl-C during a search quits and ends it (its worker joined); `Esc` ends it and keeps what it
+/// found. The worker reports one block at a time and cannot run more than a few reports ahead of
+/// the event loop, so the search is still going on when the keys arrive.
 #[test]
 fn ctrl_c_and_esc_stop_a_search() {
     let dir = write(operator(5000, 4096, Ser::String), "ctrl-c-scan");
-    let open = || App::open(dir.to_path_buf(), AppOptions::default(), |_| {}).unwrap();
+    let options = AppOptions {
+        search_step_bytes: 1,
+        ..Default::default()
+    };
+    let open = || App::open(dir.to_path_buf(), options.clone(), |_| {}).unwrap();
     let type_filter = |app: &mut App| {
         press(app, KeyCode::Char('/'));
         for c in "*9*".chars() {
@@ -269,7 +277,7 @@ fn ctrl_c_and_esc_stop_a_search() {
     let mut app = open();
     type_filter(&mut app);
     assert!(app.tree().searching());
-    assert!(app.tick(), "one step does not scan 4096 key-groups");
+    assert!(app.tick(), "a few reports do not cover 4096 key-groups");
     app.handle_key(ctrl_c());
     assert!(app.should_quit());
     assert!(!app.tree().searching());
@@ -302,6 +310,7 @@ fn nothing_is_written_into_the_savepoint_directory() {
         cache_dir: Some(cache.to_path_buf()),
         count_keys: true,
         count_step_bytes: 0,
+        search_step_bytes: 0,
     };
 
     let mut app = App::open(dir.to_path_buf(), options.clone(), |_| {}).unwrap();
@@ -375,4 +384,94 @@ fn the_cache_directory_comes_from_the_environment() {
             );
         }
     }
+}
+
+/// The search runs on a worker thread: `apply_filter` returns before it is done, `poll_search`
+/// applies what was reported without waiting, and the worker, which may run only a few reports
+/// ahead, is stopped and joined by `cancel_search` even while it waits on a full channel.
+#[test]
+fn the_search_runs_on_a_worker_thread() {
+    let dir = write(operator(5000, 4096, Ser::String), "search-worker");
+    let mut tree = open_tree(&dir);
+    tree.jump_first();
+    tree.expand();
+    tree.set_search_step_bytes(1); // a report per block: thousands of them
+    tree.apply_filter(&Some(AppliedFilter::Pattern("*9*".to_string())));
+    assert!(tree.searching());
+    // The worker fills its channel and waits; polling takes what is there and returns.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let t = std::time::Instant::now();
+    assert!(
+        tree.poll_search(),
+        "a few reports do not cover 4096 key-groups"
+    );
+    assert!(t.elapsed() < std::time::Duration::from_secs(1));
+    tree.cancel_search();
+    assert!(!tree.searching());
+
+    // Left to run, it finds every match.
+    tree.apply_filter(&Some(AppliedFilter::Pattern("*9*".to_string())));
+    while tree.searching() {
+        tree.poll_search();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let want = (0..5000)
+        .map(|i| format!("user-{:05}", i))
+        .filter(|k| k.contains('9'))
+        .count();
+    assert!(
+        operator_row(&mut tree).contains(&format!("({}/", want)),
+        "{}",
+        operator_row(&mut tree)
+    );
+}
+
+/// A cancelled job is joined even when its worker is blocked sending on a full bounded channel
+/// (receiving is what frees it), and what it sent meanwhile is still drained.
+#[test]
+fn a_job_blocked_on_a_full_channel_is_cancelled() {
+    use flink_explorer::tui::jobs::Job;
+    use std::sync::atomic::Ordering;
+    let mut job: Job<usize> = Job::spawn_bounded(1, |tx, cancel| {
+        for i in 0..1_000_000 {
+            if cancel.load(Ordering::Relaxed) || tx.send(i).is_err() {
+                return;
+            }
+        }
+    });
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    job.cancel();
+    assert!(!job.is_running());
+    let got = job.drain();
+    assert!(!got.is_empty() && got.len() < 1_000_000, "{}", got.len());
+    assert_eq!(got[0], 0);
+}
+
+/// The counts cache is written through a side file of its own — named after the process and a
+/// counter, so two writers never share one — synced, then renamed; none is left behind.
+#[test]
+fn the_counts_cache_is_written_through_a_unique_side_file() {
+    use flink_explorer::tui::counts;
+    let dir = write(operator(10, 128, Ser::String), "counts-tmp");
+    let cache = synth::temp_dir("counts-tmp-cache");
+    let path = counts::cache_file(&cache, &dir);
+    let (a, b) = (counts::temp_file(&path), counts::temp_file(&path));
+    assert_ne!(a, b);
+    let name = a.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(
+        name.contains(&format!(".{}-", std::process::id())),
+        "{}",
+        name
+    );
+    assert!(name.ends_with(".partial"));
+    for n in [10, 11] {
+        let saved = counts::save(&cache, &dir, &[("2c2c".to_string(), n)]).unwrap();
+        assert_eq!(saved, path);
+        assert_eq!(counts::load(&cache, &dir).unwrap()["2c2c"], n);
+    }
+    let files: Vec<_> = std::fs::read_dir(&cache)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(files, [path.file_name().unwrap().to_owned()], "{:?}", files);
 }

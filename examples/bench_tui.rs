@@ -77,6 +77,7 @@ fn main() {
             cache_dir: None,
             count_keys: false,
             count_step_bytes: 0,
+            search_step_bytes: 0,
         },
         |_| {},
     )
@@ -162,7 +163,7 @@ fn main() {
     let tree = app.tree();
     tree.apply_filter(&Some(AppliedFilter::Pattern(glob.clone())));
     let mut steps = 0;
-    while tree.search_step(flink_explorer::tui::tree::SEARCH_STEP_BYTES) {
+    while tree.search_step() {
         steps += 1;
     }
     let mut terminal = Terminal::new(TestBackend::new(200, 50)).unwrap();
