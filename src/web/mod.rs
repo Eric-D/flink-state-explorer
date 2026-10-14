@@ -1,7 +1,8 @@
 //! `flink-explorer <savepoint> --web`: a read-only browser UI over [`crate::reader::StateReader`].
 //!
 //! Server-rendered HTML (plus a little progressive JavaScript, embedded) and JSON twins under
-//! `/api/`. Every page is a URL: overview, operator, key pages (cursor paging), key detail, lookup.
+//! `/api/`. Every page is a URL: overview, operator, key pages (cursor paging), key detail, lookup,
+//! search, counts and downloads (`tools.rs`, `jobs.rs`).
 //!
 //! The server publishes production data, so the request path is guarded in this order, by
 //! [`App::handle`], for every request including static assets:
@@ -28,15 +29,39 @@
 
 pub mod html;
 pub mod http;
+mod jobs;
 mod pages;
+mod tools;
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::reader::StateReader;
 
-pub use http::{max_concurrent_reads, serve, start, RunningServer, MAX_CONNECTIONS};
+pub use http::{
+    max_concurrent_reads, serve, start, start_with_options, RunningServer, MAX_CONNECTIONS,
+};
 pub use pages::ENTRY_LIMIT;
+pub use tools::{download_filename, DEFAULT_SEARCH_BUDGET, MAX_QUERY_CHARS, MAX_SEARCH_BUDGET};
+
+/// Tunables of the server that are not per request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WebOptions {
+    /// Stored bytes a count job reads per step; it checks for cancellation between steps.
+    pub count_step_bytes: u64,
+    /// A pause between two count steps: zero in use; tests set one to catch a job running.
+    pub count_step_pause: Duration,
+}
+
+impl Default for WebOptions {
+    fn default() -> Self {
+        WebOptions {
+            count_step_bytes: 4 << 20,
+            count_step_pause: Duration::ZERO,
+        }
+    }
+}
 
 /// What the server needs to know about one request.
 #[derive(Debug, Clone, Default)]
@@ -59,6 +84,34 @@ pub struct Response {
     /// Extra headers (the security headers are added by [`App::handle`]).
     pub headers: Vec<(&'static str, String)>,
     pub body: Vec<u8>,
+    /// A body produced while it is sent (a download): run by [`http`] on a blocking thread that
+    /// holds a read permit, written through a bounded channel as a chunked body. `body` is then
+    /// empty. If the producer fails before its first chunk, the client gets a `500` instead.
+    pub stream: Option<Streamed>,
+}
+
+/// What produces a streamed body: it writes the whole body to the writer, or fails.
+pub type StreamFn = Box<dyn FnOnce(&mut (dyn std::io::Write + Send)) -> Result<(), String> + Send>;
+
+/// A [`StreamFn`], taken once.
+#[derive(Clone)]
+pub struct Streamed(Arc<Mutex<Option<StreamFn>>>);
+
+impl Streamed {
+    pub fn new(f: StreamFn) -> Self {
+        Streamed(Arc::new(Mutex::new(Some(f))))
+    }
+
+    /// The producer, the first time only.
+    pub fn take(&self) -> Option<StreamFn> {
+        self.0.lock().ok().and_then(|mut f| f.take())
+    }
+}
+
+impl std::fmt::Debug for Streamed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Streamed(..)")
+    }
 }
 
 impl Response {
@@ -68,6 +121,7 @@ impl Response {
             content_type,
             headers: Vec::new(),
             body: body.into(),
+            stream: None,
         }
     }
 
@@ -118,10 +172,22 @@ pub struct App {
     bound: SocketAddr,
     /// Shown in the page header.
     pub(crate) title: String,
+    pub(crate) options: WebOptions,
+    /// The count jobs of this session, one per operator at most.
+    pub(crate) counts: jobs::CountJobs,
 }
 
 impl App {
     pub fn new(reader: Arc<StateReader<'static>>, token: String, bound: SocketAddr) -> Self {
+        Self::with_options(reader, token, bound, WebOptions::default())
+    }
+
+    pub fn with_options(
+        reader: Arc<StateReader<'static>>,
+        token: String,
+        bound: SocketAddr,
+        options: WebOptions,
+    ) -> Self {
         let title = reader
             .savepoint_dir()
             .file_name()
@@ -132,6 +198,8 @@ impl App {
             token,
             bound,
             title,
+            options,
+            counts: jobs::CountJobs::default(),
         }
     }
 
@@ -152,8 +220,11 @@ impl App {
         let mut resp = self.guarded(req);
         with_security_headers(&mut resp);
         if req.method == "HEAD" {
-            resp.headers
-                .push(("Content-Length", resp.body.len().to_string()));
+            // A streamed body is not produced for a HEAD, and its length is unknown.
+            if resp.stream.take().is_none() {
+                resp.headers
+                    .push(("Content-Length", resp.body.len().to_string()));
+            }
             resp.body.clear();
         }
         resp
