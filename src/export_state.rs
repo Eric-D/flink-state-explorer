@@ -16,21 +16,22 @@
 //!    per line.
 //!
 //! Rows are therefore emitted as they are read; nothing accumulates.
+//!
+//! Opening the streams (each file once, read positionally), resolving each subtask's header and
+//! locating a key-group's bytes are [`crate::reader`]'s, shared with
+//! [`crate::reader::StateReader`]; this module adds the state filter, the row shape and the sinks.
 
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::io::Write;
+use std::path::Path;
 
 use serde_json::{json, Value};
 
-use crate::parser::keyed_state::{
-    count_states_in_header, extract_entry_layouts, extract_state_metadata,
-    extract_value_pojo_classes, extract_value_serializer_types, key_group_block,
-    parse_key_group_block, read_keyed_stream_header, EntryLayout, KeyGroupParse,
-};
-use crate::parser::metadata::{Operator, Savepoint};
-use crate::parser::pojo::{extract_pojo_infos, PojoInfo};
-use crate::parser::state_handle::{KeyGroupsStateHandle, StateHandle, StreamStateHandle};
+use crate::parser::keyed_state::{key_group_block, parse_key_group_block};
+use crate::parser::metadata::Savepoint;
 use crate::proto::ProtoContext;
+use crate::reader::{decode_entry_value, kg_prefix_len, OpContext};
+
+pub use crate::reader::hex_id;
 
 /// What an export actually read, for reporting and for asserting the bounded footprint in tests.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -52,158 +53,6 @@ pub struct ExportStats {
     pub first_malformed: Option<String>,
 }
 
-/// A keyed state located in the savepoint, with everything needed to decode its values.
-struct ResolvedState {
-    state_id: u16,
-    name: String,
-    state_type: String,
-    value_type: String,
-    pojo: Option<PojoInfo>,
-    key_type: String,
-    key_pojo: Option<PojoInfo>,
-    state_types: Vec<String>,
-    /// What follows the key in each state's entries, so keys split from namespaces the same way
-    /// as on the index path.
-    layouts: Vec<EntryLayout>,
-    num_states: usize,
-    /// For MAP states: the `Map<K,V>` key and value serializer types.
-    map_key_type: String,
-    map_value_type: String,
-}
-
-/// Where a subtask's keyed stream lives, and how to read a byte range out of it.
-enum Source<'a> {
-    Mem(&'a [u8]),
-    File { path: PathBuf, base: u64, len: u64 },
-}
-
-impl Source<'_> {
-    fn len(&self) -> u64 {
-        match self {
-            Source::Mem(d) => d.len() as u64,
-            Source::File { len, .. } => *len,
-        }
-    }
-
-    /// Read `[start, end)` of the logical stream into `buf`.
-    fn read_range(&self, start: u64, end: u64, buf: &mut Vec<u8>) -> Result<(), String> {
-        let end = end.min(self.len());
-        if end <= start {
-            buf.clear();
-            return Ok(());
-        }
-        let len = (end - start) as usize;
-        match self {
-            Source::Mem(d) => {
-                buf.clear();
-                buf.extend_from_slice(&d[start as usize..end as usize]);
-            }
-            Source::File { path, base, .. } => {
-                let mut f = std::fs::File::open(path)
-                    .map_err(|e| format!("open {}: {}", path.display(), e))?;
-                f.seek(SeekFrom::Start(base + start))
-                    .map_err(|e| format!("seek {}: {}", path.display(), e))?;
-                buf.clear();
-                buf.resize(len, 0);
-                f.read_exact(buf)
-                    .map_err(|e| format!("read {}: {}", path.display(), e))?;
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Where `delegate`'s bytes are. A file-backed stream is opened first, and must be as long as its
-/// handle records ([`crate::state_file::open`]): a missing, unreadable or short file is an `Err`
-/// naming it, never a stream that silently yields fewer rows. `Ok(None)`: no stream at all.
-fn source_for<'a>(
-    delegate: &'a StreamStateHandle,
-    savepoint_dir: &Path,
-) -> Result<Option<Source<'a>>, String> {
-    match delegate {
-        StreamStateHandle::ByteStream(bs) => Ok(Some(Source::Mem(&bs.data))),
-        StreamStateHandle::Relative(rel) => {
-            let path = savepoint_dir.join(&rel.relative_path);
-            let (_, len) = crate::state_file::open(&path, rel.state_size)?;
-            Ok(Some(Source::File { path, base: 0, len }))
-        }
-        StreamStateHandle::File(f) => {
-            let path = crate::state_file::local_path(&f.file_path)?;
-            let (_, len) = crate::state_file::open(&path, f.state_size)?;
-            Ok(Some(Source::File { path, base: 0, len }))
-        }
-        // A segment handle points at a region of a shared file, and offsets inside it are
-        // relative to `start_pos`: FileMergingCheckpointStateOutputStream.getPos (:125-129) on
-        // write, FsSegmentDataInputStream.seek (:96-99) on read (release-1.20). No real
-        // file-merging savepoint has been read yet.
-        StreamStateHandle::Segment(seg) => {
-            let path = crate::state_file::local_path(&seg.file_path)?;
-            let base = seg.start_pos.max(0) as u64;
-            let len = seg.state_size.max(0) as u64;
-            // The segment must lie within its file.
-            crate::state_file::open(&path, (base + len) as i64)?;
-            Ok(Some(Source::File { path, base, len }))
-        }
-        StreamStateHandle::KeyGroups(_)
-        | StreamStateHandle::Null
-        | StreamStateHandle::EmptySegment => Ok(None),
-    }
-}
-
-/// One subtask's keyed stream, opened and checked against its handle.
-struct KeyedStream<'a> {
-    subtask_index: i32,
-    kg: &'a KeyGroupsStateHandle,
-    src: Source<'a>,
-}
-
-impl KeyedStream<'_> {
-    /// The stream's header, which runs from offset 0 to the first key-group.
-    fn header(&self) -> Result<Vec<u8>, String> {
-        let mut header = Vec::new();
-        self.src
-            .read_range(0, header_len(&self.kg.offsets, self.src.len()), &mut header)?;
-        Ok(header)
-    }
-}
-
-/// Open every keyed stream of `op`, in subtask order. A stream that cannot be opened goes to the
-/// second list instead, as a message naming its file: a caller must never take a broken file for
-/// a subtask without state.
-fn open_keyed_streams<'a>(
-    op: &'a Operator,
-    savepoint_dir: &Path,
-) -> (Vec<KeyedStream<'a>>, Vec<String>) {
-    let mut streams = Vec::new();
-    let mut errors = Vec::new();
-    for (subtask_index, kg) in keyed_handles(op) {
-        match source_for(effective_delegate(kg), savepoint_dir) {
-            Ok(Some(src)) => {
-                let what = match &src {
-                    Source::File { path, .. } => path.display().to_string(),
-                    Source::Mem(_) => format!("subtask {} (inline)", subtask_index),
-                };
-                match crate::state_file::check_offsets(
-                    &what,
-                    &kg.offsets,
-                    kg.start_key_group,
-                    src.len(),
-                ) {
-                    Ok(()) => streams.push(KeyedStream {
-                        subtask_index,
-                        kg,
-                        src,
-                    }),
-                    Err(e) => errors.push(e),
-                }
-            }
-            Ok(None) => {}
-            Err(e) => errors.push(e),
-        }
-    }
-    (streams, errors)
-}
-
 /// `"N state file(s) could not be read: <the first few>"`.
 fn unreadable(errors: &[String]) -> String {
     format!(
@@ -211,114 +60,6 @@ fn unreadable(errors: &[String]) -> String {
         errors.len(),
         crate::state_file::summarize(errors, 5)
     )
-}
-
-/// Read a whole stream into memory, resolving its handle exactly as [`source_for`] does (inline
-/// bytes, a file relative to the savepoint, an absolute `file:` path, or a segment of a shared
-/// file), with the same checks: a missing, unreadable or truncated file is an error naming it.
-///
-/// For operator-state streams, which the index reads in full like Flink does on restore
-/// (`OperatorStateRestoreOperation`); keyed streams are read one key-group at a time instead.
-pub(crate) fn read_whole_stream(
-    delegate: &StreamStateHandle,
-    savepoint_dir: &Path,
-) -> Result<Vec<u8>, String> {
-    let Some(src) = source_for(delegate, savepoint_dir)? else {
-        return Err("the state handle points at no stream".to_string());
-    };
-    let mut buf = Vec::new();
-    src.read_range(0, src.len(), &mut buf)?;
-    Ok(buf)
-}
-
-/// Unwrap the delegate of a keyed handle, which may itself nest a key-groups handle.
-fn effective_delegate(kg: &KeyGroupsStateHandle) -> &StreamStateHandle {
-    match &kg.delegate_handle {
-        StreamStateHandle::KeyGroups(nested) => &nested.delegate_handle,
-        other => other,
-    }
-}
-
-fn keyed_handles(op: &Operator) -> Vec<(i32, &KeyGroupsStateHandle)> {
-    op.subtask_states
-        .iter()
-        .filter_map(|st| match &st.managed_keyed_state {
-            StateHandle::KeyGroups(kg) => Some((st.subtask_index, kg)),
-            _ => None,
-        })
-        .collect()
-}
-
-/// Byte length of the header: it runs from offset 0 to the first key-group.
-fn header_len(offsets: &[i64], stream_len: u64) -> u64 {
-    offsets
-        .iter()
-        .copied()
-        .filter(|&o| o > 0)
-        .min()
-        .map(|o| o as u64)
-        .unwrap_or(stream_len)
-        .min(stream_len)
-}
-
-/// Resolve a state by name inside one operator, reading only that operator's header.
-fn resolve_state(header: &[u8], state_name: &str) -> Option<ResolvedState> {
-    let metas = extract_state_metadata(header);
-    let idx = metas.iter().position(|m| m.name == state_name)?;
-    let meta = &metas[idx];
-
-    let value_types = extract_value_serializer_types(header, &metas);
-    let value_pojo_classes = extract_value_pojo_classes(header, &metas);
-    let pojo_infos = extract_pojo_infos(header);
-
-    let is_timer = meta.state_type == "TIMER";
-    // Mirrors `index::builder`: timers carry a synthesized firing timestamp, and must not be
-    // matched against a nearby POJO snapshot.
-    let value_type = if is_timer {
-        "Date".to_string()
-    } else {
-        value_types.get(idx).cloned().unwrap_or_default()
-    };
-    let pojo = if is_timer {
-        None
-    } else {
-        value_pojo_classes
-            .get(idx)
-            .and_then(|o| o.as_ref())
-            .and_then(|cls| pojo_infos.iter().find(|p| &p.class_name == cls))
-            .cloned()
-    };
-
-    let key_type = meta.key_type.clone();
-    let key_pojo = if key_type == "Pojo" {
-        crate::parser::keyed_state::extract_key_pojo_info(header)
-    } else {
-        None
-    };
-    let state_types: Vec<String> = metas.iter().map(|m| m.state_type.clone()).collect();
-    let layouts = extract_entry_layouts(header, header.len());
-    let num_states = count_states_in_header(header, &metas);
-
-    let (map_key_type, map_value_type) = if meta.state_type == "MAP" {
-        crate::parser::value::split_map_types(&value_type)
-    } else {
-        (String::new(), String::new())
-    };
-
-    Some(ResolvedState {
-        state_id: idx as u16,
-        name: meta.name.clone(),
-        state_type: meta.state_type.clone(),
-        value_type,
-        pojo,
-        key_type,
-        key_pojo,
-        state_types,
-        layouts,
-        num_states,
-        map_key_type,
-        map_value_type,
-    })
 }
 
 /// Every operator holding a keyed state with this name, as `(hex operator id, state type)`.
@@ -355,34 +96,32 @@ pub struct StateListing {
 /// List every keyed state name in the savepoint, reading only the header of each subtask stream.
 pub fn list_states(savepoint: &Savepoint, savepoint_dir: &Path) -> StateListing {
     let mut listing = StateListing::default();
-    for op in &savepoint.operators {
-        let (streams, errors) = open_keyed_streams(op, savepoint_dir);
-        listing.errors.extend(errors);
+    for (op_index, op) in savepoint.operators.iter().enumerate() {
+        let ctx = OpContext::open(savepoint, op_index, savepoint_dir);
+        listing.errors.extend(ctx.open_errors());
         let op_hex = hex_id(&op.id);
         let mut seen = std::collections::HashSet::new();
         // Every subtask's header, not only the first one: a first file that cannot be read must
         // not hide the operator, and a state registered lazily exists only in the subtasks that
         // touched it.
-        for stream in &streams {
-            let header = match stream.header() {
+        for stream in &ctx.streams {
+            let header = match &stream.header {
                 Ok(h) => h,
                 Err(e) => {
-                    listing.errors.push(e);
+                    listing.errors.push(e.clone());
                     continue;
                 }
             };
-            for m in extract_state_metadata(&header) {
-                if seen.insert(m.name.clone()) {
-                    listing.states.push((op_hex.clone(), m.name, m.state_type));
+            for st in &header.states {
+                if seen.insert(st.name.clone()) {
+                    listing
+                        .states
+                        .push((op_hex.clone(), st.name.clone(), st.state_type.clone()));
                 }
             }
         }
     }
     listing
-}
-
-pub fn hex_id(id: &[u8; 16]) -> String {
-    id.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 /// One exported entry, handed to a [`RowSink`] as it is read.
@@ -494,10 +233,10 @@ pub fn export_state_rows<S: RowSink + ?Sized>(
 ) -> Result<ExportStats, String> {
     let mut stats = ExportStats::default();
 
-    let candidates: Vec<&Operator> = savepoint
-        .operators
-        .iter()
-        .filter(|op| operator.is_none_or(|want| hex_id(&op.id).starts_with(want)))
+    let candidates: Vec<usize> = (0..savepoint.operators.len())
+        .filter(|&i| {
+            operator.is_none_or(|want| hex_id(&savepoint.operators[i].id).starts_with(want))
+        })
         .collect();
     if candidates.is_empty() {
         return Err(format!(
@@ -511,34 +250,31 @@ pub fn export_state_rows<S: RowSink + ?Sized>(
     // multi-gigabyte export. Every subtask's stream is opened (which checks its file) and the
     // state is resolved from the first header holding it, so a bad first file is reported as
     // such instead of as "state not found".
-    type Target<'a> = (
-        &'a Operator,
-        ResolvedState,
-        Vec<KeyedStream<'a>>,
-        Vec<String>,
-    );
-    let mut targets: Vec<Target> = Vec::new();
+    let mut targets: Vec<(OpContext, Vec<String>)> = Vec::new();
     // Operators without the state in their readable headers, but with files that could not be
     // read: the state may be in those.
     let mut unread_elsewhere: Vec<(String, Vec<String>)> = Vec::new();
-    for op in candidates {
-        let (streams, mut errors) = open_keyed_streams(op, savepoint_dir);
-        let mut resolved = None;
-        for stream in &streams {
-            match stream.header() {
+    for op_index in candidates {
+        let ctx = OpContext::open(savepoint, op_index, savepoint_dir);
+        let mut errors = ctx.open_errors();
+        let mut resolved = false;
+        for stream in &ctx.streams {
+            match &stream.header {
                 Ok(header) => {
-                    resolved = resolve_state(&header, state_name);
-                    if resolved.is_some() {
+                    resolved = header.state_id(state_name).is_some();
+                    if resolved {
                         break;
                     }
                 }
-                Err(e) => errors.push(e),
+                Err(e) => errors.push(e.clone()),
             }
         }
         match resolved {
-            Some(rs) => targets.push((op, rs, streams, errors)),
-            None if !errors.is_empty() => unread_elsewhere.push((hex_id(&op.id), errors)),
-            None => {}
+            true => targets.push((ctx, errors)),
+            false if !errors.is_empty() => {
+                unread_elsewhere.push((hex_id(&savepoint.operators[op_index].id), errors))
+            }
+            false => {}
         }
     }
 
@@ -559,7 +295,10 @@ pub fn export_state_rows<S: RowSink + ?Sized>(
         }
         1 => {}
         _ => {
-            let ops: Vec<String> = targets.iter().map(|(op, ..)| hex_id(&op.id)).collect();
+            let ops: Vec<String> = targets
+                .iter()
+                .map(|(ctx, _)| hex_id(&savepoint.operators[ctx.op_index].id))
+                .collect();
             return Err(format!(
                 "state {:?} exists in {} operators ({}); narrow it with --operator <hex prefix>",
                 state_name,
@@ -569,7 +308,8 @@ pub fn export_state_rows<S: RowSink + ?Sized>(
         }
     }
 
-    let (op, _resolved, streams, errors) = targets.remove(0);
+    let (ctx, errors) = targets.remove(0);
+    let op = &savepoint.operators[ctx.op_index];
     let op_hex = hex_id(&op.id);
     if !errors.is_empty() {
         return Err(format!(
@@ -601,70 +341,47 @@ pub fn export_state_rows<S: RowSink + ?Sized>(
     let mut raw = Vec::new();
     let mut inflated = Vec::new();
 
-    for stream in &streams {
-        let (subtask_index, kg, src) = (stream.subtask_index, stream.kg, &stream.src);
-        let stream_len = src.len();
-        if stream_len == 0 {
+    let kg_prefix_len = kg_prefix_len(op.max_parallelism);
+    let op_index = ctx.op_index;
+    // By value: each subtask's file is closed once its key-groups are exported.
+    for stream in ctx.streams {
+        let subtask_index = stream.subtask_index;
+        if stream.src.len() == 0 {
             continue;
         }
         stats.subtasks += 1;
 
-        let hlen = header_len(&kg.offsets, stream_len);
-        let header = stream.header()?;
-        let compressed = read_keyed_stream_header(&header)
-            .map(|h| h.using_key_group_compression)
-            .unwrap_or(false);
+        let header = stream.header.as_ref().map_err(String::clone)?;
+        let compressed = header.compressed;
         stats.compressed |= compressed;
 
         // A subtask can register its states in its own order, so re-resolve per subtask rather
         // than reusing the first subtask's state id.
         // A subtask whose header does not register the state holds none of its entries: reading
         // it with another subtask's state id would decode a different state.
-        let Some(sub) = resolve_state(&header, state_name) else {
+        let Some(state_id) = header.state_id(state_name) else {
             continue;
         };
+        let sub = &header.states[state_id as usize];
 
-        let kg_prefix_len = if op.max_parallelism > 128 { 2 } else { 1 };
-
-        for (i, &offset) in kg.offsets.iter().enumerate() {
-            let start = offset;
-            if start <= 0 || (start as u64) < hlen || (start as u64) >= stream_len {
+        for i in 0..stream.offsets.len() {
+            let Some(range) = stream.block_range(i) else {
                 continue;
-            }
-            // The next key-group starts where this one ends; empty key-groups repeat an offset.
-            let end = kg.offsets[(i + 1)..]
-                .iter()
-                .copied()
-                .find(|&o| o > start)
-                .map(|o| o as u64)
-                .unwrap_or(stream_len)
-                .min(stream_len);
-            if end <= start as u64 {
-                continue;
-            }
-
-            src.read_range(start as u64, end, &mut raw)?;
-            let block = key_group_block(&raw, compressed, &mut inflated)
+            };
+            let bytes = stream.read_block(savepoint, op_index, range, &mut raw)?;
+            let block = key_group_block(bytes, compressed, &mut inflated)
                 .map_err(|e| format!("key-group {} snappy decode: {}", i, e))?;
             stats.max_block_bytes = stats.max_block_bytes.max(block.len());
             stats.key_groups += 1;
 
             // Absolute key-group, not the index within this subtask's range.
-            let absolute_kg = (kg.start_key_group + i as i32) as u16;
+            let absolute_kg = (stream.start_key_group + i as i32) as u16;
 
             let mut err: Option<String> = None;
             let parsed = parse_key_group_block(
                 block,
                 absolute_kg,
-                &KeyGroupParse {
-                    num_states: sub.num_states,
-                    key_type: &sub.key_type,
-                    kg_prefix_len,
-                    key_pojo: sub.key_pojo.as_ref(),
-                    state_types: &sub.state_types,
-                    layouts: &sub.layouts,
-                    only_state: Some(sub.state_id),
-                },
+                &header.parse_ctx(kg_prefix_len, Some(state_id)),
                 &mut |entry| {
                     if err.is_some() {
                         return;
@@ -674,28 +391,13 @@ pub fn export_state_rows<S: RowSink + ?Sized>(
                     // not the blob `index::builder` assembles per key. So a map exports exploded,
                     // one row per entry, which is also what keeps rows bounded when a single key
                     // holds millions of entries.
-                    let (map_key, value) = if sub.state_type == "MAP" {
-                        let (k, v) = crate::parser::value::decode_map_entry(
-                            &entry.namespace,
-                            &entry.value,
-                            &sub.map_key_type,
-                            &sub.map_value_type,
-                            sub.pojo.as_ref(),
-                            proto,
-                            stats.rows as usize,
-                        );
-                        (Some(k), v)
-                    } else {
-                        (
-                            None,
-                            crate::parser::value::decode_state_value(
-                                &entry.value,
-                                &sub.value_type,
-                                sub.pojo.as_ref(),
-                                proto,
-                            ),
-                        )
-                    };
+                    let (map_key, value) = decode_entry_value(
+                        sub,
+                        &entry.namespace,
+                        &entry.value,
+                        proto,
+                        stats.rows as usize,
+                    );
                     // A plain VALUE state has a 1-byte VoidNamespace; anything longer carries
                     // information (e.g. a window namespace) we cannot type yet, so keep it.
                     let namespace_hex = if map_key.is_none() && entry.namespace.len() > 1 {

@@ -8,62 +8,12 @@ use std::path::Path;
 use flink_explorer::export_state::{export_state_ndjson, list_states};
 use flink_explorer::index::builder::build_index;
 use flink_explorer::parser;
+use flink_explorer::parser::key_group::{
+    java_long_hash, java_string_hash, key_group_for_hash, murmur_hash, range_for_subtask,
+};
 use serde_json::Value;
 
 const SAVEPOINT_DIR: &str = "tests/fixtures/savepoint-gitlab";
-
-/// `org.apache.flink.util.MathUtils.bitMix` (flink-core, release-1.20).
-fn bit_mix(mut i: i32) -> i32 {
-    i ^= ((i as u32) >> 16) as i32;
-    i = i.wrapping_mul(0x85eb_ca6bu32 as i32);
-    i ^= ((i as u32) >> 13) as i32;
-    i = i.wrapping_mul(0xc2b2_ae35u32 as i32);
-    i ^= ((i as u32) >> 16) as i32;
-    i
-}
-
-/// `org.apache.flink.util.MathUtils.murmurHash` (flink-core, release-1.20).
-fn murmur_hash(mut code: i32) -> i32 {
-    code = code.wrapping_mul(0xcc9e_2d51u32 as i32);
-    code = code.rotate_left(15);
-    code = code.wrapping_mul(0x1b87_3593);
-
-    code = code.rotate_left(13);
-    code = code.wrapping_mul(5).wrapping_add(0xe654_6b64u32 as i32);
-
-    code ^= 4;
-    code = bit_mix(code);
-
-    if code >= 0 {
-        code
-    } else if code != i32::MIN {
-        -code
-    } else {
-        0
-    }
-}
-
-/// `KeyGroupRangeAssignment.computeKeyGroupForKeyHash` (flink-runtime, release-1.20).
-fn key_group_for_hash(key_hash: i32, max_parallelism: i32) -> i32 {
-    murmur_hash(key_hash) % max_parallelism
-}
-
-/// `java.lang.String.hashCode`.
-fn java_string_hash(s: &str) -> i32 {
-    let mut h: i32 = 0;
-    // Java hashes UTF-16 code units.
-    for c in s.encode_utf16() {
-        h = h.wrapping_mul(31).wrapping_add(c as i32);
-    }
-    h
-}
-
-/// `KeyGroupRangeAssignment.computeKeyGroupRangeForOperatorIndex` (flink-runtime, release-1.20).
-fn range_for_subtask(max_parallelism: i32, parallelism: i32, subtask: i32) -> (i32, i32) {
-    let start = (subtask * max_parallelism + parallelism - 1) / parallelism;
-    let end = ((subtask + 1) * max_parallelism - 1) / parallelism;
-    (start, end)
-}
 
 /// Every hash Flink could have used for this rendered key.
 fn plausible_hashes(key: &str) -> Vec<i32> {
@@ -72,7 +22,7 @@ fn plausible_hashes(key: &str) -> Vec<i32> {
         v.push(i); // Integer.hashCode
     }
     if let Ok(l) = key.parse::<i64>() {
-        v.push((l ^ ((l as u64) >> 32) as i64) as i32); // Long.hashCode
+        v.push(java_long_hash(l)); // Long.hashCode
     }
     v
 }

@@ -7,6 +7,7 @@ pub mod index;
 pub mod parser;
 pub mod profile;
 pub mod proto;
+pub mod reader;
 #[cfg(feature = "sst")]
 pub mod sst;
 pub mod state_file;

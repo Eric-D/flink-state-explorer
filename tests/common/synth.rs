@@ -62,6 +62,10 @@ pub enum Ser {
     /// `EnumSerializer` over an enum class and its constants, in ordinal order. Not a key: an
     /// enum's `hashCode()` is its identity hash.
     Enum(&'static str, &'static [&'static str]),
+    /// `DateSerializer` (java.util.Date).
+    Date,
+    /// `LocalDateSerializer` (java.time.LocalDate).
+    LocalDate,
     /// `TupleSerializer` over these field serializers (`Tuple2` for two fields, …).
     Tuple(&'static [Ser]),
     /// A user serializer the explorer cannot decode, by its snapshot class: a
@@ -122,6 +126,13 @@ impl Ser {
             }
             Ser::IntArray => {
                 "org.apache.flink.api.common.typeutils.base.array.IntPrimitiveArraySerializer$IntPrimitiveArraySerializerSnapshot"
+
+            }
+            Ser::Date => {
+                "org.apache.flink.api.common.typeutils.base.DateSerializer$DateSerializerSnapshot"
+            }
+            Ser::LocalDate => {
+                "org.apache.flink.api.common.typeutils.base.LocalDateSerializer$LocalDateSerializerSnapshot"
             }
             Ser::Opaque(class) => class,
             Ser::Tuple(_) | Ser::Ttl(_) => unreachable!("a tuple or TTL snapshot is composite"),
@@ -134,6 +145,12 @@ impl Ser {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Val {
     Str(String),
+    /// A Java `String` given as its UTF-16 units: it may hold a lone surrogate.
+    Utf16(Vec<u16>),
+    /// A `java.util.Date`, as epoch millis.
+    Date(i64),
+    /// A `java.time.LocalDate`: year, month, day.
+    LocalDate(i32, u8, u8),
     Long(i64),
     Int(i32),
     Bool(bool),
@@ -181,6 +198,15 @@ impl Val {
     fn encode_into(&self, out: &mut Vec<u8>) {
         match self {
             Val::Str(s) => write_string_value(out, s),
+            Val::Utf16(units) => write_string_units(out, units),
+            // DateSerializer.serialize: writeLong(getTime()).
+            Val::Date(v) => out.extend_from_slice(&v.to_be_bytes()),
+            // LocalDateSerializer.serialize: writeInt(year), writeByte(month), writeByte(day).
+            Val::LocalDate(y, m, d) => {
+                out.extend_from_slice(&y.to_be_bytes());
+                out.push(*m);
+                out.push(*d);
+            }
             Val::Long(v) => out.extend_from_slice(&v.to_be_bytes()),
             Val::Int(v) => out.extend_from_slice(&v.to_be_bytes()),
             Val::Bool(v) => out.push(*v as u8),
@@ -254,6 +280,18 @@ impl Val {
     pub fn java_hash(&self) -> i32 {
         match self {
             Val::Str(s) => java_string_hash(s),
+            Val::Utf16(units) => units
+                .iter()
+                .fold(0i32, |h, &c| h.wrapping_mul(31).wrapping_add(c as i32)),
+            // Date.hashCode: `(int) ht ^ (int) (ht >> 32)`.
+            Val::Date(t) => (*t as i32) ^ ((*t >> 32) as i32),
+            // LocalDate.hashCode: `(y & 0xFFFFF800) ^ ((y << 11) + (m << 6) + d)`.
+            Val::LocalDate(y, m, d) => {
+                (y & 0xFFFF_F800u32 as i32)
+                    ^ (y.wrapping_shl(11)
+                        .wrapping_add((*m as i32) << 6)
+                        .wrapping_add(*d as i32))
+            }
             Val::Long(l) => (l ^ ((*l as u64) >> 32) as i64) as i32,
             Val::Int(i) => *i,
             Val::Bool(b) => {
@@ -292,6 +330,10 @@ impl Val {
     pub fn render(&self) -> String {
         match self {
             Val::Str(s) => s.clone(),
+            Val::Utf16(_) | Val::Date(_) | Val::LocalDate(..) => match self.json() {
+                serde_json::Value::String(s) => s,
+                _ => unreachable!(),
+            },
             Val::Long(v) => v.to_string(),
             Val::Int(v) => v.to_string(),
             Val::Bool(v) => v.to_string(),
@@ -317,6 +359,30 @@ impl Val {
     pub fn json(&self) -> serde_json::Value {
         match self {
             Val::Str(s) => serde_json::Value::String(s.clone()),
+            // As a key renders it: a lone surrogate as `\uXXXX`, and then every backslash
+            // doubled; a plain string with a literal `\u` is escaped the same way.
+            Val::Utf16(units) => {
+                let decoded: Vec<Result<char, u16>> = char::decode_utf16(units.iter().copied())
+                    .map(|c| c.map_err(|e| e.unpaired_surrogate()))
+                    .collect();
+                let plain: String = decoded.iter().filter_map(|c| c.ok()).collect();
+                if decoded.iter().all(|c| c.is_ok()) && !plain.contains("\\u") {
+                    return serde_json::Value::String(plain);
+                }
+                let mut out = String::new();
+                for c in decoded {
+                    match c {
+                        Ok('\\') => out.push_str("\\\\"),
+                        Ok(c) => out.push(c),
+                        Err(u) => out.push_str(&format!("\\u{:04X}", u)),
+                    }
+                }
+                serde_json::Value::String(out)
+            }
+            Val::Date(v) => serde_json::Value::String(iso_millis(*v)),
+            Val::LocalDate(y, m, d) => {
+                serde_json::Value::String(format!("{:04}-{:02}-{:02}", y, m, d))
+            }
             Val::Long(v) => serde_json::json!(v),
             Val::Int(v) => serde_json::json!(v),
             Val::Bool(v) => serde_json::json!(v),
@@ -357,6 +423,30 @@ fn char_string(unit: u16) -> String {
     match char::from_u32(unit as u32) {
         Some(c) => c.to_string(),
         None => format!("\\u{:04X}", unit),
+    }
+}
+
+/// `millis` as UTC ISO-8601, milliseconds only when non-zero (an independent port of
+/// H. Hinnant's `civil_from_days`).
+fn iso_millis(millis: i64) -> String {
+    let secs = millis.div_euclid(1000);
+    let ms = millis.rem_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let sod = secs.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    let time = format!("{:02}:{:02}:{:02}", sod / 3600, sod % 3600 / 60, sod % 60);
+    if ms == 0 {
+        format!("{:04}-{:02}-{:02}T{}Z", y, m, d, time)
+    } else {
+        format!("{:04}-{:02}-{:02}T{}.{:03}Z", y, m, d, time, ms)
     }
 }
 
@@ -1343,8 +1433,13 @@ fn write_utf(out: &mut Vec<u8>, s: &str) {
 /// `StringValue.writeString`: var-length `charCount + 1`, then each UTF-16 unit var-length.
 pub fn write_string_value(out: &mut Vec<u8>, s: &str) {
     let units: Vec<u16> = s.encode_utf16().collect();
+    write_string_units(out, &units);
+}
+
+/// `StringValue.writeString` of a Java string given as its UTF-16 units.
+pub fn write_string_units(out: &mut Vec<u8>, units: &[u16]) {
     write_var(out, units.len() as u32 + 1);
-    for u in units {
+    for &u in units {
         write_var(out, u as u32);
     }
 }
