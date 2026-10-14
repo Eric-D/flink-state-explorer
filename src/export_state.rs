@@ -154,6 +154,38 @@ pub trait RowSink {
     fn finish(&mut self) -> Result<(), String>;
 }
 
+/// The JSON object of one row: what an NDJSON line holds, and what the web UI's `/api/` rows
+/// are (one shape, built in one place).
+pub fn row_json(row: &StateRow<'_>) -> Value {
+    let mut obj = json!({
+        "operator": row.operator,
+        "subtask": row.subtask,
+        "state": row.state,
+        "state_type": row.state_type,
+        "key": row.key,
+        "key_group": row.key_group,
+        "value": row.value,
+    });
+    if let Some(map) = obj.as_object_mut() {
+        if let Some(mk) = row.map_key {
+            map.insert("map_key".into(), Value::String(mk.to_string()));
+        } else if let Some(ns) = row.namespace_hex {
+            map.insert("namespace_hex".into(), Value::String(ns.to_string()));
+        }
+    }
+    obj
+}
+
+/// The namespace as a row shows it: hex when it carries more than the 1-byte VoidNamespace
+/// (e.g. a window), `None` for a MAP entry, whose namespace holds the map key.
+pub fn namespace_hex(namespace: &[u8], is_map_entry: bool) -> Option<String> {
+    if !is_map_entry && namespace.len() > 1 {
+        Some(namespace.iter().map(|b| format!("{:02x}", b)).collect())
+    } else {
+        None
+    }
+}
+
 /// One JSON object per line, keys in alphabetical order (serde_json's map ordering).
 pub struct NdjsonSink<W: Write> {
     out: W,
@@ -171,21 +203,7 @@ impl<W: Write> NdjsonSink<W> {
 
 impl<W: Write> RowSink for NdjsonSink<W> {
     fn row(&mut self, row: &StateRow<'_>) -> Result<(), String> {
-        let mut obj = json!({
-            "operator": row.operator,
-            "subtask": row.subtask,
-            "state": row.state,
-            "state_type": row.state_type,
-            "key": row.key,
-            "key_group": row.key_group,
-            "value": row.value,
-        });
-        let map = obj.as_object_mut().unwrap();
-        if let Some(mk) = row.map_key {
-            map.insert("map_key".into(), Value::String(mk.to_string()));
-        } else if let Some(ns) = row.namespace_hex {
-            map.insert("namespace_hex".into(), Value::String(ns.to_string()));
-        }
+        let obj = row_json(row);
         self.line.clear();
         serde_json::to_writer(&mut self.line, &obj).map_err(|e| format!("serialize row: {}", e))?;
         self.line.push(b'\n');
@@ -400,17 +418,7 @@ pub fn export_state_rows<S: RowSink + ?Sized>(
                     );
                     // A plain VALUE state has a 1-byte VoidNamespace; anything longer carries
                     // information (e.g. a window namespace) we cannot type yet, so keep it.
-                    let namespace_hex = if map_key.is_none() && entry.namespace.len() > 1 {
-                        Some(
-                            entry
-                                .namespace
-                                .iter()
-                                .map(|b| format!("{:02x}", b))
-                                .collect::<String>(),
-                        )
-                    } else {
-                        None
-                    };
+                    let namespace_hex = namespace_hex(&entry.namespace, map_key.is_some());
                     let row = StateRow {
                         operator: &op_hex,
                         subtask: subtask_index,

@@ -8,11 +8,15 @@ description = "TUI tool for exploring Apache Flink 1.20 savepoints interactively
 # RocksDB/SST reading (for external state files) is off by default: the canonical
 # heap-savepoint path never uses it, and dropping it keeps the default build pure-Rust
 # (no C++/libclang) so it cross-compiles to Windows trivially. Enable with `--features sst`.
-default = []
+default = ["web"]
 sst = ["dep:rocksdb"]
 # Parquet output for `--export-state --format parquet`. Off by default: arrow+parquet pull ~36
 # crates the TUI has no use for. `cargo audit`/`cargo deny` are clean on that tree.
 parquet = ["dep:parquet", "dep:arrow-array", "dep:arrow-schema"]
+# The browser UI (`--web`). On by default: the people it is for take the released binary.
+# hyper 1 + tokio (no macros, no multi-thread runtime), `cargo audit`/`cargo deny` clean.
+# `cargo build --no-default-features` gives the TUI-only binary.
+web = ["dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:tokio", "dep:getrandom"]
 
 [dependencies]
 ratatui = "0.30"
@@ -33,6 +37,13 @@ snap = "1"
 parquet = { version = "60", default-features = false, features = ["arrow", "zstd"], optional = true }
 arrow-array = { version = "60", optional = true }
 arrow-schema = { version = "60", optional = true }
+# `--web`: all of it is used by src/web/http.rs alone, so the server can be swapped there.
+hyper = { version = "1", default-features = false, features = ["server", "http1"], optional = true }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+tokio = { version = "1", default-features = false, features = ["rt", "net", "time", "sync", "signal"], optional = true }
+# The session token: 128 bits from the OS's CSPRNG.
+getrandom = { version = "0.3", optional = true }
 
 [dev-dependencies]
 # Build a Snappy-framed key-group in tests, to prove the compressed path decodes.
