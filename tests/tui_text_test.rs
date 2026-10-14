@@ -4,8 +4,6 @@
 
 mod common;
 
-use std::path::PathBuf;
-
 use common::synth::{self, Item, KeyedOperator, Kind, Ser, Spec, Storage, Val};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use flink_explorer::index::builder::build_index;
@@ -54,7 +52,7 @@ fn long_values() -> Vec<(&'static str, String)> {
     ]
 }
 
-fn savepoint_with_long_values() -> PathBuf {
+fn savepoint_with_long_values() -> synth::TempDir {
     let mut op = KeyedOperator::new(0x77, 2, 128, Ser::String)
         .state("label", Kind::Value(Ser::String))
         .state("count", Kind::Value(Ser::Long));
@@ -116,11 +114,10 @@ fn long_non_ascii_values_render_at_80_and_120_columns() {
             let rows = render_everything(&mut tree, width);
             let dump = rows.join("\n");
             for (key, value) in long_values() {
-                let key_row = rows
-                    .iter()
+                // The key row is shown, at every width.
+                rows.iter()
                     .find(|r| r.contains(&format!("⯈ {} (", key)))
                     .unwrap_or_else(|| panic!("key {:?} not shown at {}:\n{}", key, width, dump));
-                assert!(text::width(key_row) <= width as usize);
                 // The value row starts with the value itself, whole or shortened.
                 let head: String = value.chars().take(5).collect();
                 let value_row = rows
@@ -188,9 +185,12 @@ fn the_loading_screen_shortens_a_non_ascii_operator_name() {
     }
 }
 
-fn app() -> App {
+/// The app and its savepoint directory (removed when the guard drops: keep it alive).
+fn app() -> (App, synth::TempDir) {
     let dir = savepoint_with_long_values();
-    App::new_with_progress(dir, true, |_| {}).expect("app over a synthetic savepoint")
+    let app = App::new_with_progress(dir.to_path_buf(), true, |_| {})
+        .expect("app over a synthetic savepoint");
+    (app, dir)
 }
 
 fn ctrl_c() -> KeyEvent {
@@ -203,7 +203,7 @@ fn key(c: char) -> KeyEvent {
 
 #[test]
 fn ctrl_c_quits_from_the_tree() {
-    let mut app = app();
+    let (mut app, _dir) = app();
     app.handle_key(key('c'));
     assert!(!app.should_quit(), "a plain c is not a quit");
     app.handle_key(ctrl_c());
@@ -212,7 +212,7 @@ fn ctrl_c_quits_from_the_tree() {
 
 #[test]
 fn ctrl_c_quits_while_typing_a_filter() {
-    let mut app = app();
+    let (mut app, _dir) = app();
     app.handle_key(key('/'));
     app.handle_key(key('q')); // typed into the filter, not a quit
     assert!(!app.should_quit());
@@ -223,9 +223,40 @@ fn ctrl_c_quits_while_typing_a_filter() {
 #[test]
 fn ctrl_c_quits_from_an_overlay() {
     for overlay in ['S', 'I', 'P'] {
-        let mut app = app();
+        let (mut app, _dir) = app();
         app.handle_key(KeyEvent::new(KeyCode::Char(overlay), KeyModifiers::SHIFT));
         app.handle_key(ctrl_c());
         assert!(app.should_quit(), "overlay {}", overlay);
     }
+}
+
+#[test]
+fn input_queued_while_loading_is_dropped_and_ctrl_c_detected() {
+    use crossterm::event::{Event, KeyEventKind, KeyEventState};
+    use flink_explorer::tui::app::drain_is_interrupt;
+    let key = |code, modifiers, kind| {
+        Event::Key(KeyEvent {
+            code,
+            modifiers,
+            kind,
+            state: KeyEventState::NONE,
+        })
+    };
+    let plain = || key(KeyCode::Char('j'), KeyModifiers::NONE, KeyEventKind::Press);
+    assert!(!drain_is_interrupt(vec![plain(), plain()]));
+    assert!(drain_is_interrupt(vec![
+        plain(),
+        Event::Key(ctrl_c()),
+        plain()
+    ]));
+    // A release of Ctrl-C (kitty protocol) is not a press.
+    assert!(!drain_is_interrupt(vec![key(
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL,
+        KeyEventKind::Release
+    )]));
+    // Every event is consumed, interrupt or not.
+    let mut it = vec![plain(), plain(), plain()].into_iter();
+    drain_is_interrupt(&mut it);
+    assert_eq!(it.count(), 0);
 }

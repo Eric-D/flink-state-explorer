@@ -135,7 +135,7 @@ fail with the file's path and a non-zero exit code.
 | `P` | Profile picker |
 | `H` | Toggle hiding empty operators |
 | `D` | Toggle debug mode (extra type tags, key-groups) |
-| `q` / `Ctrl-C` | Quit (`Ctrl-C` also from the filter bar and overlays, and while loading) |
+| `q` / `Ctrl-C` | Quit (`Ctrl-C` also from the filter bar and overlays, and while loading — then the process is interrupted mid-build and exits with 130; once loaded, quitting is a normal exit, 0) |
 
 In the detail overlay: `Tab` switches the key/value panel, `↑`/`↓` scroll, `Esc` closes.
 

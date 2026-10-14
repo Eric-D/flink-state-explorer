@@ -554,6 +554,21 @@ impl App {
 }
 
 /// Ctrl-C, as a key event: in raw mode the terminal sends it to us instead of raising SIGINT.
+/// Consume every event in `events` and say whether one was a Ctrl-C press. The others are
+/// dropped on purpose: keys typed while the index loads would otherwise be replayed on a tree the
+/// user has not seen yet. `main` feeds it the events queued at each loading step.
+pub fn drain_is_interrupt(events: impl IntoIterator<Item = crossterm::event::Event>) -> bool {
+    let mut interrupted = false;
+    for event in events {
+        if let crossterm::event::Event::Key(key) = event {
+            if key.kind == crossterm::event::KeyEventKind::Press && is_interrupt(&key) {
+                interrupted = true;
+            }
+        }
+    }
+    interrupted
+}
+
 pub fn is_interrupt(key: &KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))

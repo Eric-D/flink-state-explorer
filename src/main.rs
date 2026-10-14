@@ -4,12 +4,12 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::Parser;
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event;
 use ratatui::prelude::*;
 use ratatui::Terminal;
 
 use flink_explorer::error::{AppError, UiError};
-use flink_explorer::tui::app::{is_interrupt, App};
+use flink_explorer::tui::app::App;
 use flink_explorer::tui::loading::{LoadingScreen, LoadingStep};
 use flink_explorer::tui::terminal::{restore_terminal, TerminalGuard};
 
@@ -127,21 +127,14 @@ fn load_and_run(
     app.run_with_terminal(terminal)
 }
 
-/// Read every input event already queued, without blocking, and say whether one was Ctrl-C. The
-/// others are dropped on purpose: keys typed while the index loads would otherwise be replayed
-/// on a tree the user has not seen yet.
+/// Read every input event already queued, without blocking, and say whether one was Ctrl-C
+/// (the rest are dropped: see `drain_is_interrupt`).
 fn take_queued_input() -> bool {
-    let mut interrupted = false;
-    while matches!(event::poll(Duration::ZERO), Ok(true)) {
-        match event::read() {
-            Ok(Event::Key(key)) if key.kind == KeyEventKind::Press && is_interrupt(&key) => {
-                interrupted = true
-            }
-            Ok(_) => {}
-            Err(_) => break,
-        }
-    }
-    interrupted
+    let queued = std::iter::from_fn(|| match event::poll(Duration::ZERO) {
+        Ok(true) => event::read().ok(),
+        _ => None,
+    });
+    flink_explorer::tui::app::drain_is_interrupt(queued)
 }
 
 /// Parse `_metadata` without building the (fully in-memory) index.

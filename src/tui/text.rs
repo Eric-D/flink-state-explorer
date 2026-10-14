@@ -1,5 +1,6 @@
 //! Shortening text for display. Everything here cuts on a `char` boundary and measures in
-//! terminal columns, the way ratatui lays text out: slicing a `&str` at a byte count panics as
+//! terminal columns, per `char` (ratatui measures whole grapheme clusters, so ZWJ / VS16 emoji
+//! sequences may be off by a column, and a cut may split such a cluster — never panic, though): slicing a `&str` at a byte count panics as
 //! soon as the cut lands inside a multi-byte character (`é`, CJK, emoji), and a byte count is
 //! not a width anyway (`é` is 2 bytes and 1 column, `日` is 3 bytes and 2 columns).
 

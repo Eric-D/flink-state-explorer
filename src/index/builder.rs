@@ -136,8 +136,8 @@ where
     // subtask, so that no more than `max_stored_partitions` are held from one to the next.
     let mut kept: Vec<Vec<KeyPartition>> = Vec::new();
 
-    // A keyed operator's state is split across subtasks by key group; merge them all so the
-    // explorer shows every key, not just the first subtask's.
+    // A keyed operator's state is split across subtasks by key group; merge them all. Up to the
+    // cap every key is kept; past it, `spread_quotas` gives each subtask an equal share.
     for sub in &op.subtask_states {
         collect_operator_states(sub, &mut states);
         match build_keyed_state(
@@ -169,6 +169,8 @@ where
     }
     if let Some(ks) = keyed_state.as_mut() {
         ks.partitions = kept.into_iter().flatten().collect();
+        // One sorted list rather than one sorted run per subtask, so paging reads in order.
+        ks.partitions.sort_unstable_by(|a, b| a.key.cmp(&b.key));
     }
 
     // Compute keyed state data size
