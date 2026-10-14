@@ -1,0 +1,48 @@
+:root {
+  --bg: #fbfbfa; --fg: #1d1d1f; --muted: #6b6b70; --line: #e2e2e4; --accent: #1f5fbf;
+  --code: #f1f1f3; --err: #b3261e; --key: #6a3fa0;
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #17171a; --fg: #e8e8ea; --muted: #9a9aa2; --line: #2e2e33; --accent: #7fb0ff;
+          --code: #222227; --err: #ff8a80; --key: #c9a7ff; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg);
+       font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { display: flex; justify-content: space-between; align-items: center; gap: 1rem;
+         padding: .6rem 1rem; border-bottom: 1px solid var(--line); }
+.crumbs { overflow-wrap: anywhere; }
+.crumbs span { color: var(--muted); }
+.ro { color: var(--muted); font-size: .85em; border: 1px solid var(--line); border-radius: 4px;
+      padding: 0 .4em; white-space: nowrap; }
+main { padding: 1rem; max-width: 1200px; }
+h1 { font-size: 1.4rem; margin: .3rem 0 .6rem; overflow-wrap: anywhere; }
+h2 { font-size: 1.1rem; margin: 1.2rem 0 .4rem; overflow-wrap: anywhere; }
+h2 small { color: var(--muted); font-weight: normal; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+table { border-collapse: collapse; width: 100%; margin: .4rem 0 1rem; }
+th, td { text-align: left; padding: .3rem .5rem; border-bottom: 1px solid var(--line);
+         vertical-align: top; overflow-wrap: anywhere; }
+th { font-weight: 600; color: var(--muted); }
+table.info th { width: 14rem; }
+.mono, pre, code, .key, .val, .tree { font-family: ui-monospace, Menlo, Consolas, monospace;
+                                     font-size: .9em; }
+.key { color: var(--key); }
+.meta, .note { color: var(--muted); }
+.error { color: var(--err); }
+pre { background: var(--code); padding: .6rem; overflow-x: auto; }
+form.lookup { margin: .6rem 0; }
+form.lookup input { width: min(28rem, 70vw); font: inherit; padding: .2rem .4rem; }
+.pager { margin: .6rem 0; display: flex; gap: 1rem; }
+.entry { border-top: 1px solid var(--line); }
+.tree ul { list-style: none; margin: 0; padding-left: 1.2rem; }
+.tree .k { color: var(--muted); }
+.tree .preview { color: var(--muted); }
+.tree details[open] > summary .preview { display: none; }
+.mapkey { color: var(--key); }
+.tree-tools button { font: inherit; margin-right: .4rem; }
+.warning { border: 1px solid var(--err); border-radius: 4px; padding: .4rem .8rem; margin: .6rem 0; }
+.warning ul { margin: .3rem 0; padding-left: 1.2rem; }
+.more { margin: .4rem 0; }

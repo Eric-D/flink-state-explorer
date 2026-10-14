@@ -262,6 +262,85 @@ windows has one entry per window (namespace bytes kept raw); `get` cannot locate
 `hashCode()` is user code) — scan for them. MAP *keys* inside values still render lone surrogates
 as U+FFFD.
 
+## Web UI: `--web` (`src/web`, feature `web`)
+
+`flink-explorer <savepoint> --web [--port N] [--bind IP] [--open]` (`--open` spawns
+`xdg-open`/`open`/`rundll32 url.dll,FileProtocolHandler <url>` — never `cmd /C start`, which
+parses `&` — and reaps the child on a detached thread): a read-only browser UI built
+**only on `reader::StateReader`** (never on `src/index`), so it opens at once and reads one
+key-group per request. Feature `web` is **on by default** (users take the released binary);
+`--no-default-features` is the TUI-only build and CI checks it (`cargo check
+--no-default-features --all-targets`). A build without it answers `--web` with an error.
+
+- **Crates**: hyper 1 (`server`, `http1`), hyper-util (`tokio` only — `TokioIo`, `TokioTimer`),
+  http-body-util, tokio (`rt`, `net`, `time`, `sync`, `signal`; **no** `macros`, no multi-thread
+  runtime: a current-thread runtime is built by hand), getrandom 0.3 (the token). All of
+  hyper/tokio is in **`src/web/http.rs`** alone (swap the server there); reader calls run in
+  `spawn_blocking`, each holding a permit of a `Semaphore` of `max_concurrent_reads()` (2×CPU,
+  2..=64; the permit moves into the blocking closure, so an abandoned request still counts until
+  its read ends: 400 parallel big pages used to reach 1.1 GB). At most `MAX_CONNECTIONS` (64)
+  connections hold a permit; one more is served by a service answering `web::busy()` (`503`,
+  `Retry-After`, security headers, `keep_alive(false)`), never reading the savepoint. Shutdown:
+  a `Notify` raced against `poll_accept` with `poll_fn` (no `select!`); `serve` also stops on
+  `tokio::signal::ctrl_c`, `start` (tests) does not.
+- **Everything else is plain functions**: `App::handle(&Request) -> Response` (`mod.rs`) runs the
+  guards then `pages::route`. Guards, in order, for **every** path incl. assets: method
+  `GET`/`HEAD` (405 + `Allow`); `host_allowed` (loopback names on any port — `ssh -L` with another
+  local port works — plus the bound IP, any IP literal when bound to the unspecified address; a
+  DNS name other than `localhost` is refused: that is what rebinding sends); `?token=` → 303 to
+  the same URL without it — a **200** HTML page with `<meta http-equiv="refresh"
+  content="0;url=…">` + a link, not a 303: a token link followed from another site is a
+  cross-site navigation, and a redirect in it may lose a just-set strict cookie; the refresh is a
+  navigation of our own origin (meta refresh is not under the CSP) — + `Set-Cookie:
+  flink_explorer_<port>=<token>; HttpOnly; SameSite=Strict; Path=/` (port in the name: cookies
+  are not port-scoped, which also means every other local port sees it — README says so); else
+  the cookie, or 403 without data. Then `SECURITY_HEADERS` (CSP `default-src 'none'; script-src
+  'self'; …`, `nosniff`, `no-referrer`, `no-store`, `X-Frame-Options`, `Cross-Origin-Resource-
+  Policy` and `Cross-Origin-Opener-Policy` `same-origin`) on every response, the 500 of a
+  panicked handler and the 503 included. Token: 16 bytes from
+  `getrandom::fill`, compared in constant time. HEAD: body dropped, `Content-Length` kept.
+- **Escaping is a type invariant** (`html.rs`): `Html` grows only by `text()`/`display()`
+  (escaped) or `raw(&'static str)` (templates). Never add a constructor taking a runtime `String`
+  unescaped. No data in `<script>`: `assets/app.js` is static (focus `/` → lookup, expand/collapse
+  all) and every page works without it. Paths from `_metadata` are never served: the only files are
+  the two `include_str!` assets.
+- **Values**: rendered from the reader's `serde_json::Value` (`<details>` tree, leaves through
+  `value_to_display`), raw namespace/value bytes as a hex dump (first 4 KiB). Nothing in `web`
+  decodes bytes. Table cells and tree summaries use `pages::preview` / `summary`, which produce
+  `value_to_display`'s text **cut while it is built** (a huge value costs the budget, not a
+  display string of its whole subtree; unit-tested equal when it fits).
+- **Big keys and broken files**: `--web` opens its reader `with_entry_limit(web::ENTRY_LIMIT)`
+  (200 per state per record); a key page renders the record only and, per `KeyRecord.truncated`
+  state, links to `/op/<id>/entries?at=&state=&offset=` (`StateReader::entries`, paged,
+  `limit` default 100) — a state page adds a "more entries" row, JSON twins carry `truncated`
+  (with the `more` API link). `KeyPage.unreadable` is shown as a `.warning` (subtask,
+  key-groups, file, error) and listed as `unreadable` in the JSON; `Lookup::Found.malformed` and
+  `KeyPage.malformed` as errors. A key position inside an unreadable range answers 500 naming the
+  file, not 404. `ReaderError` maps to the status (`From<ReaderError> for Fail`):
+  UnknownOperator/NoKeyedState/NotFound 404, AmbiguousOperator/BadCursor 400, the rest 500.
+  Path segments are decoded with `url_decode_path` (`+` stays `+`); `/op/` (empty prefix) is 404.
+- **Routes** (`pages.rs`): `/`, `/op/<id>`, `/op/<id>/keys`, `/op/<id>/state?name=`,
+  `/op/<id>/key?at=<cursor>` (a page of one from that cursor, which must be that key's own
+  position, else 404), `/op/<id>/lookup?key=` (`get`: Found → key view, Absent → key-group and
+  subtask, NeedsScan → says so), `/op/<id>/entries?at=&state=&offset=&limit=`,
+  `/assets/app.{css,js}`, and `/api/…` twins of each. `limit`
+  1..=1000 (default 100). **`/api/` rows are `export_state::row_json`** — the NDJSON line builder,
+  shared, so they are byte-identical to `--export-state` rows (`namespace_hex` likewise shared);
+  a state page filters the operator's key page, so it may hold fewer rows than `limit`.
+- **Operator state** is listed from `_metadata` only (name, mode, subtasks, element count), with
+  "use the TUI" for the values: the decoding lives in `index::builder`, which `web` must not use.
+- **Tests**: `tests/web_test.rs` (CI, `#![cfg(feature = "web")]`) starts `web::start` on
+  `127.0.0.1:0` over synth savepoints and speaks raw HTTP/1.1 over `TcpStream`: no/bad cookie or
+  token → 403 without data, token → strict cookie + clean redirect, foreign/rebinding `Host` (also
+  absolute-form targets) → 403, non-GET → 405, headers on every status, paged `/api/` rows ==
+  export rows for every state (inline and compressed files), lookup found/absent/hostile, hostile
+  key/value/map key escaped with exactly one (static) `<script>`, shutdown; the login page's
+  meta refresh (no `Location`, `//host` → `/`), CORP/COOP, `/op/` 404, an unreadable subtask's
+  warning + JSON + 500 key position, a capped key and its entries view (`with_entry_limit(1)`),
+  503 past `MAX_CONNECTIONS` idle connections and recovery, parallel requests past the read
+  permits all 200. Each guard was
+  reverted once to check its test fails. #23 (search, counts, downloads) builds on these routes.
+
 ## TUI: key cap, text, terminal
 
 - **Key cap.** The index (`src/index/builder.rs`) stores at most `MAX_STORED_PARTITIONS` (100 000)
@@ -555,7 +634,7 @@ source** (branch `release-1.20`, https://github.com/apache/flink) rather than gu
   `tests/keyed_block_test.rs` are the fixture-free home for file-backed / multi-subtask /
   compressed, operator-state, key-type and block-level cases, `tests/tui_*_test.rs` for the TUI
   over ratatui's `TestBackend`, `tests/state_reader_test.rs` and `tests/key_group_test.rs` for the
-  reader and the key-group assignment), so the fixture-dependent ones
+  reader and the key-group assignment, `tests/web_test.rs` for `--web`), so the fixture-dependent ones
   (`gitlab_savepoint_test`, `decode_e2e_test`, `coverage_audit`, `export_state_stream_test`,
   `key_group_assignment_test`, `compressed_savepoint_test`, `export_parquet_test`,
   `tui_gitlab_parity_test`, `state_reader_fixture_test`, `state_reader_big_test`) only ever run

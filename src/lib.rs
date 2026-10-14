@@ -12,3 +12,5 @@ pub mod reader;
 pub mod sst;
 pub mod state_file;
 pub mod tui;
+#[cfg(feature = "web")]
+pub mod web;
