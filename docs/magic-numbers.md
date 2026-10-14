@@ -123,6 +123,11 @@ priority-queue states such as timers, in one shared id space): `writeShort(kvSta
 state's entries, ending with `writeShort(END_OF_KEY_GROUP_MARK)`. Each entry is
 `BytePrimitiveArraySerializer.serialize(key)` then `serialize(value)` (each = int length + bytes).
 
+`FIRST_BIT_IN_BYTE_MASK` is the **metadata-follows flag**: `setMetaDataFollowsFlagInKey` sets it on
+`key[0]` of the last entry of each state's run (`FullSnapshotAsyncWriter.java:177/217`), and a
+`short` (next stateId or `END_OF_KEY_GROUP_MARK`) follows only such an entry
+(`FullSnapshotRestoreOperation.java:301-308`). It is the only delimiter of a run.
+
 > Because priority-queue (timer) states share the id space, a keyed state's stateId is **not**
 > necessarily its index among keyed states (e.g. a window operator's `window-contents` is stateId 1
 > when a timer priority-queue occupies stateId 0).

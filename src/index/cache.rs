@@ -19,7 +19,11 @@ use crate::error::IndexError;
 /// 4: operator-state elements are decoded from file-backed and compressed streams too (they were
 ///    `name[i]` placeholders and hex previews), and keep no copy of their bytes
 ///    ([`ValueRef::Decoded`]).
-pub const CACHE_FORMAT: u32 = 4;
+/// 5: a state's run of entries ends on Flink's metadata-follows flag, not on a key-length
+///    heuristic (a key over 10,000 bytes used to drop the rest of its key-group); header
+///    extractors read the whole header, not its first 50 KB (later states used to vanish); and
+///    `CachedKeyedState` reports malformed key-groups.
+pub const CACHE_FORMAT: u32 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IndexCache {
@@ -153,6 +157,16 @@ impl CachedOperator {
                 "Keyed states".to_string(),
                 format!("{} [{}]", names.len(), names.join(", ")),
             ));
+            if ks.malformed_key_groups > 0 {
+                v.push((
+                    "Malformed key-groups".to_string(),
+                    format!(
+                        "{} — entries past the defect were not read (first: {})",
+                        ks.malformed_key_groups,
+                        ks.first_malformed.as_deref().unwrap_or("?")
+                    ),
+                ));
+            }
         }
         if !self.states.is_empty() {
             let os: Vec<String> = self
@@ -175,6 +189,12 @@ pub struct CachedKeyedState {
     pub total_keys: usize,
     /// Key serializer type (e.g. "String", "Pojo", "Long")
     pub key_type: String,
+    /// Key-groups that could not be read to their end mark (truncated, a bad length, an unknown
+    /// stateId, a Snappy frame that does not decode), across all subtasks. The entries read
+    /// before each defect are indexed; the rest of that key-group is not.
+    pub malformed_key_groups: usize,
+    /// The first of them, as `key-group K: <defect>`.
+    pub first_malformed: Option<String>,
 }
 
 impl CachedKeyedState {
