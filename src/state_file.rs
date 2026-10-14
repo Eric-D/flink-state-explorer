@@ -2,8 +2,9 @@
 //!
 //! A missing, unreadable or truncated state file must surface as an error naming the file, never
 //! as "no state": read as an empty buffer, it used to make a subtask's keys vanish without a word
-//! (issue #16). The index (`index::builder`) and the streaming export (`export_state`) both open
-//! state files through here, so they report the same errors in the same words.
+//! (issue #16). The index (`index::builder`), the streaming export (`export_state`) and the
+//! [`crate::reader::StateReader`] all open state files through here, so they report the same errors
+//! in the same words.
 
 use std::fs::File;
 use std::io::Read;

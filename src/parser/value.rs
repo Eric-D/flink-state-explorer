@@ -968,7 +968,7 @@ fn bytes_to_value(b: &[u8]) -> Value {
 }
 
 /// Split a comma-separated generic argument list at the top level (ignoring nested `<...>`).
-fn split_top_level(s: &str) -> Vec<&str> {
+pub(crate) fn split_top_level(s: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0i32;
     let mut start = 0usize;
