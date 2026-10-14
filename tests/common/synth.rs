@@ -37,6 +37,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Scalar serializers this generator can write (keys, values, map keys/values, list elements).
+/// `CharArray` is a value only: Java arrays hash by identity, so one is never a key.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Ser {
     String,
@@ -44,11 +45,22 @@ pub enum Ser {
     Int,
     Boolean,
     Double,
+    Char,
+    CharArray,
 }
 
 impl Ser {
     fn snapshot_class(self) -> &'static str {
         match self {
+            // Both are `SimpleTypeSerializerSnapshot`s, like the others here (snapshot version 3,
+            // `SimpleTypeSerializerSnapshot.java:47`): `CharSerializer.java:94`,
+            // `CharPrimitiveArraySerializer.java:113`.
+            Ser::Char => {
+                "org.apache.flink.api.common.typeutils.base.CharSerializer$CharSerializerSnapshot"
+            }
+            Ser::CharArray => {
+                "org.apache.flink.api.common.typeutils.base.array.CharPrimitiveArraySerializer$CharPrimitiveArraySerializerSnapshot"
+            }
             Ser::String => {
                 "org.apache.flink.api.common.typeutils.base.StringSerializer$StringSerializerSnapshot"
             }
@@ -76,6 +88,10 @@ pub enum Val {
     Int(i32),
     Bool(bool),
     Double(f64),
+    /// A Java `char`: one UTF-16 code unit, possibly half of a surrogate pair.
+    Char(u16),
+    /// A Java `char[]`.
+    Chars(Vec<u16>),
 }
 
 impl Val {
@@ -92,6 +108,17 @@ impl Val {
             Val::Int(v) => out.extend_from_slice(&v.to_be_bytes()),
             Val::Bool(v) => out.push(*v as u8),
             Val::Double(v) => out.extend_from_slice(&v.to_bits().to_be_bytes()),
+            // `CharSerializer.serialize` = `writeChar` (`CharSerializer.java:66-68`), high byte
+            // first (`DataOutputSerializer.writeChar`, `DataOutputSerializer.java:167-173`).
+            Val::Char(c) => out.extend_from_slice(&c.to_be_bytes()),
+            // `CharPrimitiveArraySerializer.serialize`: `writeInt(length)`, then `writeChar` per
+            // element (`CharPrimitiveArraySerializer.java:73-77`).
+            Val::Chars(cs) => {
+                out.extend_from_slice(&(cs.len() as i32).to_be_bytes());
+                for c in cs {
+                    out.extend_from_slice(&c.to_be_bytes());
+                }
+            }
         }
         out
     }
@@ -113,6 +140,9 @@ impl Val {
                 let bits = d.to_bits() as i64;
                 (bits ^ ((bits as u64) >> 32) as i64) as i32
             }
+            // `Character.hashCode()` is the char's value.
+            Val::Char(c) => *c as i32,
+            Val::Chars(_) => panic!("a char[] is never a key: Java arrays hash by identity"),
         }
     }
 
@@ -124,9 +154,13 @@ impl Val {
             Val::Int(v) => v.to_string(),
             Val::Bool(v) => v.to_string(),
             Val::Double(v) => v.to_string(),
+            Val::Char(c) => char_string(*c),
+            Val::Chars(_) => self.json().to_string(),
         }
     }
 
+    /// The explorer's JSON for this value: a `char` is a one-character string, a `char[]` an
+    /// array of them.
     pub fn json(&self) -> serde_json::Value {
         match self {
             Val::Str(s) => serde_json::Value::String(s.clone()),
@@ -134,8 +168,18 @@ impl Val {
             Val::Int(v) => serde_json::json!(v),
             Val::Bool(v) => serde_json::json!(v),
             Val::Double(v) => serde_json::json!(v),
+            Val::Char(c) => serde_json::Value::String(char_string(*c)),
+            Val::Chars(cs) => cs
+                .iter()
+                .map(|c| serde_json::Value::String(char_string(*c)))
+                .collect(),
         }
     }
+}
+
+/// One UTF-16 unit as a string; a lone surrogate has no Rust `char` and is U+FFFD.
+fn char_string(unit: u16) -> String {
+    String::from_utf16(&[unit]).unwrap_or_else(|_| "\u{FFFD}".to_string())
 }
 
 /// The kind of a registered state.

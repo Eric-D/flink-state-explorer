@@ -432,6 +432,165 @@ fn ttl_and_broadcast_decode() {
     );
 }
 
+/// The fields of `AllFieldsPojo` that decode, in Flink's field order (`PojoTypeInfo` sorts them
+/// by name), up to and including `deepNested`.
+const ALL_FIELDS_DECODED: [&str; 11] = [
+    "boolArray",
+    "boolBoxed",
+    "boolField",
+    "byteArray",
+    "byteBoxed",
+    "byteField",
+    "charArray",
+    "charBoxed",
+    "charField",
+    "dateField",
+    "deepNested",
+];
+
+/// One `AllFieldsPojo` value, as `AllFieldsProcessFunction.buildPojo` (test-flink-job) fills it.
+fn assert_all_fields_pojo(v: &Value, ctx: &str) {
+    let obj = v
+        .as_object()
+        .unwrap_or_else(|| panic!("{}: not an object: {}", ctx, v));
+    assert_eq!(obj.len(), 43, "{}: AllFieldsPojo has 43 fields", ctx);
+    assert_eq!(
+        obj["boolArray"],
+        serde_json::json!([true, false, true, true])
+    );
+    assert_eq!(obj["boolBoxed"], serde_json::json!(false));
+    assert_eq!(obj["boolField"], serde_json::json!(true));
+    assert_eq!(obj["byteArray"], serde_json::json!("Hello"));
+    assert_eq!(obj["byteBoxed"], serde_json::json!(-1));
+    assert_eq!(obj["byteField"], serde_json::json!(42));
+    // #25: `char[]`, `Character` and `char` decode — and no longer stop the POJO.
+    assert_eq!(
+        obj["charArray"],
+        serde_json::json!(["X", "Y", "Z"]),
+        "{}",
+        ctx
+    );
+    assert_eq!(obj["charBoxed"], serde_json::json!("Z"), "{}", ctx);
+    assert_eq!(obj["charField"], serde_json::json!("A"), "{}", ctx);
+    assert!(
+        obj["dateField"].as_str().is_some_and(|s| s.ends_with('Z')),
+        "{}: dateField is an ISO date: {}",
+        ctx,
+        obj["dateField"]
+    );
+    // `DeepNested.innerList` is a `List` field, which Flink 1.20 serializes with Kryo (the
+    // snapshot says `KryoSerializer`): its length is unknown, so decoding stops there, visibly.
+    assert_eq!(
+        obj["deepNested"],
+        serde_json::json!({
+            "innerAddress": { "city": "Lyon", "street": "456 Oak Ave", "zipCode": 69001 },
+            "innerEnum": "ARCHIVE",
+            "innerList": "[Kryo]",
+            "label": "[not decoded: follows innerList]",
+        }),
+        "{}",
+        ctx
+    );
+    // Every later field is marked, not null — although some of them are null in Flink
+    // (`nullString`, `shortBoxed`, ...), none can be located any more.
+    for (name, value) in obj {
+        if !ALL_FIELDS_DECODED.contains(&name.as_str()) {
+            assert_eq!(
+                value,
+                &serde_json::json!("[not decoded: follows deepNested]"),
+                "{}: field {}",
+                ctx,
+                name
+            );
+        }
+    }
+}
+
+#[test]
+fn all_fields_pojo_decodes_past_its_char_fields_or_says_why_not() {
+    // Index path (the JSON export, and the TUI's data).
+    let index = load_index();
+    let json = export(&index, None);
+    let mut seen = 0;
+    for op in json["operators"].as_array().unwrap() {
+        for k in op["keys"].as_array().unwrap() {
+            let key = k["key"].as_str().unwrap_or("?");
+            if let Some(v) = k["states"].get("all-fields-pojo").filter(|v| !v.is_null()) {
+                assert_all_fields_pojo(v, &format!("index all-fields-pojo {}", key));
+                seen += 1;
+            }
+            if let Some(m) = k["states"].get("all-fields-map").filter(|v| !v.is_null()) {
+                for (mk, v) in m.as_object().expect("a map") {
+                    assert_all_fields_pojo(v, &format!("index all-fields-map {} {}", key, mk));
+                    seen += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        seen >= 16,
+        "expected the fixture's 8 keys in both states, saw {}",
+        seen
+    );
+
+    // Streaming path (NDJSON/Parquet rows).
+    let dir = Path::new(SAVEPOINT_DIR);
+    let savepoint = parser::parse_metadata(&dir.join("_metadata")).unwrap();
+    for state in ["all-fields-pojo", "all-fields-map"] {
+        let mut out = Vec::new();
+        flink_explorer::export_state::export_state_ndjson(
+            &savepoint, dir, None, state, None, &mut out,
+        )
+        .expect("export");
+        let rows: Vec<Value> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert!(!rows.is_empty());
+        for row in &rows {
+            assert_all_fields_pojo(&row["value"], &format!("stream {} {}", state, row["key"]));
+        }
+    }
+
+    // The TUI's display string, through the same decoder: values and markers, no `null`.
+    let op = index
+        .operators
+        .iter()
+        .find(|o| {
+            o.keyed_state
+                .as_ref()
+                .is_some_and(|k| k.descriptors.iter().any(|d| d.name == "all-fields-pojo"))
+        })
+        .unwrap();
+    let ks = op.keyed_state.as_ref().unwrap();
+    let si = ks
+        .descriptors
+        .iter()
+        .position(|d| d.name == "all-fields-pojo")
+        .unwrap();
+    let pi = flink_explorer::tui::tree::cached_pojo_to_pojo_info(
+        ks.descriptors[si].pojo_info.as_ref().expect("POJO info"),
+    );
+    let raw = ks.partitions[0].values[si].as_deref().expect("a value");
+    let shown = parser::pojo::deserialize_pojo_to_json(raw, &pi, None);
+    for part in [
+        "charArray: [\"X\", \"Y\", \"Z\"]",
+        "charBoxed: \"Z\"",
+        "charField: \"A\"",
+        "innerList: [Kryo]",
+        "label: [not decoded: follows innerList]",
+        "stringMap: [not decoded: follows deepNested]",
+    ] {
+        assert!(shown.contains(part), "TUI shows {:?}: {}", part, shown);
+    }
+    assert!(
+        !shown.contains(": null"),
+        "no null value in the TUI rendering: {}",
+        shown
+    );
+}
+
 #[test]
 fn value_class_in_export() {
     let json = export(&load_index(), None);

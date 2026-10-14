@@ -111,7 +111,9 @@ tests assert that. The Parquet `value` column is **typed per export**, since one
 state and a state has one value serializer: `Int64`/`Float64`/`Boolean`/`Utf8` for scalars, and
 `Utf8` holding compact JSON for anything structured (POJO, Map, List, Tuple, arrays, Kryo). The
 `value_type` column carries the Flink serializer type so a reader can tell the two `Utf8` cases
-apart. Files are zstd-compressed, written in 65 536-row row groups.
+apart. A `value_note` column says why `value` is NULL when the state did hold something
+(the decoder's marker, or JSON the typed column cannot hold); NULL `value` with NULL note is a
+value Flink stored as null. Files are zstd-compressed, written in 65 536-row row groups.
 
 `src/export_state.rs` deliberately bypasses `src/index`, because the index holds every key and
 every raw value in memory. Instead it reads only each subtask's **header** (it ends where the first
@@ -211,8 +213,24 @@ do **not** add a second decoder. To support a new type, add it here once.
   profile with a matching `[[proto_patterns]]` is loaded (`src/proto/`). `.proto` files are
   gitignored (project-specific).
 
+### `null` vs "could not decode"
+`null` in a decoded value is only ever a null Flink stored (null POJO field/POJO, `NullableSerializer`
+null, null `StringValue`, null `GenericArraySerializer` element). What could not be decoded is a
+**string marker** instead (`value.rs` module docs; `undecodable`, `not_decoded_after`, `is_marker`):
+`"[Kryo]"`, `"[undecodable: <type>]"` (unknown serializer, a POJO subclass, or bytes that end
+early), `"[not decoded: follows <field>]"` for every POJO/tuple field after one whose length is
+unknown, and `"[not decoded: <n> more elements]"` closing a list cut short. Internally this is
+`Decoded = Result<Value, Value>`: `Err` carries the partial value and means the reader position is
+lost, which is how a nested POJO's failure stops its parent (it used to read on, from garbage).
+`value_to_display` prints markers without quotes; the TUI's per-field POJO view uses the same
+markers (`read_field_value_pub` → `Result`). In a typed Parquet scalar column a marker is NULL
+(only truncated bytes produce one there).
+
 ### Decoded correctly
-Scalars, date/time (`Date`/`Timestamp`/`Instant`; note: Flink serializes `java.time.LocalDate`/
+Scalars, `char`/`Character` (`Char` → a one-character string) and `char[]` (an array of them; a
+lone surrogate becomes U+FFFD), strings with characters outside the BMP (`StringValue` writes
+UTF-16 units, so surrogate pairs are decoded together), date/time (`Date`/`Timestamp`/`Instant`;
+note: Flink serializes `java.time.LocalDate`/
 `LocalTime`/`LocalDateTime` POJO fields with **Kryo**, so they show as `[Kryo]` — the dedicated
 `Local*Serializer` formats are still handled in `value.rs` for the explicit-state case, layouts
 verified vs Flink: `LocalDate`=int+byte+byte, `LocalTime`=byte+byte+byte+int, `LocalDateTime`=13B),
@@ -283,7 +301,14 @@ don't store a user class — only the serializer class, which implies the type.
 
 ### Known decode limitations
 - **Kryo** values are not decoded — marked `[Kryo]`. An undecodable field stops decoding of the
-  rest of that POJO (length unknown), so following fields show `null`.
+  rest of that POJO, and of the POJOs around it (length unknown): the following fields are marked
+  `[not decoded: follows <field>]`. Flink 1.20 serializes `List`/`Map` POJO fields with Kryo too
+  (interfaces are a `GenericTypeInfo`), so on the fixture's `AllFieldsPojo` decoding stops at
+  `deepNested.innerList`: everything after `deepNested` is marked.
+- A **POJO subclass** instance (`PojoSerializer` flags `IS_SUBCLASS`/`IS_TAGGED_SUBCLASS`) is
+  written by the subclass's own serializer, which the parent's snapshot doesn't describe: marked
+  `[undecodable: subclass …]`.
+- `MapSerializer` **POJO fields** (explicit `MapTypeInfo`) are not decoded (`[undecodable: Map<…>]`).
 - The **window namespace** itself (TimeWindow start/end) isn't surfaced as a field — only the
   window's buffered contents and its firing timer are shown; if one key has multiple windows, only
   the first window's contents is kept per key.
@@ -337,7 +362,14 @@ source** (branch `release-1.20`, https://github.com/apache/flink) rather than gu
 - **VoidNamespace** = 1 byte; a window's namespace is a `TimeWindow` = two `long`s (start, end).
 - **Enum** — `EnumSerializerSnapshot`: `writeUTF(enumClass)` + `int(n)` + `n × writeUTF(constant)`
   (constants in ordinal order).
-- **String** — Flink `StringValue`: var-int length = `charCount + 1`, then var-int chars.
+- **String** — Flink `StringValue` (`flink-core/.../types/StringValue.java`): var-int length =
+  `charCount + 1` (`0` = null — `StringSerializer` writes null Strings), then each **UTF-16 unit**
+  var-int (`charAt`, so a non-BMP char is two surrogate units).
+- **Char** — `CharSerializer` = `writeChar`: 2 bytes, high byte first. `char[]`
+  (`CharPrimitiveArraySerializer`) = `int` length + `writeChar` per element.
+- **POJO** — `PojoSerializer.serialize`: flags byte (`IS_NULL`=1, `NO_SUBCLASS`=2, `IS_SUBCLASS`=4
+  → `writeUTF(class)`, `IS_TAGGED_SUBCLASS`=8 → `writeByte(tag)`), then, for `NO_SUBCLASS`, per
+  field `writeBoolean(isNull)` + the field; fields in name order (`PojoTypeInfo` sorts them).
 - **Operator-state stream** — `DefaultOperatorStateBackendSnapshotStrategy.java:165-212` +
   `OperatorBackendSerializationProxy.java:97-103`: `writeInt(6)`, `writeBoolean(usingStateCompression)`
   and the meta info, never compressed; then **one** `CompressibleFSDataOutputStream` (Snappy-framed when
@@ -357,7 +389,14 @@ source** (branch `release-1.20`, https://github.com/apache/flink) rather than gu
   (`gitlab_savepoint_test`, `decode_e2e_test`, `coverage_audit`, `export_state_stream_test`,
   `key_group_assignment_test`, `compressed_savepoint_test`, `export_parquet_test`) only ever run
   locally.
-- `tests/decode_e2e_test.rs` — protobuf, tuples, primitive arrays, full-POJO, scrollbar.
+- `tests/decode_e2e_test.rs` — protobuf, tuples, primitive arrays, full-POJO, scrollbar, and
+  `AllFieldsPojo` field by field (chars decoded, then explicit markers — no `null`) on the index,
+  streaming and TUI-display paths.
+- `tests/value_decode_test.rs` (CI) — `parser::value` on hand-written Flink bytes: `Char`, `char[]`,
+  an emoji string, null Strings, every marker (Kryo, unknown serializer, truncated bytes, nested
+  POJO, list, tuple, subclass, map key) and their TUI rendering. Reader-level `StringValue` and
+  `readChar` cases are in `tests/java_deser_test.rs`; `synth_savepoint_test.rs` runs `Char`,
+  `char[]`, `List<Char>`, `Map<String,Char>` and emoji keys/values through both read paths.
 - `tests/coverage_audit.rs` — dumps the full operator/state inventory + decoded values (diagnostic).
 - `tests/gitlab_savepoint_test.rs` — exhaustive per-state assertions.
 - `tests/export_parquet_test.rs` — **needs `--features parquet`**: the file is well-formed, the

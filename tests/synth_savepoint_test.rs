@@ -733,3 +733,138 @@ fn a_malformed_key_group_is_reported_by_the_export_the_index_and_the_cli() {
         stderr
     );
 }
+
+/// The explorer's value for each key of `state`, derived from the items alone (a MAP state as one
+/// object per key, as the index path stores it).
+fn expected_by_key(op: &KeyedOperator, state: usize) -> BTreeMap<String, Value> {
+    let mut out: BTreeMap<String, Value> = BTreeMap::new();
+    for item in op.items.iter().filter(|i| i.state() == state) {
+        let key = item.key().render();
+        match item {
+            Item::Value { value, .. } => {
+                out.insert(key, value.json());
+            }
+            Item::MapEntry { map_key, value, .. } => {
+                let entry = out.entry(key).or_insert_with(|| json!({}));
+                entry[map_key.render()] = value.as_ref().map_or(Value::Null, Val::json);
+            }
+            Item::List { values, .. } => {
+                out.insert(key, values.iter().map(Val::json).collect());
+            }
+            Item::Timer { .. } => {}
+        }
+    }
+    out
+}
+
+/// `char`, `char[]` and strings outside the BMP, through both read paths (#25): the value types
+/// come from the serializer snapshots in the header, and keys holding an emoji keep it.
+#[test]
+fn char_and_non_bmp_string_states_decode_on_both_paths() {
+    let keys = ["plain", "café", "emoji-😀", "flag-🇫🇷", "math-𝔸"];
+    let names = ["initial", "letters", "label", "grade", "typed"];
+    let mut op = KeyedOperator::new(0x62, 2, 128, Ser::String)
+        .state(names[0], Kind::Value(Ser::Char))
+        .state(names[1], Kind::Value(Ser::CharArray))
+        .state(names[2], Kind::Value(Ser::String))
+        .state(names[3], Kind::Map(Ser::String, Ser::Char))
+        .state(names[4], Kind::List(Ser::Char));
+    // 'A', 'B', 'é', a lone high surrogate (a `char` may hold half of a pair), 'Z'.
+    let initials = [0x41u16, 0x42, 0xE9, 0xD83D, 0x5A];
+    for (key, initial) in keys.iter().zip(initials) {
+        let units: Vec<u16> = key.encode_utf16().collect();
+        let key = Val::str(key);
+        op.items.push(Item::Value {
+            state: 0,
+            key: key.clone(),
+            value: Val::Char(initial),
+        });
+        op.items.push(Item::Value {
+            state: 1,
+            key: key.clone(),
+            value: Val::Chars(units.clone()),
+        });
+        op.items.push(Item::Value {
+            state: 2,
+            key: key.clone(),
+            value: Val::Str(format!("{} ✓ 😀", key.render())),
+        });
+        op.items.push(Item::MapEntry {
+            state: 3,
+            key: key.clone(),
+            map_key: Val::str("first"),
+            value: Some(Val::Char(units[0])),
+        });
+        op.items.push(Item::List {
+            state: 4,
+            key,
+            values: units.iter().map(|&u| Val::Char(u)).collect(),
+        });
+    }
+    let mut spec = Spec::new(Storage::Files);
+    spec.operators.push(op.clone());
+    let dir = write(&spec, "chars");
+
+    // Streaming export.
+    for (i, name) in names.iter().enumerate() {
+        assert_eq!(
+            projected(&rows(&dir, name)),
+            expected_rows(&op, i),
+            "state {}",
+            name
+        );
+    }
+    // The same against literals, not the generator's own rendering.
+    let value_of = |state: &str, key: &str| {
+        rows(&dir, state)
+            .into_iter()
+            .find(|r| r["key"] == key)
+            .unwrap_or_else(|| panic!("no row for key {:?} in {}", key, state))["value"]
+            .clone()
+    };
+    assert_eq!(value_of("label", "emoji-😀"), json!("emoji-😀 ✓ 😀"));
+    assert_eq!(value_of("label", "flag-🇫🇷"), json!("flag-🇫🇷 ✓ 😀"));
+    assert_eq!(value_of("initial", "emoji-😀"), json!("é"));
+    assert_eq!(value_of("initial", "flag-🇫🇷"), json!("\u{FFFD}"));
+    assert_eq!(value_of("letters", "café"), json!(["c", "a", "f", "é"]));
+    assert_eq!(
+        value_of("typed", "math-𝔸"),
+        json!(["m", "a", "t", "h", "-", "\u{FFFD}", "\u{FFFD}"])
+    );
+
+    // Index (TUI) path: the value types read from the header, every key intact, same values.
+    let savepoint = parser::parse_metadata(&dir.join("_metadata")).unwrap();
+    let index = build_index(&savepoint, 0, 0, &dir);
+    let ks = index.operators[0]
+        .keyed_state
+        .as_ref()
+        .expect("keyed state indexed");
+    let types: Vec<&str> = ks
+        .descriptors
+        .iter()
+        .map(|d| d.value_type.as_str())
+        .collect();
+    assert_eq!(
+        types,
+        ["Char", "char[]", "String", "Map<String,Char>", "List<Char>"]
+    );
+    let indexed_keys: BTreeSet<&str> = ks.partitions.iter().map(|p| p.key.as_str()).collect();
+    assert_eq!(indexed_keys, keys.into_iter().collect());
+    for (i, desc) in ks.descriptors.iter().enumerate() {
+        let got: BTreeMap<String, Value> = ks
+            .partitions
+            .iter()
+            .map(|p| {
+                let raw = p.values[i].as_deref().expect("every key has every state");
+                let v = flink_explorer::parser::value::decode_state_value(
+                    raw,
+                    &desc.value_type,
+                    None,
+                    None,
+                );
+                (p.key.clone(), v)
+            })
+            .collect();
+        assert_eq!(got, expected_by_key(&op, i), "state {}", desc.name);
+    }
+}

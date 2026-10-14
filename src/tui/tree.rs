@@ -989,6 +989,7 @@ fn parse_pojo_fields_for_display(
     proto_ctx: Option<&ProtoContext>,
 ) -> Vec<(String, String)> {
     use crate::parser::java_deser::JavaReader;
+    use crate::parser::value::{not_decoded_after, undecodable, value_to_display};
 
     let mut r = JavaReader::new(raw);
 
@@ -1000,22 +1001,34 @@ fn parse_pojo_fields_for_display(
     if flags & 0x01 != 0 {
         return vec![("(value)".to_string(), "null".to_string())];
     }
-    if flags & 0x08 != 0 {
-        let _ = r.read_int(); // subclass tag
-    } else if flags & 0x04 != 0 {
-        let _ = r.read_utf(); // subclass name
+    if flags & (0x04 | 0x08) != 0 {
+        // A subclass instance has a layout of its own: show the single decoder's marker.
+        let value = crate::parser::value::decode_pojo(&mut JavaReader::new(raw), info, proto_ctx);
+        let shown = value_to_display(&crate::parser::value::value_of(value));
+        return vec![("(value)".to_string(), shown)];
     }
 
     let mut fields = Vec::new();
-    let mut ok = true;
+    // The first field that could not be fully decoded: nothing after it can be located.
+    let mut lost: Option<String> = None;
     for field in info.fields.iter() {
-        if !ok {
-            fields.push((field.name.clone(), "...".to_string()));
+        if let Some(after) = &lost {
+            fields.push((
+                field.name.clone(),
+                value_to_display(&not_decoded_after(after)),
+            ));
             continue;
         }
         let is_null = match r.read_boolean() {
             Ok(b) => b,
-            Err(_) => break,
+            Err(_) => {
+                fields.push((
+                    field.name.clone(),
+                    value_to_display(&undecodable(&field.type_name)),
+                ));
+                lost = Some(field.name.clone());
+                continue;
+            }
         };
         if is_null {
             fields.push((field.name.clone(), "null".to_string()));
@@ -1054,14 +1067,20 @@ fn parse_pojo_fields_for_display(
                             fields.push((field.name.clone(), format!("[{} bytes]", bytes.len())));
                         }
                         Err(_) => {
-                            fields.push((field.name.clone(), "?".to_string()));
-                            ok = false;
+                            fields.push((
+                                field.name.clone(),
+                                value_to_display(&undecodable(&field.type_name)),
+                            ));
+                            lost = Some(field.name.clone());
                         }
                     }
                 }
                 _ => {
-                    fields.push((field.name.clone(), "?".to_string()));
-                    ok = false;
+                    fields.push((
+                        field.name.clone(),
+                        value_to_display(&undecodable(&field.type_name)),
+                    ));
+                    lost = Some(field.name.clone());
                 }
             }
             continue;
@@ -1072,15 +1091,10 @@ fn parse_pojo_fields_for_display(
             field.nested_pojo.as_deref(),
             proto_ctx,
         ) {
-            Some(val) => {
-                if val.contains('?') || val.contains("...") {
-                    ok = false;
-                }
-                fields.push((field.name.clone(), val));
-            }
-            None => {
-                fields.push((field.name.clone(), "?".to_string()));
-                ok = false;
+            Ok(val) => fields.push((field.name.clone(), val)),
+            Err(partial) => {
+                fields.push((field.name.clone(), partial));
+                lost = Some(field.name.clone());
             }
         }
     }
@@ -1909,5 +1923,64 @@ fn format_key_preview(key: &[u8]) -> String {
                 hex
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(fields: &[(&str, &str)]) -> PojoInfo {
+        PojoInfo {
+            class_name: "com.example.P".to_string(),
+            short_name: "P".to_string(),
+            fields: fields
+                .iter()
+                .map(|(n, t)| PojoField {
+                    name: n.to_string(),
+                    type_name: t.to_string(),
+                    nested_pojo: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn pairs(expected: &[(&str, &str)]) -> Vec<(String, String)> {
+        expected
+            .iter()
+            .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn expanded_pojo_fields_use_the_decoder_markers() {
+        // NO_SUBCLASS, then per field writeBoolean(isNull=false) + the value.
+        let raw = [
+            0x02, 0x00, 0x00, 0x41, // c: Char 'A'
+            0x00, 0x01, 0x02, // k: Kryo, length unknown
+            0x00, 0, 0, 0, 7, // z: Int, unreachable
+        ];
+        let p = info(&[("c", "Char"), ("k", "KryoSerializer"), ("z", "Int")]);
+        assert_eq!(
+            parse_pojo_fields_for_display(&raw, &p, None),
+            pairs(&[
+                ("c", "\"A\""),
+                ("k", "[Kryo]"),
+                ("z", "[not decoded: follows k]"),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_question_mark_in_a_string_does_not_stop_the_expanded_view() {
+        let raw = [
+            0x02, 0x00, 0x05, b'w', b'h', b'y', b'?', // s: "why?"
+            0x00, 0, 0, 0, 7, // n: 7
+        ];
+        let p = info(&[("s", "String"), ("n", "Int")]);
+        assert_eq!(
+            parse_pojo_fields_for_display(&raw, &p, None),
+            pairs(&[("s", "\"why?\""), ("n", "7")])
+        );
     }
 }
