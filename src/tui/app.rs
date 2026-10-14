@@ -246,10 +246,19 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => self.tree_view.move_up(),
             KeyCode::Down | KeyCode::Char('j') => self.tree_view.move_down(),
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                if let Some((key, value)) = self.tree_view.expand() {
-                    self.detail.open(key, value);
+                if !self.tree_view.expand() {
+                    // A leaf: open the bytes behind it, if any.
+                    if let Some(raw) = self.tree_view.selected_raw_bytes(&self.index) {
+                        self.detail.open_raw(raw);
+                    }
                 }
             }
+            KeyCode::PageDown => self.tree_view.page_down(),
+            KeyCode::PageUp => self.tree_view.page_up(),
+            KeyCode::Char('x') => match self.tree_view.selected_raw_bytes(&self.index) {
+                Some(raw) => self.detail.open_raw(raw),
+                None => self.set_status("x: no bytes behind this row".to_string()),
+            },
             KeyCode::Char('i') => {
                 // Show all info for the selected operator.
                 if let Some(op_idx) = self.tree_view.selected_op_idx() {
@@ -462,7 +471,7 @@ impl App {
 
         // Status bar
         let status_idx = path_idx + 1;
-        let default_shortcuts = "q:quit  ↑↓:nav  Enter:expand  i:op-info  /:filter  S:summary  H:hide  D:debug  P:profile  I:protos  E:export";
+        let default_shortcuts = "q:quit  ↑↓:nav  Enter:expand  x:hex  i:op-info  /:filter  S:summary  H:hide  D:debug  P:profile  I:protos  E:export";
         let status = if self.detail.visible {
             "↑↓:scroll  Tab:key/value  Esc:close"
         } else if self.filter.active {

@@ -108,7 +108,7 @@ fail with the file's path and a non-zero exit code.
 │      • transactionalIdPrefix=verts-txn                                   │
 ├──────────────────────────────────────────────────────────────────────────┤
 │ [rocheteau] Suivi des joueurs > rocheteau > fiche-joueur.nom             │
-│ q:quit ↑↓:nav Enter:expand Esc:collapse /:filter i:info E:export H:empty │
+│ q:quit ↑↓:nav Enter:expand x:hex Esc:collapse /:filter i:info E:export   │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -127,10 +127,12 @@ fail with the file's path and a non-zero exit code.
 |-----|--------|
 | `j` / `↓` | Move down |
 | `k` / `↑` | Move up |
-| `l` / `Enter` / `→` | Expand / open detail (hex key+value) |
+| `PageDown` / `PageUp` | Move a page (the tree's height) down / up; past a `↓`/`↑` row, the keys or operator-state elements scroll by the rest of the page |
+| `l` / `Enter` / `→` | Expand; on a value or an operator-state element, open its hex detail |
+| `x` | Hex detail of the selected value (keyed value, MAP blob, operator-state element): its raw bytes |
 | `h` / `Esc` / `←` | Collapse / clear filter / close overlay |
 | `g` / `Home` | Jump to first |
-| `G` / `End` | Jump to last |
+| `G` / `End` | Jump to the last row (of the keys or elements shown: `↓` past it scrolls) |
 | `i` | Operator info (OperatorID, parallelism, state names, …) |
 | `E` | Export the decoded model to `export.json` |
 | `S` | Savepoint summary |
@@ -141,7 +143,11 @@ fail with the file's path and a non-zero exit code.
 | `D` | Toggle debug mode (extra type tags, key-groups) |
 | `q` / `Ctrl-C` | Quit (`Ctrl-C` also from the filter bar and overlays, and while loading — then the process is interrupted mid-build and exits with 130; once loaded, quitting is a normal exit, 0) |
 
-In the detail overlay: `Tab` switches the key/value panel, `↑`/`↓` scroll, `Esc` closes.
+In the detail overlay: `Tab` switches the key/value panel, `↑`/`↓` scroll, `Esc` closes. The value
+panel holds the bytes as the index stores them — for a MAP state, the per-key blob it assembles
+(titled `per-key blob`: `int count`, then per entry `int len` + namespace (`VoidNamespace` byte +
+map key), `int len` + value behind its `NullableSerializer` null byte); the key panel holds the key
+as rendered (raw key bytes are not kept).
 
 ## JSON Export
 
