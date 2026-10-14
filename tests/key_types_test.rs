@@ -3,8 +3,8 @@
 //!
 //! Only String, Long, Int and POJO keys used to be decoded. A Short, Double, Boolean, BigInteger
 //! or Tuple key fell back to a printable-ASCII preview or `[N bytes]` that also swallowed the
-//! namespace, so distinct keys merged into one in the index (which groups entries by the rendered
-//! key) and a MapState's map key leaked into the key; `BigIntSerializer` was even read as `Int`.
+//! namespace, so distinct keys merged into one in the index, and now in the reader (both group
+//! entries by the rendered key) and a MapState's map key leaked into the key; `BigIntSerializer` was even read as `Int`.
 
 mod common;
 
@@ -13,7 +13,6 @@ use std::path::Path;
 
 use common::synth::{self, Item, KeyedOperator, Kind, Ser, Spec, Storage, Val};
 use flink_explorer::export_state::export_state_ndjson;
-use flink_explorer::index::builder::build_index;
 use flink_explorer::parser;
 use flink_explorer::parser::value::decode_state_value;
 use serde_json::{json, Value};
@@ -79,7 +78,7 @@ fn key_group(key: &Val, max_parallelism: i32) -> i64 {
 }
 
 /// Every distinct key stays distinct, with its own value, map entries and key-group, on the
-/// streaming export and on the index alike; MAP keys go to `map_key`, never into the key.
+/// streaming export and on the reader (the TUI's path) alike; MAP keys go to `map_key`, never into the key.
 fn assert_keys_stay_distinct(key_ser: Ser, keys: &[Val], expected_key_type: &str) {
     let rendered: BTreeSet<String> = keys.iter().map(Val::render).collect();
     assert_eq!(
@@ -153,40 +152,44 @@ fn assert_keys_stay_distinct(key_ser: Ser, keys: &[Val], expected_key_type: &str
         assert_eq!(rows.len(), keys.len() * MAP_KEYS.len(), "{}: MAP rows", ctx);
         assert_eq!(got, want, "{}: MAP rows", ctx);
 
-        // Index path (the TUI's): one partition per key — timers included, which must render
-        // their key exactly like the entries do or they would open partitions of their own.
-        let savepoint = parser::parse_metadata(&dir.join("_metadata")).unwrap();
-        let index = build_index(&savepoint, 0, 0, &dir);
-        let ks = index.operators[0]
-            .keyed_state
-            .as_ref()
-            .expect("keyed state");
+        // Reader path (the TUI's): one record per key — timers included, which must render
+        // their key exactly like the entries do or they would open records of their own.
+        let ks = common::keyed::keyed(&dir, &op.id_hex()).expect("keyed state");
         assert_eq!(ks.key_type, expected_key_type, "{}: key type", ctx);
-        assert_eq!(ks.total_keys, keys.len(), "{}: no key merged or split", ctx);
-        let by_key: BTreeMap<&str, &flink_explorer::index::cache::KeyPartition> =
-            ks.partitions.iter().map(|p| (p.key.as_str(), p)).collect();
+        assert_eq!(ks.keys.len(), keys.len(), "{}: no key merged or split", ctx);
+        let by_key: BTreeMap<&str, &flink_explorer::reader::KeyRecord> =
+            ks.keys.iter().map(|p| (p.key.as_str(), p)).collect();
+        assert_eq!(by_key.len(), keys.len(), "{}: each key once", ctx);
         for (i, k) in keys.iter().enumerate() {
+            let r = k.render();
             let p = by_key
-                .get(k.render().as_str())
-                .unwrap_or_else(|| panic!("{}: no partition for {:?}", ctx, k.render()));
+                .get(r.as_str())
+                .unwrap_or_else(|| panic!("{}: no record for {:?}", ctx, r));
             assert_eq!(p.key_group as i64, key_group(k, max_parallelism), "{}", ctx);
-            let value = decode_state_value(p.values[VALUE].as_deref().unwrap(), "Long", None, None);
-            assert_eq!(value, json!(1000 + i as i64), "{}: value of {:?}", ctx, k);
-            let map = decode_state_value(
-                p.values[MAP].as_deref().unwrap(),
-                "Map<String,Long>",
-                None,
-                None,
+            assert_eq!(
+                ks.value(&r, "visits"),
+                Some(json!(1000 + i as i64)),
+                "{}: value of {:?}",
+                ctx,
+                k
             );
             assert_eq!(
-                map,
-                json!({ "clicks": i as i64 * 10, "views": i as i64 * 10 + 1 }),
+                ks.value(&r, "stats"),
+                Some(json!({ "clicks": i as i64 * 10, "views": i as i64 * 10 + 1 })),
                 "{}: map of {:?}",
                 ctx,
                 k
             );
-            let ts = decode_state_value(p.values[TIMER].as_deref().unwrap(), "Long", None, None);
-            assert_eq!(ts, json!(1_700_000_000_000 + i as i64), "{}: timer", ctx);
+            // A timer's raw value is its firing timestamp, 8 big-endian bytes.
+            let ts = ks
+                .raw(&r, "_timer_state/processing_user-timers")
+                .expect("timer");
+            assert_eq!(
+                i64::from_be_bytes(ts.try_into().unwrap()),
+                1_700_000_000_000 + i as i64,
+                "{}: timer",
+                ctx
+            );
         }
     }
 }
@@ -379,16 +382,12 @@ fn big_integer_and_char_values_decode() {
             ("k3".to_string(), json!(",")),
         ])
     );
-    let savepoint = parser::parse_metadata(&dir.join("_metadata")).unwrap();
-    let index = build_index(&savepoint, 0, 0, &dir);
-    let types: Vec<&str> = index.operators[0]
-        .keyed_state
-        .as_ref()
+    let hex = parser::parse_metadata(&dir.join("_metadata"))
         .unwrap()
-        .descriptors
-        .iter()
-        .map(|d| d.value_type.as_str())
-        .collect();
+        .operators[0]
+        .id;
+    let ks = common::keyed::keyed(&dir, &flink_explorer::reader::hex_id(&hex)).unwrap();
+    let types: Vec<&str> = ks.states.iter().map(|d| d.value_type.as_str()).collect();
     // `BigIntSerializer` is matched exactly, not as a substring of `IntSerializer`.
     assert_eq!(types, ["BigInteger", "Char", "Short"]);
 }
@@ -559,16 +558,10 @@ fn one_letter_state_names_resolve_their_own_serializers() {
         });
     }
     let dir = write(&op, "shortnames");
-    let savepoint = parser::parse_metadata(&dir.join("_metadata")).unwrap();
-    let index = build_index(&savepoint, 0, 0, &dir);
-    let ks = index.operators[0].keyed_state.as_ref().unwrap();
-    let types: Vec<&str> = ks
-        .descriptors
-        .iter()
-        .map(|d| d.value_type.as_str())
-        .collect();
+    let ks = common::keyed::keyed(&dir, &op.id_hex()).unwrap();
+    let types: Vec<&str> = ks.states.iter().map(|d| d.value_type.as_str()).collect();
     assert_eq!(types, ["Tuple<String,Long>", "Map<String,Long>"]);
-    assert_eq!(ks.total_keys, 2);
+    assert_eq!(ks.keys.len(), 2);
 
     let rows: BTreeSet<String> = export(&dir, "m")
         .iter()

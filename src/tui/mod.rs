@@ -1,7 +1,9 @@
 pub mod app;
+pub mod counts;
 pub mod detail;
 pub mod filter;
 pub mod hex_view;
+pub mod jobs;
 pub mod loading;
 pub mod profile_picker;
 pub mod terminal;

@@ -10,41 +10,39 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use common::synth::{self, KeyedOperator, OpState, Ser, Spec, Storage, Val};
-use flink_explorer::index::builder::build_index;
-use flink_explorer::index::cache::IndexCache;
+use flink_explorer::operators::{summarize, OperatorSummary};
 use flink_explorer::parser;
 use serde_json::Value;
 
-/// `(state name, state type, entry labels)` of every operator state, in index order.
+/// `(state name, state type, element labels)` of every operator state, in summary order.
 type OpStates = Vec<(String, String, Vec<String>)>;
 
-fn index(dir: &Path) -> IndexCache {
+/// The operators of the savepoint in `dir`, with their operator states decoded.
+fn summaries(dir: &Path) -> Vec<OperatorSummary> {
     let savepoint =
         parser::parse_metadata(&dir.join("_metadata")).expect("synthetic _metadata parses");
-    build_index(&savepoint, 0, 0, dir)
+    summarize(&savepoint, dir)
 }
 
-fn op_states(index: &IndexCache) -> OpStates {
-    index
-        .operators
-        .iter()
+fn op_states(ops: &[OperatorSummary]) -> OpStates {
+    ops.iter()
         .flat_map(|op| &op.states)
         .map(|s| {
-            let labels = s
-                .entries
-                .iter()
-                .map(|e| String::from_utf8(e.key.clone()).unwrap())
-                .collect();
+            let labels = s.elements.iter().map(|e| e.label.clone()).collect();
             (s.name.clone(), s.state_type.clone(), labels)
         })
         .collect()
 }
 
 /// The same, as the full JSON export writes it (`operators[].operator_states`).
-fn exported_op_states(index: &IndexCache, tag: &str) -> OpStates {
+fn exported_op_states(dir: &Path, tag: &str) -> OpStates {
     let tmp = synth::temp_dir(tag);
     let out = tmp.join("export.json");
-    flink_explorer::export::export_json(index, None, &out).expect("export_json");
+    let reader = flink_explorer::reader::StateReader::open(dir).unwrap();
+    let ops = summarize(reader.savepoint(), dir);
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    flink_explorer::export::export_json(&reader, &ops, &out, &cancel, &mut |_| {})
+        .expect("export_json");
     let root: Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
     root["operators"]
         .as_array()
@@ -151,18 +149,19 @@ fn write(storage: Storage, compressed: bool, op: KeyedOperator, tag: &str) -> sy
 
 #[test]
 fn file_backed_streams_decode_like_their_inline_twin() {
-    let inline = index(&write(Storage::Inline, false, operator(false), "op-inline"));
+    let inline_dir = write(Storage::Inline, false, operator(false), "op-inline");
+    let inline = summaries(&inline_dir);
     assert_eq!(op_states(&inline), expected(false));
 
     // Every other delegate a stream can have: a file relative to the savepoint (what production
     // savepoints use above the inline threshold), an absolute file, a segment of a shared file.
     for storage in [Storage::Files, Storage::AbsoluteFiles, Storage::Segments] {
         let dir = write(storage, false, operator(false), "op-files");
-        let idx = index(&dir);
+        let idx = summaries(&dir);
         assert_eq!(op_states(&idx), op_states(&inline), "{:?}", storage);
         assert_eq!(
-            exported_op_states(&idx, "op-files-export"),
-            exported_op_states(&inline, "op-inline-export"),
+            exported_op_states(&dir, "op-files-export"),
+            exported_op_states(&inline_dir, "op-inline-export"),
             "{:?}: JSON export",
             storage
         );
@@ -171,7 +170,7 @@ fn file_backed_streams_decode_like_their_inline_twin() {
 
 #[test]
 fn compressed_streams_decode_like_uncompressed_ones() {
-    let plain = op_states(&index(&write(
+    let plain = op_states(&summaries(&write(
         Storage::Inline,
         false,
         operator(true),
@@ -180,7 +179,12 @@ fn compressed_streams_decode_like_uncompressed_ones() {
     assert_eq!(plain, expected(true));
     for storage in [Storage::Inline, Storage::Files, Storage::Segments] {
         let dir = write(storage, true, operator(true), "op-compressed");
-        assert_eq!(op_states(&index(&dir)), plain, "{:?}, compressed", storage);
+        assert_eq!(
+            op_states(&summaries(&dir)),
+            plain,
+            "{:?}, compressed",
+            storage
+        );
     }
 }
 
@@ -227,7 +231,7 @@ fn an_unreadable_stream_is_a_visible_error_not_a_placeholder() {
     // reported, not half-decoded.
     std::fs::write(&truncated, &bytes[..bytes.len() - 40]).unwrap();
 
-    let got = op_states(&index(&dir));
+    let got = op_states(&summaries(&dir));
     let names: Vec<&str> = got.iter().map(|(n, _, _)| n.as_str()).collect();
     assert_eq!(
         names,
@@ -279,7 +283,7 @@ fn an_unreadable_stream_is_a_visible_error_not_a_placeholder() {
 fn element_boundaries_are_found_without_a_quadratic_scan() {
     // The end of each element used to be a linear scan over all offsets: O(n²) in the elements
     // of a stream (in release, 250k elements took 17 s and 1M took 250 s). With a binary search,
-    // 200k index in ~0.2 s in debug. One generous bound only: wall-clock ratios are fragile on
+    // 200k are summarized in ~0.2 s in debug. One generous bound only: wall-clock ratios are fragile on
     // shared CI runners, and the quadratic version is two orders of magnitude over this.
     let n = 200_000;
     let elements = (0..n).map(|i| Val::Str(format!("e{:07}", i))).collect();
@@ -288,14 +292,11 @@ fn element_boundaries_are_found_without_a_quadratic_scan() {
     let dir = write(Storage::Inline, false, op, "op-linear");
     let savepoint = parser::parse_metadata(&dir.join("_metadata")).unwrap();
     let t = Instant::now();
-    let idx = build_index(&savepoint, 0, 0, &dir);
+    let idx = summarize(&savepoint, &dir);
     let elapsed = t.elapsed();
-    let s = &idx.operators[0].states[0];
-    assert_eq!(s.entries.len(), n);
-    assert_eq!(
-        s.entries[n - 1].key,
-        format!("\"e{:07}\"", n - 1).into_bytes()
-    );
+    let s = &idx[0].states[0];
+    assert_eq!(s.elements.len(), n);
+    assert_eq!(s.elements[n - 1].label, format!("\"e{:07}\"", n - 1));
     assert!(
         elapsed < Duration::from_secs(20),
         "{} elements took {:?}",
@@ -308,7 +309,7 @@ fn element_boundaries_are_found_without_a_quadratic_scan() {
 fn operator_stream_matches_real_flink_streams() {
     // ClusterJob's operator states, as Flink 1.20 wrote them, uncompressed and compressed
     // (local fixtures from `mvn verify`; skipped in CI). The elements are taken from the real
-    // index, the bytes are synth's: every byte of header, framing and offsets must match.
+    // operator summaries, the bytes are synth's: every byte of header, framing and offsets must match.
     for (dir, compressed) in [
         ("tests/fixtures/savepoint-gitlab", false),
         ("tests/fixtures/savepoint-compressed", true),
@@ -319,10 +320,10 @@ fn operator_stream_matches_real_flink_streams() {
             continue;
         }
         let savepoint = parser::parse_metadata(&dir.join("_metadata")).unwrap();
-        let idx = build_index(&savepoint, 0, 0, dir);
+        let idx = summarize(&savepoint, dir);
         let mut checked = 0;
         let mut dumped = false;
-        for (op, cached) in savepoint.operators.iter().zip(&idx.operators) {
+        for (op, cached) in savepoint.operators.iter().zip(&idx) {
             let mut cached_states = cached.states.iter();
             for sub in &op.subtask_states {
                 let Some(parser::state_handle::StateHandle::OperatorStream(os)) =
@@ -334,15 +335,15 @@ fn operator_stream_matches_real_flink_streams() {
                 else {
                     panic!("ClusterJob's operator state is inline");
                 };
-                // The index has one state per partition, in handle order; rebuild them.
+                // The summary has one state per partition, in handle order; rebuild them.
                 let mut states = Vec::new();
                 for part in &os.partition_offsets {
                     let labels: Vec<String> = cached_states
                         .next()
                         .unwrap()
-                        .entries
+                        .elements
                         .iter()
-                        .map(|e| String::from_utf8(e.key.clone()).unwrap())
+                        .map(|e| e.label.clone())
                         .collect();
                     let unquote = |s: &str| Val::str(s.trim_matches('"'));
                     states.push(match part.mode {

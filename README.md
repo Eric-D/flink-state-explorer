@@ -43,13 +43,22 @@ payloads. Everything visible in the TUI is also available as a JSON export.
   state, keyed/operator state names + distribution mode, sizes.
 - **Value class** — a state value's fully-qualified Java class (package + name) is surfaced when the
   serializer stores it (POJO/enum).
-- **JSON export** (`E`) — writes `export.json` next to the savepoint with the decoded model (up to
-  100 000 keys per operator, flagged `truncated` past that; `--export-state` streams every key).
+- **JSON export** (`E`) — streams every operator and every key, with its decoded values, to
+  `export.json` next to the savepoint (in the background; `--export-state` streams one state).
+- **Instant start, every key** — the TUI reads a savepoint lazily, a key-group at a time: the
+  first frame is up once `_metadata` and the state headers are read, every key of every subtask
+  is reachable (no key cap), and memory stays at a few pages of keys plus a small block cache (a
+  211 MB / 1M-key savepoint: first frame in a few milliseconds, 100 000 keys paged in under a
+  second at ~26 MB). One caveat: a key-group is read whole, so a single hot key with millions of
+  entries costs the memory and time of its key-group; what is decoded and shown of it stays a page
+  (an expanded MAP shows 50 entries at a time behind `↑`/`↓` pager rows).
+- **Filtering** — glob pattern (searched on a background thread, cancellable), exact key
+  (looked up directly by its key-group), or key-group range.
+- **Key counts** — counted in the background (`≥ N keys` until then), cached under the user cache
+  directory (counts only, never in the savepoint directory).
 - **Web UI** (`--web`) — the same savepoint in a browser, read-only, loopback-only, token-guarded;
   see [Web UI](#web-ui).
-- **Filtering** — by key prefix, exact match, or key-group range.
 - **Profiles** — per-project proto dirs, patterns, and bindings.
-- **Index caching** — fast reload with staleness detection (auto-rebuilds if stale).
 
 ## Build
 
@@ -85,7 +94,7 @@ binaries to **GitHub Releases** — see the
 # Open with a specific profile (for proto decoding)
 ./target/release/flink-explorer -p my-profile /path/to/savepoint-dir
 
-# Skip the index cache (always re-parse; .flink-explorer-cache is neither read nor written)
+# Neither read nor write the key counts cache
 ./target/release/flink-explorer --no-cache /path/to/savepoint-dir
 ```
 
@@ -93,7 +102,8 @@ binaries to **GitHub Releases** — see the
 
 A state file that is missing, unreadable or shorter than `_metadata` says is never taken for
 "no state": the operator is flagged `⚠ N state file(s) not read` (details under `i`), the other
-subtasks still load, and such a partial index is not cached. `--list-states` and `--export-state`
+subtasks are still read, the key list says where keys are missing, and counts that met such a
+file are not cached. `--list-states` and `--export-state`
 fail with the file's path and a non-zero exit code.
 
 ## TUI Layout
@@ -122,7 +132,7 @@ fail with the file's path and a non-zero exit code.
 | Level | Content | Example |
 |-------|---------|---------|
 | **Operator** | Flink operator (📨 if Kafka) | `[rocheteau] Suivi des joueurs des Verts (1 keys, 7 states)` |
-| **Partition** | keyBy value | `rocheteau (7 states)` |
+| **Partition** | keyBy value, in the savepoint's order (below) | `rocheteau (7 states)` |
 | **State entry** | State name + decoded value | `matchs-joues: 416` |
 | **Expanded** | POJO fields / MAP pairs | `nom: "Rocheteau"` |
 
@@ -134,37 +144,72 @@ fail with the file's path and a non-zero exit code.
 | `k` / `↑` | Move up |
 | `PageDown` / `PageUp` | Move a page (the tree's height) down / up; past a `↓`/`↑` row, the keys or operator-state elements scroll by the rest of the page |
 | `l` / `Enter` / `→` | Expand; on a value or an operator-state element, open its hex detail |
-| `x` | Hex detail of the selected value (keyed value, MAP blob, operator-state element): its raw bytes |
+| `x` | Hex detail of the selected value (keyed value, MAP entry, operator-state element): its raw bytes |
 | `h` / `Esc` / `←` | Collapse / clear filter / close overlay |
 | `g` / `Home` | Jump to first |
 | `G` / `End` | Jump to the last row (of the keys or elements shown: `↓` past it scrolls) |
 | `i` | Operator info (OperatorID, parallelism, state names, …) |
-| `E` | Export the decoded model to `export.json` |
+| `E` | Export every operator and key, decoded, to `export.json` (in the background; progress on the status bar) |
+| `C` | Stop / restart the background key count |
 | `S` | Savepoint summary |
 | `I` | List loaded `.proto` files |
-| `/` | Open the filter bar (Tab cycles prefix / exact / key-group) |
+| `/` | Open the filter bar (Tab cycles pattern / exact / key-group); `Esc` stops a search |
 | `P` | Profile picker |
 | `H` | Toggle hiding empty operators |
 | `D` | Toggle debug mode (extra type tags, key-groups) |
-| `q` / `Ctrl-C` | Quit (`Ctrl-C` also from the filter bar and overlays, and while loading — then the process is interrupted mid-build and exits with 130; once loaded, quitting is a normal exit, 0) |
+| `q` / `Ctrl-C` | Quit. While an `E` export runs, `q` first asks ("q again to abort the export and quit, or wait"): a second `q` in a row aborts it (no `export.json` is left), any other key cancels the question. `Ctrl-C` quits at once, aborting whatever runs — also from the filter bar and overlays, during a search or the key count, and while loading (then the process exits with 130; once loaded, quitting is a normal exit, 0) |
 
 In the detail overlay: `Tab` switches the key/value panel, `↑`/`↓` scroll, `Esc` closes. The value
-panel holds the bytes as the index stores them — for a MAP state, the per-key blob it assembles
-(titled `per-key blob`: `int count`, then per entry `int len` + namespace (`VoidNamespace` byte +
-map key), `int len` + value behind its `NullableSerializer` null byte); the key panel holds the key
-as rendered (raw key bytes are not kept).
+panel holds the entry's bytes as the savepoint stores them. Under a MAP state each entry is its
+own: on a map entry's row (or the first entry, on the state's row) the key panel holds its
+namespace (`VoidNamespace` byte + serialized map key) and the value panel the value behind its
+`NullableSerializer` null byte. Elsewhere the key panel holds the key as rendered (raw key bytes
+are not kept).
+
+### Key order, counts and search
+
+Keys are listed in the order the savepoint stores them: **key-groups ascending**, and inside one
+key-group in **Flink's on-disk order** (the order the heap backend wrote them, not sorted). The
+TUI reads the page it shows from the savepoint (`src/reader`), so every key of every subtask can
+be reached, whatever their number.
+
+An operator shows `≥ N keys` until it is counted: a background pass counts every key (progress on
+the operator row; `C` stops or restarts it; `q`/`Ctrl-C` stop it). Complete counts are cached in
+`$XDG_CACHE_HOME/flink-explorer` (or `~/.cache/flink-explorer`; `%LOCALAPPDATA%\flink-explorer`
+on Windows), one small file per savepoint holding counts only, ignored once `_metadata` changes.
+Nothing is ever written into the savepoint directory except by `E` and `--export-state`.
+
+The filter bar's **pattern** (`*` and `?` wildcards, case-insensitive) is searched through every
+key on a background thread, so the TUI keeps answering keys meanwhile: matches show as they are
+found, with the search's progress, and `Esc` stops it (keeping what it found) between two
+key-groups — one key-group is read whole, so a huge one delays the stop by its read. An **exact** key of a String, numeric, Boolean, Char,
+BigInteger, Date, LocalDate or Flink-tuple key type is looked up directly — its key-group computed
+with Flink's hash, one block read; a pattern without wildcard shows that key at once, then
+searches for its other cases. Other key types (POJOs) are searched. A **key-group range** pages
+from its first key-group to its last.
 
 ## JSON Export
 
-Press `E` in the TUI to write `export.json` into the savepoint directory. It mirrors the TUI model
-and includes **all** operators (not just keyed ones): an `info` block per operator, the
-`state_descriptors` (with `value_class` when known), and the per-key decoded values. The export and
-the TUI share the same decoder (`src/parser/value.rs`), so they never diverge.
+Press `E` in the TUI to write `export.json` into the savepoint directory (through
+`export.json.partial`, renamed when complete). It mirrors the TUI model and includes **all**
+operators (not just keyed ones): per operator its `operator_states`, its `state_descriptors` (with
+`value_class` when known), **every key** with its decoded values (`{key, key_group, states}`), then
+`total_keys`, `load_errors`, `malformed_key_groups` and an `info` block (these follow the keys:
+they are known once the keys are read). It is streamed from the savepoint a page of keys at a
+time — and a MAP of one key a page of entries at a time — on a background thread, so memory
+stays bounded whatever the savepoint's size (but for one key-group, read whole: a single hot key
+with millions of entries costs its key-group's size). A MAP state is one object of all its
+entries, in on-disk order (an entry whose map key could not be decoded is written under
+`#<its index>`); another state holds the value of its first entry (a key with several windows or
+timers: the first one, as in the TUI).
 
-The index behind the TUI and this export keeps at most **100 000 keys per operator**, shared
-between its subtasks. Past that, the TUI says so (`100000 of 1000000 keys shown`) and the export
-sets `truncated: true` at the root and on the operator, with its `stored_keys` and `total_keys`.
-To get every key of a state, use `--export-state`, which streams the savepoint instead.
+Compared with the exports of earlier versions (built from the in-memory index): `truncated` is
+still written, at the top level and per operator, but is always `false` (nothing is left out);
+`stored_keys` is gone (`total_keys` is the count); `total_keys`, `load_errors`,
+`malformed_key_groups` and `info` now come **after** `keys`; keys are in the reader's order
+(key-groups ascending, on-disk order inside one), not sorted; MAP entries are in on-disk order. The export and the TUI share the same
+decoder (`src/parser/value.rs`), so they never diverge. To export one state as NDJSON or Parquet,
+use `--export-state`.
 
 ## Web UI
 
@@ -349,9 +394,8 @@ src/
 │   ├── pojo.rs           # POJO structure parser (recursive, framed snapshots)
 │   ├── value.rs          # ★ single source of truth: raw bytes → serde_json::Value
 │   └── kafka.rs          # Kafka connector state decoders (source/sink), verified vs. the connector
-├── index/
-│   ├── builder.rs        # savepoint → structured cache model (merges all subtasks)
-│   └── cache.rs          # cached model + postcard persistence (staleness-checked)
+├── reader/               # StateReader: lazy, per-key-group random access to keyed state
+├── operators.rs          # operator metadata + decoded operator state (Kafka, broadcast, lists)
 ├── proto/
 │   ├── compiler.rs       # protox .proto → DescriptorPool
 │   ├── decoder.rs        # prost-reflect DynamicMessage decoder
@@ -360,10 +404,12 @@ src/
 ├── sst/reader.rs         # read-only RocksDB/SST reader (external state files)
 ├── tui/
 │   ├── app.rs            # main event loop + render
-│   ├── tree.rs           # tree widget (Operator/Partition/Entry/MapEntry)
+│   ├── tree.rs           # tree widget: navigation state, pages of keys asked of the reader
+│   ├── jobs.rs           # background key count and `E` export (worker threads, cancellable)
+│   ├── counts.rs         # key counts cache (user cache dir, counts only)
 │   ├── detail.rs         # key/value hex overlay + operator-info overlay
 │   ├── hex_view.rs       # hex dump widget
-│   ├── filter.rs         # key filter (prefix / exact / key-group range)
+│   ├── filter.rs         # key filter (pattern / exact / key-group range)
 │   ├── profile_picker.rs # profile selection overlay
 │   └── loading.rs        # loading / progress screen
 ├── reader/               # lazy StateReader: one key-group per call, exact key lookup
@@ -373,7 +419,7 @@ src/
 │   ├── pages.rs          # routes: HTML pages + /api/ JSON twins
 │   ├── http.rs           # hyper/tokio glue (the only file that knows them)
 │   └── assets/           # app.css, app.js (embedded with include_str!)
-├── export.rs             # JSON export (same decoder as the TUI)
+├── export.rs             # `E` JSON export, streamed from the reader (same decoder as the TUI)
 └── error.rs              # unified error types
 ```
 

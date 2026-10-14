@@ -10,10 +10,8 @@ use std::path::Path;
 
 use common::synth::{self, Item, KeyedOperator, Kind, RunOrder, Ser, Spec, Storage, TempDir, Val};
 use flink_explorer::export_state::{export_state_ndjson, list_states, ExportStats};
-use flink_explorer::index::builder::build_index;
 use flink_explorer::parser;
 use flink_explorer::parser::state_handle::{StateHandle, StreamStateHandle};
-use flink_explorer::parser::value::decode_state_value;
 use serde_json::{json, Value};
 
 const LAYOUTS: [(Storage, bool); 4] = [
@@ -287,31 +285,27 @@ fn state_runs_in_any_order_read_the_same() {
 }
 
 #[test]
-fn index_path_sees_every_key_of_every_subtask_in_every_layout() {
+fn reader_path_sees_every_key_of_every_subtask_in_every_layout() {
     let op = synth::sample_operator(300);
     for (storage, compressed) in LAYOUTS {
         let what = format!("{:?}, compressed {}", storage, compressed);
-        let dir = write(&spec_with(&op, storage, compressed), "index");
-        let savepoint = parser::parse_metadata(&dir.join("_metadata")).unwrap();
-        let index = build_index(&savepoint, 0, 0, &dir);
-        let ks = index.operators[0]
-            .keyed_state
-            .as_ref()
-            .unwrap_or_else(|| panic!("{}: keyed state indexed", what));
-        assert_eq!(ks.total_keys, 300, "{}", what);
-        let names: Vec<&str> = ks.descriptors.iter().map(|d| d.name.as_str()).collect();
-        assert_eq!(names, SAMPLE_STATES, "{}", what);
+        let dir = write(&spec_with(&op, storage, compressed), "reader");
+        let ks = common::keyed::keyed(&dir, &op.id_hex())
+            .unwrap_or_else(|| panic!("{}: keyed state read", what));
+        assert_eq!(ks.keys.len(), 300, "{}", what);
+        assert_eq!(ks.state_names(), SAMPLE_STATES, "{}", what);
 
         let mut seen: BTreeMap<String, Value> = BTreeMap::new();
-        for p in &ks.partitions {
+        for p in &ks.keys {
             let want_kg = synth::key_group_for_hash(synth::java_string_hash(&p.key), 128);
             assert_eq!(
                 p.key_group as i32, want_kg,
                 "{}: key-group of {}",
                 what, p.key
             );
-            let raw = p.values[0].as_deref().expect("every key has a counter");
-            let v = flink_explorer::parser::value::decode_state_value(raw, "Long", None, None);
+            let v = ks
+                .value(&p.key, SAMPLE_STATES[0])
+                .expect("every key has a counter");
             seen.insert(p.key.clone(), v);
         }
         for i in 0..300 {
@@ -352,7 +346,7 @@ fn iso_millis_matches_known_dates() {
     assert_eq!(iso_millis(951_782_400_123), "2000-02-29T00:00:00.123Z");
 }
 
-/// Raw entries per state, as the index counts them (`StateDescriptor::entry_count`).
+/// Raw entries per state, as the reader returns them (`Keyed::entry_count`).
 fn item_counts(op: &KeyedOperator) -> Vec<usize> {
     (0..op.states.len())
         .map(|s| op.items.iter().filter(|it| it.state() == s).count())
@@ -362,7 +356,7 @@ fn item_counts(op: &KeyedOperator) -> Vec<usize> {
 #[test]
 fn long_keys_and_long_map_user_keys_survive_on_both_paths() {
     // Issue #15: a key over 10,000 bytes ended its key-group's parse, dropping its own entries
-    // and every later one of that key-group, for every state, on the index and on the export.
+    // and every later one of that key-group, for every state, on the index (now the reader) and on the export.
     // maxParallelism 32768: 2-byte key-group prefixes, all the way up to key-group 32767.
     let mut op = KeyedOperator::new(0x15, 2, 32768, Ser::String)
         .state("long-label", Kind::Value(Ser::String))
@@ -431,31 +425,24 @@ fn long_keys_and_long_map_user_keys_survive_on_both_paths() {
         .expect("the key-group 32767 row");
     assert_eq!(last["key_group"], 32767);
 
-    // Index path: every entry, every key, every value.
-    let savepoint = parser::parse_metadata(&dir.join("_metadata")).unwrap();
-    let index = build_index(&savepoint, 0, 0, &dir);
-    let ks = index.operators[0].keyed_state.as_ref().unwrap();
-    assert_eq!(ks.malformed_key_groups, 0, "{:?}", ks.first_malformed);
-    assert_eq!(ks.total_keys, keys.len());
-    let counts: Vec<usize> = ks.descriptors.iter().map(|d| d.entry_count).collect();
+    // Reader path (the TUI's): every entry, every key, every value.
+    let ks = common::keyed::keyed(&dir, &op.id_hex()).unwrap();
+    assert!(ks.malformed.is_empty(), "{:?}", ks.malformed);
+    assert_eq!(ks.keys.len(), keys.len());
+    let counts: Vec<usize> = ks.states.iter().map(|d| ks.entry_count(&d.name)).collect();
     assert_eq!(counts, item_counts(&op));
     for (i, k) in keys.iter().enumerate() {
-        let p = ks
-            .partitions
-            .iter()
-            .find(|p| &p.key == k)
-            .unwrap_or_else(|| panic!("key of {} chars not indexed", k.len()));
-        let w = p.values[2].as_deref().expect("a w value");
-        assert_eq!(decode_state_value(w, "Long", None, None), json!(i as i64));
+        assert!(ks.record(k).is_some(), "key of {} chars not read", k.len());
+        assert_eq!(ks.value(k, "long-counter"), Some(json!(i as i64)));
     }
-    let p = ks.partitions.iter().find(|p| p.key == last_kg_key).unwrap();
-    assert_eq!(p.key_group, 32767);
+    assert_eq!(ks.record(&last_kg_key).unwrap().key_group, 32767);
 }
 
 #[test]
 fn a_header_over_50_kb_lists_every_state_on_both_paths() {
     // Issue #17: the header extractors stopped at byte 50,000, so every state registered past it
-    // vanished from --list-states, the index (TUI, `i` panel, export.json) and --export-state.
+    // vanished from --list-states, the index (TUI, `i` panel, export.json; now the reader) and
+    // --export-state.
     let mut op = KeyedOperator::new(0x17, 2, 128, Ser::String);
     let kind = |i: usize| match i % 3 {
         0 => Kind::Value(Ser::Long),
@@ -528,18 +515,17 @@ fn a_header_over_50_kb_lists_every_state_on_both_paths() {
             .collect();
         assert_eq!(listed, expected_states, "{}", layout);
 
-        let index = build_index(&savepoint, 0, 0, &dir);
-        let ks = index.operators[0].keyed_state.as_ref().unwrap();
+        let ks = common::keyed::keyed(&dir, &op.id_hex()).unwrap();
         let described: Vec<(String, String)> = ks
-            .descriptors
+            .states
             .iter()
             .map(|d| (d.name.clone(), d.state_type.clone()))
             .collect();
         assert_eq!(described, expected_states, "{}", layout);
-        let counts: Vec<usize> = ks.descriptors.iter().map(|d| d.entry_count).collect();
+        let counts: Vec<usize> = ks.states.iter().map(|d| ks.entry_count(&d.name)).collect();
         assert_eq!(counts, item_counts(&op), "{}", layout);
-        assert_eq!(ks.descriptors[318].value_type, "Long", "{}", layout);
-        assert_eq!(ks.total_keys, 40, "{}", layout);
+        assert_eq!(ks.states[318].value_type, "Long", "{}", layout);
+        assert_eq!(ks.keys.len(), 40, "{}", layout);
 
         for (id, name) in [(0, "wide-000"), (316, "wide-316"), (317, "wide-317")] {
             assert_eq!(
@@ -560,8 +546,8 @@ fn a_header_over_50_kb_lists_every_state_on_both_paths() {
 }
 
 #[test]
-fn the_index_reads_its_header_from_the_header_only() {
-    // Issue #17: on the index path the header extractors ran over the whole state file, so state
+fn the_reader_reads_its_header_from_the_header_only() {
+    // Issue #17: on the index path (now the reader) the header extractors ran over the whole state file, so state
     // *values* that happen to look like a StateMetaInfoSnapshot were taken for states. This value
     // spells `[utf "phantom"][int KEY_VALUE][int 1 option][utf KEYED_STATE_TYPE][utf VALUE]`
     // (a StringValue writes chars below 0x80 as single bytes, U+0000 included).
@@ -593,15 +579,13 @@ fn the_index_reads_its_header_from_the_header_only() {
         .map(|(_, name, _)| name)
         .collect();
     assert_eq!(listed, ["note"]);
-    let index = build_index(&savepoint, 0, 0, &dir);
-    let ks = index.operators[0].keyed_state.as_ref().unwrap();
-    let names: Vec<&str> = ks.descriptors.iter().map(|d| d.name.as_str()).collect();
+    let ks = common::keyed::keyed(&dir, &op.id_hex()).unwrap();
     assert_eq!(
-        names,
+        ks.state_names(),
         ["note"],
-        "the index must see the states list_states sees"
+        "the reader must see the states list_states sees"
     );
-    assert_eq!(ks.descriptors[0].entry_count, 20);
+    assert_eq!(ks.entry_count("note"), 20);
     assert_eq!(projected(&rows(&dir, "note")), expected_rows(&op, 0));
 }
 
@@ -632,21 +616,15 @@ fn a_state_name_is_found_at_its_own_record() {
     spec.operators.push(op.clone());
     let dir = write(&spec, "short-names");
 
-    let savepoint = parser::parse_metadata(&dir.join("_metadata")).unwrap();
-    let index = build_index(&savepoint, 0, 0, &dir);
-    let ks = index.operators[0].keyed_state.as_ref().unwrap();
-    let types: Vec<&str> = ks
-        .descriptors
-        .iter()
-        .map(|d| d.value_type.as_str())
-        .collect();
+    let ks = common::keyed::keyed(&dir, &op.id_hex()).unwrap();
+    let types: Vec<&str> = ks.states.iter().map(|d| d.value_type.as_str()).collect();
     assert_eq!(types, ["Map<String,Long>", "Long"]);
     assert_eq!(projected(&rows(&dir, "m")), expected_rows(&op, 0));
     assert_eq!(projected(&rows(&dir, "a")), expected_rows(&op, 1));
 }
 
 #[test]
-fn a_malformed_key_group_is_reported_by_the_export_the_index_and_the_cli() {
+fn a_malformed_key_group_is_reported_by_the_export_the_reader_and_the_cli() {
     // Issue #15: a key-group that cannot be read to its end mark used to end the parse silently,
     // passing a partial read off as the whole state.
     let op = synth::sample_operator(300);
@@ -699,19 +677,26 @@ fn a_malformed_key_group_is_reported_by_the_export_the_index_and_the_cli() {
     assert!(expected.len() < 300, "the bad key-group held rows");
     assert_eq!(projected(&got), expected);
 
-    // Index: the same key-group, counted across subtasks, and shown in the `i` panel.
-    let index = build_index(&savepoint, 0, 0, &dir);
-    let ks = index.operators[0].keyed_state.as_ref().unwrap();
-    assert_eq!(ks.malformed_key_groups, 1);
-    let first = ks.first_malformed.as_deref().unwrap();
+    // Reader (the TUI's path): the same key-group, counted across subtasks, and shown in the
+    // `i` panel.
+    let ks = common::keyed::keyed(&dir, &op.id_hex()).unwrap();
+    assert_eq!(ks.malformed.len(), 1, "{:?}", ks.malformed);
     assert!(
-        first.starts_with(&format!("key-group {}: truncated", bad_kg)),
+        ks.malformed[0].starts_with(&format!("subtask 0, key-group {}: truncated", bad_kg)),
         "{}",
-        first
+        ks.malformed[0]
     );
-    assert_eq!(ks.total_keys, expected.len());
-    assert!(index.operators[0]
-        .info_lines()
+    assert_eq!(ks.keys.len(), expected.len());
+    let summary = &flink_explorer::operators::summarize(&savepoint, &dir)[0];
+    let info = flink_explorer::operators::KeyedInfo {
+        key_type: ks.key_type.clone(),
+        state_names: ks.states.iter().map(|s| s.name.clone()).collect(),
+        keys: ks.keys.len().to_string(),
+        errors: ks.errors.clone(),
+        malformed: ks.malformed.clone(),
+    };
+    assert!(summary
+        .info_lines(Some(&info))
         .iter()
         .any(|(k, v)| k == "Malformed key-groups" && v.starts_with("1 ")));
 
@@ -735,7 +720,7 @@ fn a_malformed_key_group_is_reported_by_the_export_the_index_and_the_cli() {
 }
 
 /// The explorer's value for each key of `state`, derived from the items alone (a MAP state as one
-/// object per key, as the index path stores it).
+/// object per key, as the reader path shows it).
 fn expected_by_key(op: &KeyedOperator, state: usize) -> BTreeMap<String, Value> {
     let mut out: BTreeMap<String, Value> = BTreeMap::new();
     for item in op.items.iter().filter(|i| i.state() == state) {
@@ -833,36 +818,23 @@ fn char_and_non_bmp_string_states_decode_on_both_paths() {
         json!(["m", "a", "t", "h", "-", "\\uD835", "\\uDD38"])
     );
 
-    // Index (TUI) path: the value types read from the header, every key intact, same values.
-    let savepoint = parser::parse_metadata(&dir.join("_metadata")).unwrap();
-    let index = build_index(&savepoint, 0, 0, &dir);
-    let ks = index.operators[0]
-        .keyed_state
-        .as_ref()
-        .expect("keyed state indexed");
-    let types: Vec<&str> = ks
-        .descriptors
-        .iter()
-        .map(|d| d.value_type.as_str())
-        .collect();
+    // Reader (TUI) path: the value types read from the header, every key intact, same values.
+    let ks = common::keyed::keyed(&dir, &op.id_hex()).expect("keyed state read");
+    let types: Vec<&str> = ks.states.iter().map(|d| d.value_type.as_str()).collect();
     assert_eq!(
         types,
         ["Char", "char[]", "String", "Map<String,Char>", "List<Char>"]
     );
-    let indexed_keys: BTreeSet<&str> = ks.partitions.iter().map(|p| p.key.as_str()).collect();
-    assert_eq!(indexed_keys, keys.into_iter().collect());
-    for (i, desc) in ks.descriptors.iter().enumerate() {
+    let read_keys: BTreeSet<&str> = ks.keys.iter().map(|p| p.key.as_str()).collect();
+    assert_eq!(read_keys, keys.into_iter().collect());
+    for (i, desc) in ks.states.iter().enumerate() {
         let got: BTreeMap<String, Value> = ks
-            .partitions
+            .keys
             .iter()
             .map(|p| {
-                let raw = p.values[i].as_deref().expect("every key has every state");
-                let v = flink_explorer::parser::value::decode_state_value(
-                    raw,
-                    &desc.value_type,
-                    None,
-                    None,
-                );
+                let v = ks
+                    .value(&p.key, &desc.name)
+                    .expect("every key has every state");
                 (p.key.clone(), v)
             })
             .collect();

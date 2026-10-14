@@ -1,10 +1,9 @@
 use std::fs;
 
-use flink_explorer::index::builder::build_index;
 use flink_explorer::parser;
 
 #[test]
-fn integration_parse_and_index_synthetic_savepoint() {
+fn integration_parse_and_open_synthetic_savepoint() {
     let dir = std::env::temp_dir().join("flink-explorer-integration-test");
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
@@ -24,9 +23,10 @@ fn integration_parse_and_index_synthetic_savepoint() {
     let op1 = &savepoint.operators[1];
     assert_eq!(op1.parallelism, 2);
 
-    let meta = fs::metadata(&metadata_path).unwrap();
-    let index = build_index(&savepoint, meta.len(), 0, &dir);
-    assert_eq!(index.operators.len(), 2);
+    let ops = flink_explorer::operators::summarize(&savepoint, &dir);
+    assert_eq!(ops.len(), 2);
+    let reader = flink_explorer::reader::StateReader::open(&dir).unwrap();
+    assert_eq!(reader.operators().len(), 2);
 
     let _ = fs::remove_dir_all(&dir);
 }

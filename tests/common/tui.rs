@@ -4,11 +4,13 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 
-use flink_explorer::export_state::{export_state_rows, hex_id, RowSink, StateRow};
-use flink_explorer::index::cache::{CachedOperator, IndexCache, StateDescriptor};
+use flink_explorer::export_state::{export_state_rows, RowSink, StateRow};
+use flink_explorer::operators::OperatorSummary;
 use flink_explorer::parser::metadata::Savepoint;
 use flink_explorer::parser::value::value_to_display;
+use flink_explorer::reader::{StateInfo, StateReader};
 use flink_explorer::tui::filter::AppliedFilter;
 use flink_explorer::tui::text;
 use flink_explorer::tui::tree::TreeView;
@@ -56,18 +58,20 @@ pub fn labels(rows: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Expand every row, top to bottom (no pager is crossed: the caller keeps the tree to one page).
+/// Expand every row, top to bottom, selecting each in turn: a pager row (a MAP's `↓`) is
+/// selected without scrolling its window.
 pub fn expand_all(tree: &mut TreeView) {
-    tree.jump_first();
     let mut i = 0;
-    loop {
+    while i < tree.row_count() {
+        tree.select_row(i);
         tree.expand();
         i += 1;
-        if i >= tree.row_count() {
-            break;
-        }
-        tree.move_down();
     }
+}
+
+/// A tree over the savepoint in `dir`, with a reader of its own (the default entry limit).
+pub fn open_tree(dir: &Path) -> TreeView {
+    TreeView::open(dir).expect("open savepoint")
 }
 
 /// Every keyed value of one operator, as the streaming export decodes it: `(key, state) → value`.
@@ -75,8 +79,11 @@ pub fn expand_all(tree: &mut TreeView) {
 #[derive(Default)]
 pub struct Exported {
     pub values: BTreeMap<(String, String), Value>,
+    /// A MAP state's map keys, in the order they were exported (on-disk order, which the TUI
+    /// shows).
+    pub map_keys: BTreeMap<(String, String), Vec<String>>,
     /// Non-MAP (key, state) pairs exported more than once (a window state's several windows):
-    /// the first row is kept, as the index keeps the first window.
+    /// the first row is kept, as the TUI shows the first window.
     pub repeated: usize,
 }
 
@@ -85,6 +92,10 @@ impl RowSink for Exported {
         let slot = (row.key.to_string(), row.state.to_string());
         match row.map_key {
             Some(mk) => {
+                self.map_keys
+                    .entry(slot.clone())
+                    .or_default()
+                    .push(mk.to_string());
                 let obj = self
                     .values
                     .entry(slot)
@@ -106,18 +117,35 @@ impl RowSink for Exported {
     }
 }
 
+/// Every state of operator `op_hex`, exported.
 pub fn export_operator(
     savepoint: &Savepoint,
     dir: &Path,
-    op: &CachedOperator,
+    op_hex: &str,
+    states: &[StateInfo],
 ) -> Result<Exported, String> {
     let mut out = Exported::default();
-    let op_hex = hex_id(&op.id);
-    for desc in &op.keyed_state.as_ref().unwrap().descriptors {
-        export_state_rows(savepoint, dir, Some(&op_hex), &desc.name, None, &mut out)
-            .map_err(|e| format!("{}: {}", desc.name, e))?;
+    for s in states {
+        export_state_rows(savepoint, dir, Some(op_hex), &s.name, None, &mut out)
+            .map_err(|e| format!("{}: {}", s.name, e))?;
     }
     Ok(out)
+}
+
+/// ` → com.example.Pojo { a: Long, … }` for a POJO-valued state, as the TUI labels it.
+pub fn pojo_detail(reader: &StateReader, op_hex: &str, state: &str) -> String {
+    reader
+        .value_pojo(op_hex, state)
+        .unwrap()
+        .map(|p| {
+            let fields: Vec<String> = p
+                .leaf_fields("")
+                .iter()
+                .map(|(path, t)| format!("{}: {}", path, t))
+                .collect();
+            format!(" → {} {{ {} }}", p.class_name, fields.join(", "))
+        })
+        .unwrap_or_default()
 }
 
 /// One state row of a key and the rows under it.
@@ -128,9 +156,15 @@ pub struct EntryView {
 }
 
 /// What the TUI must show for `value` (`None`: no exported row): the state row, and the rows of
-/// a MAP / LIST. A structured VALUE's own rows are not part of the comparison (they are layout:
-/// its label already holds the whole value).
-pub fn expected_entry(desc: &StateDescriptor, value: Option<&Value>) -> EntryView {
+/// a MAP (its first 50 entries in `map_keys` order — on-disk order — then a `↓` pager row) /
+/// LIST. A structured VALUE's own rows are not part of the comparison (they are layout: its
+/// label already holds the whole value).
+pub fn expected_entry(
+    desc: &StateInfo,
+    pojo_detail: &str,
+    value: Option<&Value>,
+    map_keys: &[String],
+) -> EntryView {
     let collection = |prefix: &str, fallback: &str| {
         if desc.value_type.starts_with(prefix) {
             desc.value_type.clone()
@@ -144,13 +178,13 @@ pub fn expected_entry(desc: &StateDescriptor, value: Option<&Value>) -> EntryVie
             let tl = collection("Map<", "MAP");
             match value.and_then(Value::as_object) {
                 Some(m) if !m.is_empty() => {
-                    let mut children: Vec<String> = m
+                    let mut children: Vec<String> = map_keys
                         .iter()
                         .take(50)
-                        .map(|(k, v)| format!("        {} : {}", k, value_to_display(v)))
+                        .map(|k| format!("        {} : {}", k, value_to_display(&m[k])))
                         .collect();
                     if m.len() > 50 {
-                        children.push(format!("        … +{} more", m.len() - 50));
+                        children.push(format!("        ↓ 1-50 / {}", m.len()));
                     }
                     EntryView {
                         label: format!(
@@ -158,7 +192,7 @@ pub fn expected_entry(desc: &StateDescriptor, value: Option<&Value>) -> EntryVie
                             head(true),
                             desc.name,
                             tl,
-                            desc.pojo_detail,
+                            pojo_detail,
                             m.len()
                         ),
                         children,
@@ -170,7 +204,7 @@ pub fn expected_entry(desc: &StateDescriptor, value: Option<&Value>) -> EntryVie
                         head(false),
                         desc.name,
                         tl,
-                        desc.pojo_detail
+                        pojo_detail
                     ),
                     children: Vec::new(),
                 },
@@ -195,7 +229,7 @@ pub fn expected_entry(desc: &StateDescriptor, value: Option<&Value>) -> EntryVie
                             head(true),
                             desc.name,
                             tl,
-                            desc.pojo_detail,
+                            pojo_detail,
                             a.len()
                         ),
                         children,
@@ -207,7 +241,7 @@ pub fn expected_entry(desc: &StateDescriptor, value: Option<&Value>) -> EntryVie
                         head(false),
                         desc.name,
                         tl,
-                        desc.pojo_detail
+                        pojo_detail
                     ),
                     children: Vec::new(),
                 },
@@ -226,24 +260,22 @@ pub fn expected_entry(desc: &StateDescriptor, value: Option<&Value>) -> EntryVie
 }
 
 /// Render the one key `key` of operator `op` (alone in its tree, every row expanded, auto-date
-/// off) and return its state rows.
+/// off) and return its state rows. The key is found through the filter: `get` for a hashable key
+/// type, a scan otherwise.
 pub fn render_key(
-    op: &CachedOperator,
-    index: &IndexCache,
+    reader: &Arc<StateReader<'static>>,
+    op: &OperatorSummary,
     key: &str,
     width: u16,
 ) -> Vec<EntryView> {
     let mut one = op.clone();
     one.states.clear(); // operator states are not keyed values
-    let single = IndexCache {
-        operators: vec![one],
-        ..index.clone()
-    };
-    let mut tree = TreeView::new(&single);
+    let mut tree = TreeView::new(reader.clone(), vec![one]);
     tree.toggle_auto_date(); // the export has no auto-date: compare the decoded values
     let mut terminal = Terminal::new(TestBackend::new(width, 4)).unwrap();
     draw(&mut terminal, &mut tree); // fixes the width before rows are built
     tree.apply_filter(&Some(AppliedFilter::Exact(key.as_bytes().to_vec())));
+    tree.finish_search();
     expand_all(&mut tree);
     let height = tree.row_count() as u16 + 2;
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -265,22 +297,38 @@ pub fn render_key(
     entries
 }
 
-/// Compare every (key, state) of `op` with the export; returns one line per difference.
+/// Compare every (key, state) of `op` with the export; returns the pairs compared and one line
+/// per difference.
 pub fn compare_operator(
     savepoint: &Savepoint,
     dir: &Path,
-    index: &IndexCache,
-    op: &CachedOperator,
+    reader: &Arc<StateReader<'static>>,
+    op: &OperatorSummary,
 ) -> (usize, Vec<String>) {
-    let exported = export_operator(savepoint, dir, op).expect("export");
-    let ks = op.keyed_state.as_ref().unwrap();
+    let hex = op.operator_id_hex();
+    let keyed = super::keyed::keyed(dir, &hex).expect("keyed operator");
+    let exported = export_operator(savepoint, dir, &hex, &keyed.states).expect("export");
+    let details: Vec<String> = keyed
+        .states
+        .iter()
+        .map(|s| pojo_detail(reader, &hex, &s.name))
+        .collect();
     let mut pairs = 0;
     let mut diffs = Vec::new();
-    for part in &ks.partitions {
-        let expected: Vec<EntryView> = ks
-            .descriptors
+    for record in &keyed.keys {
+        let expected: Vec<EntryView> = keyed
+            .states
             .iter()
-            .map(|d| expected_entry(d, exported.values.get(&(part.key.clone(), d.name.clone()))))
+            .zip(&details)
+            .map(|(d, detail)| {
+                let slot = (record.key.clone(), d.name.clone());
+                expected_entry(
+                    d,
+                    detail,
+                    exported.values.get(&slot),
+                    exported.map_keys.get(&slot).map_or(&[], Vec::as_slice),
+                )
+            })
             .collect();
         let widest = expected
             .iter()
@@ -288,16 +336,16 @@ pub fn compare_operator(
             .max()
             .unwrap_or(0);
         let width = (widest + 40).clamp(200, 6000) as u16;
-        let shown = render_key(op, index, &part.key, width);
+        let shown = render_key(reader, op, &record.key, width);
         assert_eq!(
             shown.len(),
             expected.len(),
             "key {:?}: {} state rows shown, {} states",
-            part.key,
+            record.key,
             shown.len(),
             expected.len()
         );
-        for ((desc, want), got) in ks.descriptors.iter().zip(&expected).zip(&shown) {
+        for ((desc, want), got) in keyed.states.iter().zip(&expected).zip(&shown) {
             pairs += 1;
             let same = match desc.state_type.as_str() {
                 "MAP" | "LIST" => want == got,
@@ -311,7 +359,7 @@ pub fn compare_operator(
             if !same {
                 diffs.push(format!(
                     "{} / {}:\n    tui:    {:?}\n    export: {:?}",
-                    part.key, desc.name, got, want
+                    record.key, desc.name, got, want
                 ));
             }
         }

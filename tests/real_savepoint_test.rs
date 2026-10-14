@@ -1,6 +1,7 @@
+mod common;
+
 use std::path::Path;
 
-use flink_explorer::index::builder::build_index;
 use flink_explorer::parser;
 
 const SAVEPOINT_DIR: &str = "tests/fixtures/savepoint-e6b0ef-0f4907c0f8f5";
@@ -63,29 +64,25 @@ fn parse_real_savepoint_metadata() {
 }
 
 #[test]
-fn build_index_from_real_savepoint() {
-    let metadata_path = Path::new(SAVEPOINT_DIR).join("_metadata");
-    if !metadata_path.exists() {
+fn read_operators_and_keys_from_real_savepoint() {
+    let dir = Path::new(SAVEPOINT_DIR);
+    if !dir.join("_metadata").exists() {
         eprintln!("Skipping: real savepoint fixture not found");
         return;
     }
 
-    let meta = std::fs::metadata(&metadata_path).unwrap();
-    let savepoint = parser::parse_metadata(&metadata_path).unwrap();
-    let index = build_index(&savepoint, meta.len(), 0, Path::new(SAVEPOINT_DIR));
+    let ops = common::keyed::operators(dir);
+    assert!(!ops.is_empty());
 
-    assert!(!index.operators.is_empty());
-
-    let total_entries: usize = index
-        .operators
+    let total_elements: usize = ops
         .iter()
-        .flat_map(|op| &op.states)
-        .map(|s| s.entries.len())
+        .flat_map(|(op, _)| &op.states)
+        .map(|s| s.elements.len())
         .sum();
 
-    println!("Index built: {} operators", index.operators.len());
-    for op in &index.operators {
-        let keyed_keys = op.keyed_state.as_ref().map_or(0, |k| k.partitions.len());
+    println!("Read: {} operators", ops.len());
+    for (op, keyed) in &ops {
+        let keyed_keys = keyed.as_ref().map_or(0, |k| k.keys.len());
         println!(
             "  {} — {} states, {} keys",
             op.display_name,
@@ -93,23 +90,23 @@ fn build_index_from_real_savepoint() {
             keyed_keys
         );
         for s in &op.states {
-            if !s.entries.is_empty() {
+            if !s.elements.is_empty() {
                 println!(
                     "    {} [{}]: {} entries",
                     s.name,
                     s.state_type,
-                    s.entries.len()
+                    s.elements.len()
                 );
             }
         }
-        if let Some(ks) = &op.keyed_state {
-            for p in ks.partitions.iter().take(3) {
-                println!("    key={:?} ({} values)", p.key, p.values.len());
+        if let Some(ks) = keyed {
+            for k in ks.keys.iter().take(3) {
+                println!("    key={:?} ({} entries)", k.key, k.entries.len());
             }
-            if ks.partitions.len() > 3 {
-                println!("    ... {} more keys", ks.partitions.len() - 3);
+            if ks.keys.len() > 3 {
+                println!("    ... {} more keys", ks.keys.len() - 3);
             }
         }
     }
-    println!("Total entries indexed: {}", total_entries);
+    println!("Total operator-state elements: {}", total_elements);
 }

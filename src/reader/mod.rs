@@ -493,7 +493,7 @@ pub(crate) struct SubtaskHeader {
     pub states: Vec<ResolvedState>,
     pub state_types: Vec<String>,
     /// What follows the key in each state's entries, so keys split from namespaces the same way
-    /// as on the index path.
+    /// on every path.
     pub layouts: Vec<EntryLayout>,
     pub num_states: usize,
 }
@@ -511,7 +511,7 @@ impl SubtaskHeader {
             .enumerate()
             .map(|(idx, meta)| {
                 let is_timer = meta.state_type == "TIMER";
-                // Mirrors `index::builder`: timers carry a synthesized firing timestamp, and must
+                // Timers carry a synthesized firing timestamp, and must
                 // not be matched against a nearby POJO snapshot.
                 let value_type = if is_timer {
                     "Date".to_string()
@@ -1337,6 +1337,19 @@ impl<'a> StateReader<'a> {
             }
         }
         Ok(out)
+    }
+
+    /// The POJO layout of keyed state `state`'s value (field names and types, nested POJOs), from
+    /// the first readable header that registers it; `None` when the value is not a POJO or no
+    /// header registers the state.
+    pub fn value_pojo(&self, op: &str, state: &str) -> Result<Option<PojoInfo>, ReaderError> {
+        let ctx = self.context(self.operator_index(op)?);
+        Ok(ctx
+            .streams
+            .iter()
+            .filter_map(|s| s.header.as_ref().ok())
+            .find_map(|h| h.states.iter().find(|st| st.name == state))
+            .and_then(|st| st.pojo.clone()))
     }
 
     /// A cursor must name a key-group of the operator, and the subtask that holds it.

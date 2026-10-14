@@ -22,26 +22,6 @@ pub enum ParseError {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum IndexError {
-    #[error("failed to read index cache at {path}: {source}")]
-    ReadCache {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    #[error("failed to write index cache at {path}: {source}")]
-    WriteCache {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    #[error("index cache is stale (metadata changed since last index)")]
-    StaleCache,
-    #[error("failed to decode index cache: {0}")]
-    Decode(String),
-    #[error("failed to encode index cache: {0}")]
-    Encode(String),
-}
-
-#[derive(Debug, thiserror::Error)]
 pub enum SstError {
     #[error("failed to open SST database at {path}: {msg}")]
     Open { path: PathBuf, msg: String },
@@ -87,8 +67,6 @@ pub enum UiError {
 pub enum AppError {
     #[error(transparent)]
     Parse(#[from] ParseError),
-    #[error(transparent)]
-    Index(#[from] IndexError),
     #[error(transparent)]
     Sst(#[from] SstError),
     #[error(transparent)]

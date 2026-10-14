@@ -27,7 +27,8 @@ struct Cli {
     #[arg(short, long)]
     profile: Option<String>,
 
-    /// Skip index cache (always re-parse)
+    /// Neither read nor write the key counts cache (under the user cache dir; never in the
+    /// savepoint directory): counts are then computed again in the background
     #[arg(long)]
     no_cache: bool,
 
@@ -136,8 +137,8 @@ fn load_and_run(
     let mut app = App::new_with_progress(cli.savepoint_dir, cli.no_cache, |step| {
         loading.advance(step);
         let _ = loading.render(terminal);
-        // Building the index cannot be cancelled, so a Ctrl-C ends the process here (raw mode
-        // turned it into a key event: no SIGINT does it for us).
+        // A Ctrl-C between two loading steps (headers are read one operator at a time) ends the
+        // process here: raw mode turned it into a key event, so no SIGINT does it for us.
         if take_queued_input() {
             restore_terminal(); // process::exit skips the guard's Drop
             std::process::exit(130);
@@ -163,7 +164,7 @@ fn take_queued_input() -> bool {
     flink_explorer::tui::app::drain_is_interrupt(queued)
 }
 
-/// Parse `_metadata` without building the (fully in-memory) index.
+/// Parse `_metadata` alone (the headless paths read state files themselves).
 fn parse_savepoint(cli: &Cli) -> Result<flink_explorer::parser::Savepoint, String> {
     let metadata = cli.savepoint_dir.join("_metadata");
     flink_explorer::parser::parse_metadata(&metadata)

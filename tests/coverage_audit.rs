@@ -1,51 +1,53 @@
 //! Coverage audit: dumps every operator and every state the explorer reads from the
 //! generated savepoint, so we can verify exhaustiveness across all stateful operator types.
-use std::path::Path;
+mod common;
 
-use flink_explorer::index::builder::build_index;
-use flink_explorer::index::cache::IndexCache;
-use flink_explorer::parser;
+use std::path::Path;
+use std::sync::atomic::AtomicBool;
+
+use common::keyed::{find_with_state, operators, reader, Keyed};
+use flink_explorer::operators::OperatorSummary;
 
 const SAVEPOINT_DIR: &str = "tests/fixtures/savepoint-gitlab";
 
-fn load_index() -> IndexCache {
+fn dir() -> &'static Path {
     let dir = Path::new(SAVEPOINT_DIR);
-    let metadata_path = dir.join("_metadata");
     assert!(
-        metadata_path.exists(),
+        dir.join("_metadata").exists(),
         "Savepoint _metadata not found — run `cd test-flink-job && mvn verify`"
     );
-    let savepoint = parser::parse_metadata(&metadata_path).expect("parse metadata");
-    let meta = std::fs::metadata(&metadata_path).unwrap();
-    build_index(&savepoint, meta.len(), 0u64, dir)
+    dir
+}
+
+fn load() -> Vec<(OperatorSummary, Option<Keyed>)> {
+    operators(dir())
+}
+
+/// The `E` export (streamed from the reader) of the whole fixture, written to a temp file.
+fn export(name: &str) -> serde_json::Value {
+    let r = reader(dir());
+    let summaries = flink_explorer::operators::summarize(r.savepoint(), dir());
+    let tmp = std::env::temp_dir().join(format!("{}-{}.json", name, std::process::id()));
+    flink_explorer::export::export_json(&r, &summaries, &tmp, &AtomicBool::new(false), &mut |_| {})
+        .expect("export_json");
+    let json = serde_json::from_str(&std::fs::read_to_string(&tmp).unwrap()).unwrap();
+    let _ = std::fs::remove_file(&tmp);
+    json
 }
 
 #[test]
 fn diagnose_value_types_for_all_types_operator() {
-    let index = load_index();
-    // The "all types" operator (has 'counter') — check value_type label vs actual bytes & pojo_info.
-    let op = index
-        .operators
-        .iter()
-        .find(|o| {
-            o.keyed_state
-                .as_ref()
-                .map_or(false, |k| k.descriptors.iter().any(|d| d.name == "counter"))
-        })
-        .expect("all-types operator");
-    let ks = op.keyed_state.as_ref().unwrap();
-    let part = &ks.partitions[0];
-    println!("\n=== value_type label vs reality (key '{}') ===", part.key);
-    for (idx, d) in ks.descriptors.iter().enumerate() {
-        let blen = part
-            .values
-            .get(idx)
-            .and_then(|v| v.as_ref())
-            .map(|b| b.len());
+    let ops = load();
+    // The "all types" operator (has 'counter') — check value_type label vs actual bytes & class.
+    let (_, ks) = find_with_state(&ops, "counter").expect("all-types operator");
+    let key = &ks.keys[0].key;
+    println!("\n=== value_type label vs reality (key '{}') ===", key);
+    for d in &ks.states {
+        let blen = ks.raw(key, &d.name).map(|b| b.len());
         let pojo_class = d
-            .pojo_info
+            .value_class
             .as_ref()
-            .map(|p| p.class_name.rsplit('.').next().unwrap_or("").to_string());
+            .map(|c| c.rsplit('.').next().unwrap_or("").to_string());
         println!(
             "  {:<16} state={:<9} value_type={:<22} pojo={:<14?} bytes={:?}",
             d.name, d.state_type, d.value_type, pojo_class, blen
@@ -54,14 +56,10 @@ fn diagnose_value_types_for_all_types_operator() {
 }
 
 /// Verify nested POJO (ComplexRecord.address) and tuple states decode via the production
-/// export path (the same code the TUI/JSON export uses).
+/// export path (the same reader and decoder the TUI uses).
 #[test]
 fn verify_tuples_and_nested_pojo() {
-    let index = load_index();
-    let tmp = std::env::temp_dir().join("sp_export_audit.json");
-    flink_explorer::export::export_json(&index, None, &tmp).expect("export_json");
-    let json: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&tmp).unwrap()).unwrap();
+    let json = export("sp_export_audit");
 
     let mut complex = serde_json::Value::Null;
     let mut t2 = serde_json::Value::Null;
@@ -113,11 +111,7 @@ fn verify_tuples_and_nested_pojo() {
 /// see exactly which binary payloads decode, which come out null, and which are shown raw.
 #[test]
 fn dump_decoded_values() {
-    let index = load_index();
-    let tmp = std::env::temp_dir().join("sp_export_full.json");
-    flink_explorer::export::export_json(&index, None, &tmp).expect("export_json");
-    let json: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&tmp).unwrap()).unwrap();
+    let json = export("sp_export_full");
 
     println!("\n============ DECODED VALUES (first key per operator) ============");
     for op in json["operators"].as_array().unwrap() {
@@ -125,7 +119,6 @@ fn dump_decoded_values() {
         if keys.is_empty() {
             continue;
         }
-        // pick the first key that has any non-null state
         let k = &keys[0];
         println!("\nOP {}  key={}", op["name"], k["key"]);
         let states = k["states"].as_object().unwrap();
@@ -144,67 +137,35 @@ fn dump_decoded_values() {
     println!("\n=================================================================");
 }
 
-fn to_pojo_info(
-    c: &flink_explorer::index::cache::CachedPojoInfo,
-) -> flink_explorer::parser::pojo::PojoInfo {
-    use flink_explorer::parser::pojo::{PojoField, PojoInfo};
-    PojoInfo {
-        class_name: c.class_name.clone(),
-        short_name: c
-            .class_name
-            .rsplit('.')
-            .next()
-            .unwrap_or(&c.class_name)
-            .to_string(),
-        fields: c
-            .fields
-            .iter()
-            .map(|f| PojoField {
-                name: f.name.clone(),
-                type_name: f.type_name.clone(),
-                nested_pojo: f.nested.as_ref().map(|n| Box::new(to_pojo_info(n))),
-            })
-            .collect(),
-    }
-}
-
-/// Confirm the *TUI* decoder (deserialize_pojo_to_json) decodes ComplexRecord fully,
-/// including date/time fields the JSON-export decoder misses.
+/// Confirm `deserialize_pojo_to_json` decodes ComplexRecord fully, including date/time fields.
 #[test]
 fn verify_tui_decodes_complexrecord() {
-    let index = load_index();
-    let op = index
-        .operators
+    let ops = load();
+    let (_, ks) = find_with_state(&ops, "complex-record").unwrap();
+    let r = reader(dir());
+    let pi = r
+        .value_pojo(&ks.op_hex, "complex-record")
+        .unwrap()
+        .expect("pojo_info");
+    let key = ks
+        .keys
         .iter()
-        .find(|o| {
-            o.keyed_state.as_ref().map_or(false, |k| {
-                k.descriptors.iter().any(|d| d.name == "complex-record")
-            })
-        })
-        .unwrap();
-    let ks = op.keyed_state.as_ref().unwrap();
-    let idx = ks
-        .descriptors
-        .iter()
-        .position(|d| d.name == "complex-record")
-        .unwrap();
-    let pi = to_pojo_info(ks.descriptors[idx].pojo_info.as_ref().expect("pojo_info"));
-    let raw = ks.partitions[0].values[idx].as_ref().expect("value bytes");
-    let json = flink_explorer::parser::pojo::deserialize_pojo_to_json(raw, &pi, None);
+        .find(|k| ks.raw(&k.key, "complex-record").is_some())
+        .expect("a key with a complex-record")
+        .key
+        .clone();
+    let raw = ks.raw(&key, "complex-record").unwrap();
+    let json = flink_explorer::parser::pojo::deserialize_pojo_to_json(&raw, &pi, None);
     println!("\nTUI complex-record decode:\n{}", json);
 }
 
 #[test]
 fn dump_full_inventory() {
-    let index = load_index();
+    let ops = load();
     println!("\n================ OPERATOR / STATE INVENTORY ================");
-    for op in &index.operators {
-        let kkeys = op.keyed_state.as_ref().map_or(0, |k| k.total_keys);
-        let ktype = op
-            .keyed_state
-            .as_ref()
-            .map(|k| k.key_type.as_str())
-            .unwrap_or("-");
+    for (op, keyed) in &ops {
+        let kkeys = keyed.as_ref().map_or(0, |k| k.keys.len());
+        let ktype = keyed.as_ref().map(|k| k.key_type.as_str()).unwrap_or("-");
         println!(
             "\nOP '{}'  [keyed keys={} key_type={}] [operator-states={}]",
             op.display_name,
@@ -212,11 +173,14 @@ fn dump_full_inventory() {
             ktype,
             op.states.len()
         );
-        if let Some(ks) = &op.keyed_state {
-            for d in &ks.descriptors {
+        if let Some(ks) = keyed {
+            for d in &ks.states {
                 println!(
                     "    keyed: {:<22} type={:<10} value={:<22} entries={}",
-                    d.name, d.state_type, d.value_type, d.entry_count
+                    d.name,
+                    d.state_type,
+                    d.value_type,
+                    ks.entry_count(&d.name)
                 );
             }
         }
@@ -225,141 +189,88 @@ fn dump_full_inventory() {
                 "    opstate: {:<28} type={:<18} entries={}",
                 s.name,
                 s.state_type,
-                s.entries.len()
+                s.elements.len()
             );
         }
     }
     println!("\n=========================================================");
 }
 
+/// The first two entries of a MAP state, as stored: namespace (`VoidNamespace` + map key) and
+/// value (`NullableSerializer` byte + value).
 #[test]
-fn diagnose_map_blob_bytes() {
-    let index = load_index();
-    for (state, opkey) in [
-        ("simple-string-map", "counter"),
-        ("events-by-type", "counter"),
-    ] {
-        let op = index
-            .operators
-            .iter()
-            .find(|o| {
-                o.keyed_state
-                    .as_ref()
-                    .map_or(false, |k| k.descriptors.iter().any(|d| d.name == opkey))
-            })
-            .unwrap();
-        let ks = op.keyed_state.as_ref().unwrap();
-        let idx = match ks.descriptors.iter().position(|d| d.name == state) {
-            Some(i) => i,
-            None => continue,
-        };
-        for part in &ks.partitions {
-            if let Some(Some(blob)) = part.values.get(idx) {
-                if blob.len() < 4 {
-                    continue;
-                }
-                let count = i32::from_be_bytes(blob[0..4].try_into().unwrap());
-                println!(
-                    "\n{} key='{}' count={} blobLen={}",
-                    state,
-                    part.key,
-                    count,
-                    blob.len()
-                );
-                let mut p = 4usize;
-                for _ in 0..count.min(2) {
-                    let nl = i32::from_be_bytes(blob[p..p + 4].try_into().unwrap()) as usize;
-                    p += 4;
-                    let ns = &blob[p..p + nl];
-                    p += nl;
-                    let vl = i32::from_be_bytes(blob[p..p + 4].try_into().unwrap()) as usize;
-                    p += 4;
-                    let v = &blob[p..p + vl];
-                    p += vl;
-                    println!(
-                        "  ns({})={:02x?}  val({})={:02x?}",
-                        nl,
-                        ns,
-                        vl,
-                        &v[..vl.min(24)]
-                    );
-                }
-                break;
+fn diagnose_map_entry_bytes() {
+    let ops = load();
+    let (_, ks) = find_with_state(&ops, "counter").unwrap();
+    for state in ["simple-string-map", "events-by-type"] {
+        if ks.state(state).is_none() {
+            continue;
+        }
+        for k in &ks.keys {
+            let entries = ks.entries(&k.key, state);
+            if entries.is_empty() {
+                continue;
             }
+            println!("\n{} key='{}' count={}", state, k.key, entries.len());
+            for e in entries.iter().take(2) {
+                println!(
+                    "  ns({})={:02x?}  val({})={:02x?}",
+                    e.namespace.len(),
+                    e.namespace,
+                    e.raw.len(),
+                    &e.raw[..e.raw.len().min(24)]
+                );
+            }
+            break;
         }
     }
 }
 
 #[test]
 fn diagnose_list_array_bytes() {
-    let index = load_index();
-    let op = index
-        .operators
-        .iter()
-        .find(|o| {
-            o.keyed_state.as_ref().map_or(false, |k| {
-                k.descriptors.iter().any(|d| d.name == "large-list")
-            })
-        })
-        .unwrap();
-    let ks = op.keyed_state.as_ref().unwrap();
+    let ops = load();
+    let (_, ks) = find_with_state(&ops, "large-list").unwrap();
+    let key = &ks.keys[0].key;
     for name in ["large-list", "log-entries", "event-history"] {
-        if let Some(idx) = ks.descriptors.iter().position(|d| d.name == name) {
-            if let Some(Some(b)) = ks.partitions[0].values.get(idx) {
-                println!(
-                    "{} len={} first40={:02x?}",
-                    name,
-                    b.len(),
-                    &b[..b.len().min(40)]
-                );
-            }
-        }
-    }
-    // String[] is in the extra-types op
-    let op2 = index
-        .operators
-        .iter()
-        .find(|o| {
-            o.keyed_state.as_ref().map_or(false, |k| {
-                k.descriptors.iter().any(|d| d.name == "string-array")
-            })
-        })
-        .unwrap();
-    let ks2 = op2.keyed_state.as_ref().unwrap();
-    if let Some(idx) = ks2
-        .descriptors
-        .iter()
-        .position(|d| d.name == "string-array")
-    {
-        if let Some(Some(b)) = ks2.partitions[0].values.get(idx) {
+        if let Some(b) = ks.raw(key, name) {
             println!(
-                "string-array len={} all={:02x?}",
+                "{} len={} first40={:02x?}",
+                name,
                 b.len(),
                 &b[..b.len().min(40)]
             );
         }
     }
+    // String[] is in the extra-types op
+    let (_, ks2) = find_with_state(&ops, "string-array").unwrap();
+    if let Some(b) = ks2.raw(&ks2.keys[0].key, "string-array") {
+        println!(
+            "string-array len={} all={:02x?}",
+            b.len(),
+            &b[..b.len().min(40)]
+        );
+    }
 }
 
 #[test]
 fn diagnose_value_classes() {
-    let index = load_index();
+    let ops = load();
+    let r = reader(dir());
     println!("\n=== value classes (package + name) per POJO state ===");
-    for op in &index.operators {
-        if let Some(ks) = &op.keyed_state {
-            for d in &ks.descriptors {
-                if let Some(pi) = &d.pojo_info {
-                    println!(
-                        "  {:<18} value_type={:<14} class={}",
-                        d.name, d.value_type, pi.class_name
-                    );
-                    for f in &pi.fields {
-                        if let Some(nested) = &f.nested {
-                            println!(
-                                "      nested field {:<10} class={}",
-                                f.name, nested.class_name
-                            );
-                        }
+    for (_, keyed) in &ops {
+        let Some(ks) = keyed else { continue };
+        for d in &ks.states {
+            if let Some(pi) = r.value_pojo(&ks.op_hex, &d.name).unwrap() {
+                println!(
+                    "  {:<18} value_type={:<14} class={}",
+                    d.name, d.value_type, pi.class_name
+                );
+                for f in &pi.fields {
+                    if let Some(nested) = &f.nested_pojo {
+                        println!(
+                            "      nested field {:<10} class={}",
+                            f.name, nested.class_name
+                        );
                     }
                 }
             }
