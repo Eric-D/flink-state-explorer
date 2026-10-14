@@ -305,15 +305,22 @@ fn push_operator_stream_states(
         let is_broadcast = part.mode == 2; // OperatorStateHandle.Mode.BROADCAST
         let entries = match &elements {
             _ if part.offsets.is_empty() => Vec::new(),
-            Err(e) => vec![decoded_entry(format!("[error: {}]", e))],
+            Err(e) => vec![unread_entry(format!("[error: {}]", e))],
             Ok(elements) => part
                 .offsets
                 .iter()
-                .map(|&offset| {
-                    decoded_entry(match elements.element(offset) {
-                        Ok(elem) => label_operator_element(&part.state_name, is_broadcast, &elem),
-                        Err(e) => format!("[error: {}]", e),
-                    })
+                .map(|&offset| match elements.element(offset) {
+                    Ok(elem) => CachedEntry {
+                        key: label_operator_element(&part.state_name, is_broadcast, &elem)
+                            .into_bytes(),
+                        key_group: 0,
+                        // Kept for the TUI's hex view (`x`): a partly decoded element is
+                        // checked against its bytes. At most the size of the label next to it.
+                        value_ref: ValueRef::Inline {
+                            data: elem.to_vec(),
+                        },
+                    },
+                    Err(e) => unread_entry(format!("[error: {}]", e)),
                 })
                 .collect(),
         };
@@ -349,8 +356,8 @@ fn label_operator_element(state_name: &str, is_broadcast: bool, elem: &[u8]) -> 
     .unwrap_or_else(|| decode_operator_element(elem))
 }
 
-/// An operator-state entry: the decoded label is all that is kept.
-fn decoded_entry(label: String) -> CachedEntry {
+/// An operator-state entry whose element could not be read: the error label is all there is.
+fn unread_entry(label: String) -> CachedEntry {
     CachedEntry {
         key: label.into_bytes(),
         key_group: 0,

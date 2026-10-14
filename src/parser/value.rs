@@ -174,8 +174,8 @@ fn decode_list(
     Value::Array(items)
 }
 
-/// Read a POJO value: the `PojoSerializer` flags byte, then each field. Public so the TUI's
-/// string-based path (`parser::pojo`) can reuse this single decoder.
+/// Read a POJO value: the `PojoSerializer` flags byte, then each field. Public so that
+/// `parser::pojo`'s string helpers and `decode_key` reuse this single decoder.
 pub fn decode_pojo(
     r: &mut JavaReader<&[u8]>,
     info: &PojoInfo,

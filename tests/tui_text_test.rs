@@ -118,13 +118,14 @@ fn long_non_ascii_values_render_at_80_and_120_columns() {
                 rows.iter()
                     .find(|r| r.contains(&format!("⯈ {} (", key)))
                     .unwrap_or_else(|| panic!("key {:?} not shown at {}:\n{}", key, width, dump));
-                // The value row starts with the value itself, whole or shortened.
+                // The value row starts with the value itself, whole or shortened (quoted, as
+                // `parser::value::value_to_display` shows a string).
                 let head: String = value.chars().take(5).collect();
                 let value_row = rows
                     .iter()
                     .find(|r| {
                         r.contains(&format!(
-                            "label{}: {}",
+                            "label{}: \"{}",
                             if debug { " [VALUE]" } else { "" },
                             head
                         ))

@@ -1,6 +1,7 @@
 //! End-to-end decoder tests against the generated savepoint: protobuf-in-POJO, tuples, primitive
 //! arrays, and high-cardinality (scrollbar) coverage. All go through the production decode path
-//! (`parser::value` via `export::export_json`), so they also prove export == TUI capability.
+//! (`parser::value` via `export::export_json`). That the TUI renders the same values is proved by
+//! `tests/tui_parity_test.rs` (synthetic, in CI) and `tests/tui_gitlab_parity_test.rs` (fixture).
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -569,9 +570,11 @@ fn all_fields_pojo_decodes_past_its_char_fields_or_says_why_not() {
         .iter()
         .position(|d| d.name == "all-fields-pojo")
         .unwrap();
-    let pi = flink_explorer::tui::tree::cached_pojo_to_pojo_info(
-        ks.descriptors[si].pojo_info.as_ref().expect("POJO info"),
-    );
+    let pi = ks.descriptors[si]
+        .pojo_info
+        .as_ref()
+        .expect("POJO info")
+        .to_pojo_info();
     let raw = ks.partitions[0].values[si].as_deref().expect("a value");
     let shown = parser::pojo::deserialize_pojo_to_json(raw, &pi, None);
     for part in [
