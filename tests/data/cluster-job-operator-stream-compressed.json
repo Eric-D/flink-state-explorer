@@ -1,0 +1,22 @@
+[
+  {
+    "elements": [
+      "user-alice",
+      "user-charlie",
+      "user-echo",
+      "org-beta"
+    ],
+    "name": "operator-buffer",
+    "union": false
+  },
+  {
+    "elements": [
+      "union-user-alice",
+      "union-user-charlie",
+      "union-user-echo",
+      "union-org-beta"
+    ],
+    "name": "operator-union-buffer",
+    "union": true
+  }
+]

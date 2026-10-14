@@ -123,10 +123,10 @@ fn source_for<'a>(
             let (_, len) = crate::state_file::open(&path, f.state_size)?;
             Ok(Some(Source::File { path, base: 0, len }))
         }
-        // A segment handle points at a region of a shared file. We treat the key-group offsets as
-        // relative to `start_pos`, which matches the offsets being recorded on the logical
-        // checkpoint output stream — NOT verified against a real segmented savepoint, so an
-        // export from one should be sanity-checked before being trusted.
+        // A segment handle points at a region of a shared file, and offsets inside it are
+        // relative to `start_pos`: FileMergingCheckpointStateOutputStream.getPos (:125-129) on
+        // write, FsSegmentDataInputStream.seek (:96-99) on read (release-1.20). No real
+        // file-merging savepoint has been read yet.
         StreamStateHandle::Segment(seg) => {
             let path = crate::state_file::local_path(&seg.file_path)?;
             let base = seg.start_pos.max(0) as u64;
@@ -202,6 +202,24 @@ fn unreadable(errors: &[String]) -> String {
         errors.len(),
         crate::state_file::summarize(errors, 5)
     )
+}
+
+/// Read a whole stream into memory, resolving its handle exactly as [`source_for`] does (inline
+/// bytes, a file relative to the savepoint, an absolute `file:` path, or a segment of a shared
+/// file), with the same checks: a missing, unreadable or truncated file is an error naming it.
+///
+/// For operator-state streams, which the index reads in full like Flink does on restore
+/// (`OperatorStateRestoreOperation`); keyed streams are read one key-group at a time instead.
+pub(crate) fn read_whole_stream(
+    delegate: &StreamStateHandle,
+    savepoint_dir: &Path,
+) -> Result<Vec<u8>, String> {
+    let Some(src) = source_for(delegate, savepoint_dir)? else {
+        return Err("the state handle points at no stream".to_string());
+    };
+    let mut buf = Vec::new();
+    src.read_range(0, src.len(), &mut buf)?;
+    Ok(buf)
 }
 
 /// Unwrap the delegate of a keyed handle, which may itself nest a key-groups handle.

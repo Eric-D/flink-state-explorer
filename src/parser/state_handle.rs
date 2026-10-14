@@ -379,7 +379,9 @@ pub fn read_operator_state_handle<R: Read>(
     let tag = reader.read_byte()?;
     match tag {
         0 => Ok(StateHandle::Null),
-        OSH_PARTITIONABLE | OSH_SEGMENT_PARTITIONABLE => read_operator_stream_state_handle(reader),
+        OSH_PARTITIONABLE | OSH_SEGMENT_PARTITIONABLE => {
+            read_operator_stream_state_handle(reader, tag == OSH_SEGMENT_PARTITIONABLE)
+        }
         _ => Err(ParseError::UnknownStateHandleTag {
             tag,
             position: reader.position() - 1,
@@ -387,8 +389,13 @@ pub fn read_operator_state_handle<R: Read>(
     }
 }
 
+/// `MetadataV2V3SerializerBase.deserializeOperatorStateHandle` (Flink release-1.20, :643-693).
+/// A file-merging handle (`SEGMENT_PARTITIONABLE_OPERATOR_STATE_HANDLE`, written at :624-636)
+/// carries the task-owned and shared directories plus an `isEmpty` flag between the offsets and
+/// the delegate (a `SegmentFileStateHandle`); none of them is needed to read the stream.
 fn read_operator_stream_state_handle<R: Read>(
     reader: &mut JavaReader<R>,
+    file_merging: bool,
 ) -> Result<StateHandle, ParseError> {
     let num_partitions = reader.read_int()?;
     let mut partition_offsets = Vec::with_capacity(num_partitions as usize);
@@ -405,6 +412,11 @@ fn read_operator_stream_state_handle<R: Read>(
             mode,
             offsets,
         });
+    }
+    if file_merging {
+        let _task_owned_dir = reader.read_utf()?;
+        let _shared_dir = reader.read_utf()?;
+        let _is_empty = reader.read_boolean()?;
     }
     let delegate_handle = read_stream_state_handle(reader)?;
     Ok(StateHandle::OperatorStream(OperatorStreamStateHandle {
