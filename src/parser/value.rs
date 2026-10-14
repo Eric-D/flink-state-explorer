@@ -17,7 +17,8 @@
 //!   one that could not be fully decoded. Flink writes no length in front of a field, so once one
 //!   value's length is unknown nothing after it can be located.
 //! - `"[not decoded: <n> more elements]"`: the rest of a length-prefixed list or array whose
-//!   decoding stopped at an element.
+//!   decoding stopped at an element; `"[not decoded: the rest of the list]"` for a keyed
+//!   `ListState`, whose elements are delimited, not counted.
 //!
 //! A value that could only be partly decoded keeps what was read, with the marker where decoding
 //! stopped (see [`Decoded`]). A marker sits where a value of any type would, so a reader can
@@ -150,8 +151,14 @@ fn decode_list(
             Ok(v) => items.push(v),
             Err(partial) => {
                 // The next delimiter can't be found once an element's length is unknown: the
-                // element's marker ends the list.
+                // element's marker ends the list. Say so when bytes remain, or a list of three
+                // Kryo elements would read as a list of one.
                 items.push(partial);
+                if r.remaining() > 0 {
+                    items.push(Value::String(
+                        "[not decoded: the rest of the list]".to_string(),
+                    ));
+                }
                 break;
             }
         }
@@ -631,6 +638,9 @@ pub fn decode_map_entry(
         let mut kr = JavaReader::new(key_payload);
         match decode_field(&mut kr, key_type, None, proto) {
             Ok(Value::String(s)) => s,
+            // A null key (a heap MapState accepts one; StringSerializer writes it as length 0)
+            // must not read as the string "null".
+            Ok(Value::Null) => "[null]".to_string(),
             Ok(v) => v.to_string().trim_matches('"').to_string(),
             Err(marker) => format!("{} #{}", value_to_display(&marker), fallback_key),
         }

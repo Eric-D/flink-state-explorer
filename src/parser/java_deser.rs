@@ -8,6 +8,13 @@ pub struct JavaReader<R> {
     pos: u64,
 }
 
+impl JavaReader<&[u8]> {
+    /// Bytes left to read (reading a `&[u8]` advances the slice).
+    pub fn remaining(&self) -> usize {
+        self.inner.len()
+    }
+}
+
 impl<R: Read> JavaReader<R> {
     pub fn new(inner: R) -> Self {
         Self { inner, pos: 0 }

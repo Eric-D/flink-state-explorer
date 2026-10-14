@@ -111,7 +111,9 @@ tests assert that. The Parquet `value` column is **typed per export**, since one
 state and a state has one value serializer: `Int64`/`Float64`/`Boolean`/`Utf8` for scalars, and
 `Utf8` holding compact JSON for anything structured (POJO, Map, List, Tuple, arrays, Kryo). The
 `value_type` column carries the Flink serializer type so a reader can tell the two `Utf8` cases
-apart. Files are zstd-compressed, written in 65 536-row row groups.
+apart. A `value_note` column says why `value` is NULL when the state did hold something
+(the decoder's marker, or JSON the typed column cannot hold); NULL `value` with NULL note is a
+value Flink stored as null. Files are zstd-compressed, written in 65 536-row row groups.
 
 `src/export_state.rs` deliberately bypasses `src/index`, because the index holds every key and
 every raw value in memory. Instead it reads only each subtask's **header** (it ends where the first
