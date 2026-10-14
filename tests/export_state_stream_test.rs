@@ -214,7 +214,7 @@ fn every_key_group_flink_wrote_reads_to_its_end_mark() {
     for dir in [SAVEPOINT_DIR, "tests/fixtures/savepoint-compressed"] {
         let dir = Path::new(dir);
         let sp = parser::parse_metadata(&dir.join("_metadata")).expect("parse metadata");
-        let states = list_states(&sp, dir);
+        let states = list_states(&sp, dir).states;
         assert!(!states.is_empty(), "{}", dir.display());
         for (op, name, _) in &states {
             let stats = export_state_ndjson(&sp, dir, Some(op), name, None, &mut std::io::sink())

@@ -955,7 +955,9 @@ pub struct KeyGroupParse<'a> {
 /// length, which read together as a plausible length.
 ///
 /// Returns `Err` when the block cannot be read to its end mark — see [`BlockDefect`]; the entries
-/// read before the defect have been emitted.
+/// read before the defect have been emitted. A run under a stateId the header does not declare
+/// is skipped (not emitted), the rest of the block is still read, and the block is then reported
+/// as [`BlockDefect::UnknownStateId`].
 pub fn parse_key_group_block(
     data: &[u8],
     kg_index: u16,
@@ -976,14 +978,20 @@ pub fn parse_key_group_block(
 
     let mut pos = 0usize;
     let mut state_id = read_be_u16(data, &mut pos)?;
+    // A stateId the header does not declare. The run is still delimited by the flag, so it is
+    // skipped and the rest of the key-group is read; the defect is reported at the end. (The
+    // declared count comes from header heuristics, which may undercount: aborting here would
+    // drop good entries.)
+    let mut unknown: Option<BlockDefect> = None;
 
     loop {
         if state_id == END_OF_KEY_GROUP_MARK {
-            return Ok(());
+            return unknown.map_or(Ok(()), Err);
         }
         // Keyed and priority-queue states share the stateId space; the header registers them all.
-        if state_id as usize >= num_states {
-            return Err(BlockDefect::UnknownStateId {
+        let known = (state_id as usize) < num_states;
+        if !known && unknown.is_none() {
+            unknown = Some(BlockDefect::UnknownStateId {
                 offset: pos - 2,
                 state_id,
                 num_states,
@@ -1009,7 +1017,7 @@ pub fn parse_key_group_block(
 
         // Entries of a state we were not asked for are skipped without decoding the key or
         // copying the value: only the length prefixes are followed.
-        let wanted = only_state.is_none_or(|s| s == state_id);
+        let wanted = known && only_state.is_none_or(|s| s == state_id);
 
         // Timer (priority-queue) entries have a different key layout and no value; synthesize
         // the firing timestamp as the value so it can be displayed. Both key readers skip the

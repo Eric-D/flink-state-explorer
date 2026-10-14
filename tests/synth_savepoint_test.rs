@@ -522,6 +522,7 @@ fn a_header_over_50_kb_lists_every_state_on_both_paths() {
 
         let savepoint = parser::parse_metadata(&dir.join("_metadata")).unwrap();
         let listed: Vec<(String, String)> = list_states(&savepoint, &dir)
+            .states
             .into_iter()
             .map(|(_, name, ty)| (name, ty))
             .collect();
@@ -587,6 +588,7 @@ fn the_index_reads_its_header_from_the_header_only() {
 
     let savepoint = parser::parse_metadata(&dir.join("_metadata")).unwrap();
     let listed: Vec<String> = list_states(&savepoint, &dir)
+        .states
         .into_iter()
         .map(|(_, name, _)| name)
         .collect();
@@ -715,7 +717,7 @@ fn a_malformed_key_group_is_reported_by_the_export_the_index_and_the_cli() {
 
     // CLI: the rows still go out, with a warning on stderr.
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_flink-explorer"))
-        .arg(&dir)
+        .arg(&*dir)
         .args(["--export-state", "counter", "-o", "-"])
         .output()
         .unwrap();
