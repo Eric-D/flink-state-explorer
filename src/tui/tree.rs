@@ -10,6 +10,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, List, ListItem, ListState};
 use serde_json::Value;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::index::cache::{IndexCache, StateDescriptor, ValueRef};
@@ -21,6 +22,8 @@ use crate::tui::text;
 
 /// Operator-state elements listed at once; past it, `↑`/`↓` pager rows scroll the window.
 const ENTRY_PAGE_SIZE: usize = 500;
+/// Rows `PageUp`/`PageDown` move by before the tree has been rendered (then: the list's height).
+const DEFAULT_PAGE_ROWS: usize = 20;
 /// Maximum number of partitions (keys) to display at once.
 const PARTITION_PAGE_SIZE: usize = 30;
 /// Entries of an expanded MAP value listed before a "… +N more" row.
@@ -129,7 +132,16 @@ pub struct TreeView {
     /// Show a `Long` value that looks like epoch millis as a date
     pub auto_date: bool,
     display_width: u16,
+    /// Rows the list showed at its last render: what `PageUp`/`PageDown` move by.
+    page_rows: usize,
     proto_ctx: Option<Arc<ProtoContext>>,
+    /// The decoded values of the expanded keys, by (operator, partition, descriptor): a rebuild
+    /// (any expand, collapse, toggle or scroll) reuses them instead of decoding every value of
+    /// every expanded key again — a 300k-entry MAP took ~70 ms per rebuild. Holds only what the
+    /// last rebuild showed, and is dropped when the proto context changes.
+    decoded: HashMap<(usize, usize, usize), Value>,
+    /// Values decoded so far (`decode_state_value` calls), for tests.
+    decode_calls: usize,
 }
 
 struct OperatorSnapshot {
@@ -237,13 +249,12 @@ struct PartitionSnapshot {
     entry_raw: Vec<Option<Vec<u8>>>,
 }
 
-/// One operator-state element.
+/// One operator-state element. Its bytes stay in the index, where `selected_raw_bytes` reads
+/// them: a copy here held them twice in memory.
 struct OpElement {
     /// The decoded element, as the index labelled it.
     label: Vec<u8>,
     key_group: u16,
-    /// The element's bytes; `None` when it could not be read (the label says why).
-    bytes: Option<Vec<u8>>,
 }
 
 struct StateSnapshot {
@@ -302,10 +313,6 @@ impl TreeView {
                             .map(|e| OpElement {
                                 label: e.key.clone(),
                                 key_group: e.key_group,
-                                bytes: match &e.value_ref {
-                                    ValueRef::Inline { data } => Some(data.clone()),
-                                    ValueRef::File { .. } | ValueRef::Decoded => None,
-                                },
                             })
                             .collect(),
                         filtered_indices: None,
@@ -354,7 +361,10 @@ impl TreeView {
             debug_mode: false,
             auto_date: true,
             display_width: 120,
+            page_rows: DEFAULT_PAGE_ROWS,
             proto_ctx: None,
+            decoded: HashMap::new(),
+            decode_calls: 0,
         };
         tv.rebuild_flat_list();
         if !tv.nodes.is_empty() {
@@ -365,6 +375,10 @@ impl TreeView {
 
     fn rebuild_flat_list(&mut self) {
         let mut nodes = Vec::new();
+        // Values decoded by the last rebuild; those this one shows move to `decoded`.
+        let mut previous = std::mem::take(&mut self.decoded);
+        let mut decoded = HashMap::new();
+        let mut decode_calls = 0;
         let style = ValueStyle {
             proto: self.proto_ctx.as_deref(),
             debug: self.debug_mode,
@@ -498,8 +512,13 @@ impl TreeView {
                             .and_then(|v| v.as_deref())
                             .filter(|r| !r.is_empty());
                         let pojo = keyed.pojo_infos.get(ei).and_then(Option::as_ref);
-                        let value =
-                            raw.map(|r| decode_state_value(r, &desc.value_type, pojo, style.proto));
+                        let cache_key = (op_idx, pi, ei);
+                        let value = raw.map(|r| {
+                            previous.remove(&cache_key).unwrap_or_else(|| {
+                                decode_calls += 1;
+                                decode_state_value(r, &desc.value_type, pojo, style.proto)
+                            })
+                        });
                         let row = entry_row(desc, value.as_ref(), raw, &style);
                         let entry_expanded = row.expandable
                             && self.is_expanded(
@@ -540,6 +559,9 @@ impl TreeView {
                                     .kind(c.kind)
                                     .at(Some(state_idx), Some(ei))
                             }));
+                        }
+                        if let Some(value) = value {
+                            decoded.insert(cache_key, value);
                         }
                     }
                 }
@@ -629,6 +651,9 @@ impl TreeView {
             }
         }
 
+        self.decoded = decoded;
+        self.decode_calls += decode_calls;
+
         // Preserve selection
         let selected = self.list_state.selected().unwrap_or(0);
         self.nodes = nodes;
@@ -686,7 +711,16 @@ impl TreeView {
 
     pub fn set_proto_context(&mut self, ctx: Arc<ProtoContext>) {
         self.proto_ctx = Some(ctx);
+        // Decoded with the previous context: protobuf fields may decode differently now.
+        self.decoded.clear();
         self.rebuild_flat_list();
+    }
+
+    /// How many values have been decoded since this view was created. A rebuild decodes only the
+    /// values the previous one did not show.
+    #[doc(hidden)]
+    pub fn decode_calls(&self) -> usize {
+        self.decode_calls
     }
 
     pub fn toggle_hide_empty(&mut self) {
@@ -704,16 +738,17 @@ impl TreeView {
         self.rebuild_flat_list();
     }
 
-    /// Scroll the window a pager row belongs to by one step, keeping the cursor where it is:
-    /// the keyed partitions of its operator, or the elements of its operator state.
-    fn scroll(&mut self, pager_idx: usize, forward: bool) {
+    /// Scroll the window a pager row belongs to by up to `amount` items, keeping the cursor where
+    /// it is: the keyed partitions of its operator, or the elements of its operator state.
+    /// Returns how far it scrolled.
+    fn scroll(&mut self, pager_idx: usize, forward: bool, amount: usize) -> usize {
         let selected_before = self.list_state.selected().unwrap_or(0);
         let (op_idx, state_idx) = {
             let n = &self.nodes[pager_idx];
             (n.op_idx, n.state_idx)
         };
         let Some(op) = self.operators.get_mut(op_idx) else {
-            return;
+            return 0;
         };
         let (offset, visible, page) = match state_idx {
             None => match &mut op.keyed {
@@ -721,29 +756,30 @@ impl TreeView {
                     let visible = k.visible_count();
                     (&mut k.partition_offset, visible, PARTITION_PAGE_SIZE)
                 }
-                None => return,
+                None => return 0,
             },
             Some(si) => match op.states.get_mut(si) {
                 Some(s) => {
                     let visible = s.visible_count();
                     (&mut s.entry_offset, visible, ENTRY_PAGE_SIZE)
                 }
-                None => return,
+                None => return 0,
             },
         };
-        if forward {
-            if *offset < visible.saturating_sub(page) {
-                *offset += 1;
-            }
+        let before = *offset;
+        *offset = if forward {
+            before.max((before + amount).min(visible.saturating_sub(page)))
         } else {
-            *offset = offset.saturating_sub(1);
-        }
+            before.saturating_sub(amount)
+        };
+        let moved = before.abs_diff(*offset);
 
         self.rebuild_flat_list();
         // Keep cursor at same visual position
         self.list_state.select(Some(
             selected_before.min(self.nodes.len().saturating_sub(1)),
         ));
+        moved
     }
 
     /// Apply a filter to keyed partition keys and operator-state elements.
@@ -787,7 +823,7 @@ impl TreeView {
             }
             if self.nodes[selected - 1].kind == NodeKind::PagerUp {
                 // Scroll backward — cursor stays on same visual position
-                self.scroll(selected - 1, false);
+                self.scroll(selected - 1, false, 1);
             } else {
                 self.list_state.select(Some(selected - 1));
             }
@@ -801,29 +837,78 @@ impl TreeView {
             }
             if self.nodes[selected + 1].kind == NodeKind::PagerDown {
                 // Scroll forward — cursor stays on same visual position
-                self.scroll(selected + 1, true);
+                self.scroll(selected + 1, true, 1);
             } else {
                 self.list_state.select(Some(selected + 1));
             }
         }
     }
 
-    /// Expand the selected node. On a leaf with bytes behind it (a keyed value, an
-    /// operator-state element), returns them for the detail overlay instead.
-    pub fn expand(&mut self) -> Option<RawBytes> {
-        let selected = self.list_state.selected()?;
-        let node = self.nodes.get(selected)?;
-        if node.has_children {
-            self.nodes[selected].expanded = true;
-            self.rebuild_flat_list();
-            return None;
+    /// `PageDown`: the cursor moves down a page of rows (the list's height); where it meets a `↓`
+    /// pager row, that window scrolls forward instead, by what is left of the page.
+    pub fn page_down(&mut self) {
+        self.page(true);
+    }
+
+    /// `PageUp`: the cursor moves up a page of rows; where it meets a `↑` pager row, that window
+    /// scrolls back instead, by what is left of the page.
+    pub fn page_up(&mut self) {
+        self.page(false);
+    }
+
+    fn page(&mut self, forward: bool) {
+        let pager = if forward {
+            NodeKind::PagerDown
+        } else {
+            NodeKind::PagerUp
+        };
+        let mut left = self.page_rows.max(1);
+        while left > 0 {
+            let Some(selected) = self.list_state.selected() else {
+                return;
+            };
+            let next = if forward {
+                selected + 1
+            } else if selected > 0 {
+                selected - 1
+            } else {
+                return;
+            };
+            let Some(node) = self.nodes.get(next) else {
+                return;
+            };
+            if node.kind == pager {
+                match self.scroll(next, forward, left) {
+                    0 => return,
+                    moved => left -= moved,
+                }
+            } else {
+                self.list_state.select(Some(next));
+                left -= 1;
+            }
         }
-        self.selected_raw_bytes()
+    }
+
+    /// Expand the selected node. Returns `false` on a leaf, which has nothing to open: the
+    /// caller shows the bytes behind it ([`TreeView::selected_raw_bytes`]) instead.
+    pub fn expand(&mut self) -> bool {
+        let Some(selected) = self.list_state.selected() else {
+            return false;
+        };
+        match self.nodes.get(selected) {
+            Some(node) if node.has_children => {
+                self.nodes[selected].expanded = true;
+                self.rebuild_flat_list();
+                true
+            }
+            _ => false,
+        }
     }
 
     /// The bytes behind the selected row, for the hex overlay: a keyed value (from its state row
-    /// or any row under it) or an operator-state element. `None` on any other row.
-    pub fn selected_raw_bytes(&self) -> Option<RawBytes> {
+    /// or any row under it) or an operator-state element. `None` on any other row. They are read
+    /// from `index`, the one this view was built from: the view keeps no operator-state bytes.
+    pub fn selected_raw_bytes(&self, index: &IndexCache) -> Option<RawBytes> {
         let node = self.nodes.get(self.list_state.selected()?)?;
         if node.kind != NodeKind::Data
             || !matches!(node.level, NodeLevel::Entry | NodeLevel::MapEntry)
@@ -833,16 +918,26 @@ impl TreeView {
         let (si, ei) = (node.state_idx?, node.entry_idx?);
         let op = self.operators.get(node.op_idx)?;
         if let Some(state) = op.states.get(si) {
-            let element = state.elements.get(ei)?;
-            let label = String::from_utf8_lossy(&element.label);
+            let entry = index
+                .operators
+                .get(node.op_idx)?
+                .states
+                .get(si)?
+                .entries
+                .get(ei)?;
+            let bytes = match &entry.value_ref {
+                ValueRef::Inline { data } => Some(data),
+                ValueRef::File { .. } | ValueRef::Decoded => None,
+            };
+            let label = String::from_utf8_lossy(&entry.key);
             return Some(RawBytes {
                 key_title: format!("{}[{}], as decoded", state.name, ei),
-                key: element.label.clone(),
-                value_title: match &element.bytes {
+                key: entry.key.clone(),
+                value_title: match bytes {
                     Some(_) => format!("element {}[{}]", state.name, ei),
                     None => format!("no bytes: the element could not be read ({})", label),
                 },
-                value: element.bytes.clone().unwrap_or_default(),
+                value: bytes.cloned().unwrap_or_default(),
             });
         }
         let keyed = op.keyed.as_ref()?;
@@ -851,11 +946,9 @@ impl TreeView {
         let raw = part.entry_raw.get(ei).and_then(|v| v.clone());
         let value_title = match (&raw, desc.state_type.as_str()) {
             (None, _) => format!("{}: no value for this key", desc.name),
-            (Some(_), "MAP") => format!(
-                "{} [{}]: the per-key blob the index builds — int count, then per entry \
-                 int len + namespace (VoidNamespace + map key), int len + NullableSerializer value",
-                desc.name, desc.value_type
-            ),
+            // Its layout is in the README (detail overlay): spelled out here, the title took ~150
+            // columns and was cut.
+            (Some(_), "MAP") => format!("{} [{}]: per-key blob", desc.name, desc.value_type),
             (Some(_), _) => format!("{} [{}]", desc.name, desc.value_type),
         };
         Some(RawBytes {
@@ -905,13 +998,15 @@ impl TreeView {
         }
     }
 
+    /// The last data row: never a `↓` pager row (stepping onto one scrolls) nor a note.
     pub fn jump_last(&mut self) {
-        if !self.nodes.is_empty() {
-            self.list_state.select(Some(self.nodes.len() - 1));
+        if let Some(last) = self.nodes.iter().rposition(|n| n.kind == NodeKind::Data) {
+            self.list_state.select(Some(last));
         }
     }
 
     pub fn render(&mut self, frame: &mut Frame, block: Block, area: Rect) {
+        self.page_rows = (block.inner(area).height as usize).max(1);
         if area.width != self.display_width {
             self.display_width = area.width;
             self.rebuild_flat_list();

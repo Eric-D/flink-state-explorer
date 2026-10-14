@@ -186,12 +186,22 @@ plausible half key set.
   their label: a key, a value or an operator-state element may contain `↓` or `…`.
 - **Operator-state elements** page like keyed partitions: 500 rows at a time behind `↑`/`↓` pager
   rows (`StateSnapshot::entry_offset`), each row showing the element's **real** index, also under a
-  filter (`(12/1200 entries)` in the header).
+  filter (`(12/1200 entries)` in the header). `↓`/`↑` onto a pager row scroll its window by one;
+  `PageDown`/`PageUp` move a page (the list's height at the last render) and, at a pager row,
+  scroll by the rest of the page (`TreeView::scroll` takes the amount); `G` lands on the last
+  `Data` row, never on a pager row.
+- **Decoded values are cached per rebuild** (`TreeView::decoded`, by operator × partition ×
+  descriptor): `rebuild_flat_list` runs on every expand / collapse / toggle / scroll, and used to
+  decode every value of every expanded key each time (~70 ms with a 300k-entry MAP). It keeps only
+  what the last rebuild showed (a collapsed key's values are dropped) and is cleared by
+  `set_proto_context`. `decode_calls()` counts decodes, for tests.
 - **Raw bytes.** `x` (or Enter on a leaf) opens the hex `DetailOverlay` on the selected row's bytes
-  (`TreeView::selected_raw_bytes`): a keyed value — from its state row or any row under it — as the
-  index stores it (for a MAP, the per-key blob `index::builder` assembles, and the panel title says
-  so; the key panel holds the rendered key, since the index keeps no raw key bytes), or an
-  operator-state element's own bytes.
+  (`TreeView::selected_raw_bytes(&index)`): a keyed value — from its state row or any row under
+  it — as the index stores it (for a MAP, the per-key blob `index::builder` assembles: the panel
+  title says `per-key blob`, its layout is in the README; the key panel holds the rendered key,
+  since the index keeps no raw key bytes), or an operator-state element's own bytes, read from
+  the `IndexCache` the `App` holds (the tree keeps no copy). `expand()` returns `false` on a leaf,
+  and the app then opens the bytes.
 - **Text.** Shorten display text only through `src/tui/text.rs` (`width`, `truncate_to_width`,
   `ellipsize`): it measures terminal columns and cuts on a `char` boundary. `&s[..n]` on display
   text panicked as soon as `n` fell inside `é`, CJK or an emoji. Widths come from ratatui's own
@@ -322,9 +332,12 @@ one** Snappy-framed stream (stream identifier once, right after the header), flu
 recorded offset, so each element is its own run of chunks and is inflated on its own
 (`inflate_snappy_chunks`, no checksum check, like Flink). An element ends at the next offset of
 **any** state (binary search over all offsets). The decoded label is the entry's `key`, and the
-element's bytes are kept (`ValueRef::Inline`, cache format 8) for the TUI's hex view (`x`): at most
-the stream's size, next to labels that are usually longer. Only an element that could not be read
-is `ValueRef::Decoded` (label, no bytes).
+element's bytes are kept (`ValueRef::Inline`, cache format 8) for the TUI's hex view (`x`), **once**:
+in the index (and its cache file); `TreeView` copies only the labels and reads the bytes from the
+index when `x` asks (`selected_raw_bytes(&index)`). Their total is the elements' size, which is the
+stream's size without compression but **more** with it (each element is kept inflated), and a
+label does not bound them: an undecoded element's label is `[N bytes] <16-byte hex preview>`
+whatever N. Only an element that could not be read is `ValueRef::Decoded` (label, no bytes).
 
 > A savepoint's metadata stores only the **OperatorID** (a hash of the uid). The operator's human
 > **name** and **uid** appear only in metadata **v5+** (our Flink 1.20 fixtures are v4 → shown as
@@ -450,16 +463,22 @@ source** (branch `release-1.20`, https://github.com/apache/flink) rather than gu
   `tui_gitlab_parity_test`) only ever run locally.
 - `tests/tui_parity_test.rs` (CI) — every (key, state) of a synthetic savepoint (`Map<String,String>`
   with a null value and a comma, `Map<String,Long>`, `Map<Enum,Boolean>`, `List<Long>` with 0x2c
-  bytes in the values, `List<String>`, `byte[]`, `int[]`, `Byte`, `Tuple2`, `Char`, `Long`, and a key
-  holding none of them) rendered through `TreeView` + `TestBackend` equals `value_to_display` of the
-  `--export-state` value, MAP/LIST rows included; the exported values are the written ones; and
-  `auto_date` only touches `Long`s. Helpers in `tests/common/tui.rs`.
+  bytes in the values, `List<String>`, `byte[]`, `int[]`, `Byte`, `Tuple2`, `Char`, `Long`,
+  `Ttl<Long>`, and a key holding none of them) rendered through `TreeView` + `TestBackend` equals
+  `value_to_display` of the `--export-state` value, MAP/LIST rows included; the exported values are
+  the written ones (the TTL'd one `{ _ttlLastAccess, value }`); `auto_date` only touches `Long`s;
+  and a rebuild decodes only values it did not show before. Helpers in `tests/common/tui.rs`.
+  `synth::Ser::Ttl(&inner)` writes a `TtlSerializerSnapshot` (composite, outer version 2, nested
+  `[LongSerializer, inner]`) and `Val::Ttl(ts, v)` a `TtlValue` (`writeLong(ts)` + the value), per
+  `TtlStateFactory.java` (release-1.20).
 - `tests/tui_gitlab_parity_test.rs` — the same over every (key, state) of `savepoint-gitlab`
   (2262 pairs, 66 states incl. timers and windows).
 - `tests/tui_raw_bytes_test.rs` (CI) — `x` on a keyed value gives its bytes (and the overlay shows
   them), on a MAP the per-key blob; an operator state of 1,200 elements pages to `[1199]` (with its
   bytes) and keeps real indices under a filter; keys and elements whose labels look like pager
-  rows (`↓ 1-30 / 99`) do not trap the cursor.
+  rows (`↓ 1-30 / 99`) do not trap the cursor; `PageDown`/`PageUp` cross 1,200 elements (and 99
+  keys) a page at a time; `G` lands on a data row; element bytes are read from the index; the MAP
+  overlay title fits 80 columns.
 - `tests/decode_e2e_test.rs` — protobuf, tuples, primitive arrays, full-POJO, scrollbar, and
   `AllFieldsPojo` field by field (chars decoded, then explicit markers — no `null`) on the index,
   streaming and `deserialize_pojo_to_json` display paths. It does **not** check the TUI: the

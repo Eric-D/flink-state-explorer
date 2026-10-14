@@ -68,6 +68,10 @@ pub enum Ser {
     /// `SimpleTypeSerializerSnapshot` subclass (no payload), as a `TypeSerializerSingleton` has.
     /// Its records are [`Val::Opaque`] bytes.
     Opaque(&'static str),
+    /// `TtlStateFactory.TtlSerializer` over the user value's serializer: the value serializer of
+    /// a state whose descriptor has `enableTimeToLive`. Its records are [`Val::Ttl`]. A value
+    /// only (`ValueState` here): a TTL'd MAP or LIST wraps its *element* serializer instead.
+    Ttl(&'static Ser),
 }
 
 impl Ser {
@@ -120,7 +124,7 @@ impl Ser {
                 "org.apache.flink.api.common.typeutils.base.array.IntPrimitiveArraySerializer$IntPrimitiveArraySerializerSnapshot"
             }
             Ser::Opaque(class) => class,
-            Ser::Tuple(_) => unreachable!("a tuple snapshot is composite"),
+            Ser::Tuple(_) | Ser::Ttl(_) => unreachable!("a tuple or TTL snapshot is composite"),
             Ser::Enum(..) => unreachable!("an enum snapshot has a payload"),
         }
     }
@@ -157,6 +161,9 @@ pub enum Val {
         bytes: Vec<u8>,
         hash: i32,
     },
+    /// A `TtlValue` of a [`Ser::Ttl`] serializer: the last access timestamp (epoch millis) and
+    /// the user value.
+    Ttl(i64, Box<Val>),
 }
 
 impl Val {
@@ -231,6 +238,15 @@ impl Val {
             // EnumSerializer.serialize: `writeInt(valueToOrdinal.get(record))`.
             Val::Enum(ordinal, _) => out.extend_from_slice(&ordinal.to_be_bytes()),
             Val::Opaque { bytes, .. } => out.extend_from_slice(bytes),
+            // TtlSerializer is a `CompositeSerializer` over [LongSerializer, user serializer]
+            // (`TtlStateFactory.java:274-280`); `CompositeSerializer.serialize` writes each field
+            // with its serializer in turn (`CompositeSerializer.java:143-149`), and `getField`
+            // gives index 0 = `getLastAccessTimestamp()`, 1 = `getUserValue()` (:302-304):
+            // `writeLong(lastAccessTimestamp)`, then the user value.
+            Val::Ttl(ts, value) => {
+                out.extend_from_slice(&ts.to_be_bytes());
+                value.encode_into(out);
+            }
         }
     }
 
@@ -259,6 +275,7 @@ impl Val {
                 panic!("an array is never a key: Java arrays hash by identity")
             }
             Val::Enum(..) => panic!("an enum is never a key here: it hashes by identity"),
+            Val::Ttl(..) => panic!("a TtlValue is a state value, never a key"),
             // Float.hashCode: floatToIntBits(value).
             Val::Float(f) => java_float_bits(*f),
             Val::BigInt(v) => java_big_integer_hash(*v),
@@ -282,7 +299,9 @@ impl Val {
             Val::Byte(v) => v.to_string(),
             Val::BigInt(v) => v.to_string(),
             Val::Char(v) => char_string(*v),
-            Val::Chars(_) | Val::Bytes(_) | Val::Ints(_) | Val::Enum(..) => self.json().to_string(),
+            Val::Chars(_) | Val::Bytes(_) | Val::Ints(_) | Val::Enum(..) | Val::Ttl(..) => {
+                self.json().to_string()
+            }
             // Numbers render in their JSON form (`3.0`, `-0.0`, `1e+300`); NaN and ±Infinity have
             // none, so they render as the hex of their bytes.
             Val::Double(d) if !d.is_finite() => opaque(&self.encode()),
@@ -324,6 +343,10 @@ impl Val {
             Val::Enum(_, name) => serde_json::Value::String(name.to_string()),
             // Nothing decodes an opaque serializer.
             Val::Opaque { .. } => serde_json::Value::Null,
+            Val::Ttl(ts, value) => serde_json::json!({
+                "_ttlLastAccess": flink_explorer::parser::pojo::millis_to_iso(*ts),
+                "value": value.json(),
+            }),
         }
     }
 }
@@ -1247,6 +1270,17 @@ fn versioned_snapshot(out: &mut Vec<u8>, snap: Snap) {
                 &nested,
             )
         }
+        // TtlSerializerSnapshot (flink-runtime state/ttl/TtlStateFactory.java, release-1.20):
+        // a `CompositeTypeSerializerSnapshot` (snapshot version 3) with outer version 2
+        // (:349, :359-361), no outer payload, and nested [timestamp serializer, value serializer]
+        // (:364-369) — the timestamp's is `LongSerializer.INSTANCE` (:143-144).
+        Snap::Scalar(Ser::Ttl(inner)) => composite(
+            out,
+            "org.apache.flink.runtime.state.ttl.TtlStateFactory$TtlSerializerSnapshot",
+            2,
+            &[],
+            &[Snap::Scalar(Ser::Long), Snap::Scalar(*inner)],
+        ),
         // EnumSerializerSnapshot (flink-core typeutils/base/EnumSerializer.java, release-1.20):
         // CURRENT_VERSION 3, `writeSnapshot` = `writeUTF(enumClass.getName())`,
         // `writeInt(enums.length)`, then `writeUTF(name())` per constant, in ordinal order.
