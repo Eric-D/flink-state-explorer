@@ -63,8 +63,9 @@ with **filesystem** checkpoint storage so each subtask's keyed state is a separa
 `_metadata` (`RelativeFileStateHandle`) — the layout of production savepoints. Every value is a
 pure function of the key index (`BigStateJob.*Of`). For performance work:
 `mvn -B -Dbig.savepoint=true -Dit.test=BigSavepointGeneratorIT verify`, then
-`cargo run --release --example bench_index -- tests/fixtures/savepoint-big [build|load|scroll]`
-(the TUI load path, headless, with timings and RSS).
+`cargo run --release --example bench_tui -- tests/fixtures/savepoint-big [keys to page] [glob]`
+(the TUI path, headless on a `TestBackend`: open + first frame, expand + first page, paging N
+keys, the count pass, a glob search — with timings and RSS).
 
 **Synthetic savepoints** (`tests/common/synth.rs`) are written byte for byte in Flink's layout
 (`_metadata` v4, keyed-stream header v6, key-group blocks with the metadata-follows flag, managed
@@ -115,8 +116,8 @@ apart. A `value_note` column says why `value` is NULL when the state did hold so
 (the decoder's marker, or JSON the typed column cannot hold); NULL `value` with NULL note is a
 value Flink stored as null. Files are zstd-compressed, written in 65 536-row row groups.
 
-`src/export_state.rs` deliberately bypasses `src/index`, because the index holds every key and
-every raw value in memory. Instead it reads only each subtask's **header** (it ends where the first
+`src/export_state.rs` reads one state only, so it does not go through the reader's per-key
+records (every state of a key, decoded). Instead it reads only each subtask's **header** (it ends where the first
 key-group begins) to resolve the state's id/type/serializers, then seeks per key-group via
 `KeyGroupsStateHandle.offsets`, reading **one key-group at a time** into a reused buffer. Entries of
 other states are skipped by their length prefixes without decoding keys or copying values
@@ -127,15 +128,15 @@ other states are skipped by their length prefixes without decoding keys or copyi
 A key-group that cannot be read to its end mark (truncated, a bad length, a stateId beyond the
 header's state count) is **reported, not silently cut short**: the rows read before the defect are
 exported, and `ExportStats::malformed_key_groups` / `first_malformed` count and name it — the CLI
-prints a `Warning:` on stderr (even with `-o -`), the index carries the same count in
-`CachedKeyedState` and the `i` panel shows it (`Malformed key-groups`).
+prints a `Warning:` on stderr (even with `-o -`), the reader lists it in each page's `malformed`
+and the TUI's `i` panel shows it (`Malformed key-groups`).
 
 Two things to know about the rows:
 - a **MAP** state exports **exploded**, one row per entry, with `map_key` decoded from the
   namespace (`VoidNamespace + map key`) and the value unwrapped from `NullableSerializer`. The raw
-  per-entry bytes are *not* the blob `index::builder` assembles per key, so `decode_map_entry` in
-  `parser::value` is shared by both paths;
-- `key_group` is the **absolute** key-group, on this path and on the index/TUI path alike. Both
+  per-entry bytes are decoded by `decode_map_entry` in `parser::value`, shared with the reader
+  (and so the TUI and the `E` export);
+- `key_group` is the **absolute** key-group, on this path and on the reader/TUI path alike. Both
   used to report the index *within a subtask's range* (correct only for the subtask starting at 0);
   `extract_keyed_entries` now takes the `KeyGroupsStateHandle` and adds `start_key_group`.
   `tests/key_group_assignment_test.rs` checks the result against Flink's own
@@ -150,12 +151,13 @@ unreadable, or **shorter than the handle's `stateSize`** (`"<path>: truncated: N
 Flink records the stream position at close, `-1` if unknown, which skips the length check). Do not
 go back to `fs::read(..).unwrap_or_default()` or `metadata().ok()?`: that turned a lost file into a
 plausible half key set.
-- **Index/TUI**: a subtask that cannot be read is recorded in `CachedOperator.load_errors`, and the
-  other subtasks still load. The operator gets a red `⚠ N state file(s) not read` label, is never
-  hidden by `hide_empty`, and has a `Load errors` line under `i` (and a `load_errors` array in the
-  `E` JSON export). The index does not read segment handles: it reports them as a load error.
-- **Cache**: a build with load errors is never cached (`may_save_cache`), `--no-cache` neither
-  reads nor writes it, and `tui::app::load_index` is where that is decided.
+- **Reader/TUI**: a subtask that cannot be read is reported by the reader (`KeyedStates.errors`
+  from the headers, `Unreadable` in each page that reaches it) and the other subtasks are still
+  read. The TUI collects both into the operator's errors: a red `⚠ N state file(s) not read`
+  label, never hidden by `hide_empty`, a `⚠ … could not be read: their keys are missing` row after
+  its last key, a `Load errors` line under `i` (and a `load_errors` array in the `E` JSON export).
+- **Counts cache**: counts that met an unreadable file or a malformed key-group are a lower bound
+  (`≥ N`) and are never cached (`App::save_counts`); `--no-cache` neither reads nor writes it.
 - **Headless**: `--export-state` fails before writing any row if a file of the target operator
   cannot be read, and also if another candidate operator has an unreadable file (it may hold the
   state too; `--operator` scopes it away). The state is resolved from **every** subtask's header,
@@ -169,7 +171,8 @@ plausible half key set.
 ## StateReader: random access by key-group (`src/reader`)
 
 `reader::StateReader` is the lazy core the web UI (#22/#23) and the TUI migration (#24) build on.
-`StateReader::open(dir)` parses `_metadata` and nothing else; `new(&savepoint, dir)` borrows one
+The TUI runs on it (#24, "TUI: on the reader" below). `StateReader::open(dir)` parses `_metadata`
+and nothing else; `new(&savepoint, dir)` borrows one
 already parsed. The first call on an operator opens and checks each subtask's keyed stream (#16's
 `state_file::open`) and resolves its **header** once (`SubtaskHeader`; state ids are per subtask),
 one file at a time. Blocks are then read positionally (`read_exact_at` on Unix, `seek_read` on
@@ -187,7 +190,7 @@ reads whole key-group blocks located by `KeyGroupsStateHandle.offsets`, nothing 
 - `operators() -> Vec<OperatorInfo>` (metadata only), `operator_index(op)` (hex id or unique
   prefix; every call takes `op` as that string), `states(op) -> KeyedStates` (key type; name, type,
   value type, value class, subtask count per state; `errors` naming unreadable files and
-  unsupported handles);
+  unsupported handles), `value_pojo(op, state)` (a POJO value's layout, for the TUI's labels);
 - `key_page(op, &cursor, limit) -> KeyPage { keys, next, stats, malformed, unreadable }`
   (`limit` 0 is taken as 1): each `KeyRecord` has the key, absolute key-group, subtask, its own
   `position`, its entries (`StateEntry`: state, types — `Arc<str>`, shared, not cloned per entry —
@@ -231,7 +234,7 @@ last_key_group, what, error}`/`Malformed{..}` (500). `Cursor::from_str` still er
 and merge distinct keys (and make `get` hash the wrong text). Such a string, or one containing a
 literal `\u`, renders escaped — lone surrogate `\uXXXX`, backslash `\\` — and every other string as
 itself; escaped texts always contain `\u` and plain ones never do. `parse_key_string` inverts it
-(`JavaKey::Utf16` holds the units). Values keep their rendering (U+FFFD). `CACHE_FORMAT` 8.
+(`JavaKey::Utf16` holds the units). Values keep their rendering (U+FFFD).
 
 **Order and cursor.** Ascending absolute key-group (= subtask order), and inside a block the order
 in which each key first appears on disk. `Cursor { subtask, key_group, ordinal }`, string form
@@ -277,7 +280,7 @@ as U+FFFD.
 `flink-explorer <savepoint> --web [--port N] [--bind IP] [--open]` (`--open` spawns
 `xdg-open`/`open`/`rundll32 url.dll,FileProtocolHandler <url>` — never `cmd /C start`, which
 parses `&` — and reaps the child on a detached thread): a read-only browser UI built
-**only on `reader::StateReader`** (never on `src/index`), so it opens at once and reads one
+**only on `reader::StateReader`** (no in-memory index), so it opens at once and reads one
 key-group per request. Feature `web` is **on by default** (users take the released binary);
 `--no-default-features` is the TUI-only build and CI checks it (`cargo check
 --no-default-features --all-targets`). A build without it answers `--web` with an error.
@@ -338,7 +341,7 @@ key-group per request. Feature `web` is **on by default** (users take the releas
   shared, so they are byte-identical to `--export-state` rows (`namespace_hex` likewise shared);
   a state page filters the operator's key page, so it may hold fewer rows than `limit`.
 - **Operator state** is listed from `_metadata` only (name, mode, subtasks, element count), with
-  "use the TUI" for the values: the decoding lives in `index::builder`, which `web` must not use.
+  "use the TUI" for the values: their decoding lives in `src/operators.rs`, used by the TUI.
 - **Tests**: `tests/web_test.rs` (CI, `#![cfg(feature = "web")]`) starts `web::start` on
   `127.0.0.1:0` over synth savepoints and speaks raw HTTP/1.1 over `TcpStream`: no/bad cookie or
   token → 403 without data, token → strict cookie + clean redirect, foreign/rebinding `Host` (also
@@ -414,43 +417,89 @@ key-group per request. Feature `web` is **on by default** (users take the releas
   RSS 35 MB through all of it; a cancel stops within one 4 MiB step; an aborted download stops
   the export at once.
 
-## TUI: key cap, text, terminal
+## TUI: on the reader, text, terminal
 
-- **Key cap.** The index (`src/index/builder.rs`) stores at most `MAX_STORED_PARTITIONS` (100 000)
-  keys per operator; `CachedKeyedState::total_keys` still counts every key (`stored_keys()`,
-  `is_truncated()`). The kept keys are shared between subtasks by `spread_quotas` (equal shares,
-  max-min fair: a subtask with fewer keys than its share keeps them all), re-applied after each
-  subtask, so the kept partitions never exceed ~2 × cap between subtasks (each subtask's full key
-  map is still built first — #24 removes that); each subtask gives its lexicographically smallest
-  keys, and the kept set is sorted once, so paging reads in key order. It used to fill the cap from subtask 0, so past the cap the other subtasks' keys
-  were unreachable. `build_index_with_cap` takes the cap as an argument (tests use a small one).
-  The structural fix (no cap at all) is #24.
-- **Paging** is bounded by the **stored** partitions (`KeyedSnapshot::visible_count`): bounding it
-  by the savepoint's key count indexed past the end and panicked. Every count shown makes the cap
-  explicit: operator row `100000 of 1000000 keys shown` (`N match in S of T keys shown` under a
-  filter, which only searches stored keys), the pager rows, a trailing `… N more keys not indexed`
-  row, `i` info (`Keys`), the `S` summary, and the `E` export (`truncated` at the root and per
-  operator, plus `stored_keys` / `total_keys`). `--export-state` streams every key regardless.
-  Rows are told apart by their `NodeKind` (`Data` / `PagerUp` / `PagerDown` / `Marker`), never by
-  their label: a key, a value or an operator-state element may contain `↓` or `…`.
+- **No index, no cap (#24).** The TUI used to build an in-memory index of every key and raw value
+  (`src/index`, gone; 4–5 s and 1.06 GB on `savepoint-big`, capped at 100 000 keys, all copied
+  again by `TreeView::new`, and cached with every raw value in `.flink-explorer-cache` inside the
+  savepoint directory). Now `App::open` parses `_metadata`, reads the operator states
+  (`src/operators.rs`: operator metadata, `info_lines`, decoded operator-state elements with their
+  bytes — operator state is small and read whole) and each operator's keyed **headers**
+  (`reader.states`), and draws: nothing else is read before the first frame.
+- **`TreeView` holds navigation state only**: per keyed operator a `KeySeq` (the positions —
+  reader `Cursor`s — of the keys found so far, the cursor to go on from, the window's offset) and
+  the `KeyRow`s of the window ± one page (built once from the reader's `KeyRecord`s: entries per
+  state and the value they make, `export::state_value` — a MAP's entries as one object, otherwise
+  the first non-empty entry). `ensure_window` asks the reader for what the window lacks
+  (`key_page` from a known position: contiguous runs in one call) and drops rows far from it, so
+  memory is a few pages, the positions paged through (12 bytes a key) and the reader's 8 MiB block
+  cache. A rebuild of the rows (expand, toggle, scroll inside the window) reads nothing:
+  `decode_calls()` counts the keys received from the reader. A MAP cut at the reader's entry
+  limit (1000) shows its true `total` (`KeyRecord.truncated`) and, expanded, a **window** of 50
+  entries in on-disk order behind `↑`/`↓` pager rows (`Slot::map_offset`, scrolled by
+  `TreeView::scroll` like the keys); a window past the entries the record carries is read alone
+  (`reader.entries(offset, 50)` into `Slot::page`) — never the whole map (it used to be: a
+  1.6M-entry map took 1 s and +670 MB on the UI thread). `entries_read()` counts those entries
+  for the tests. A new proto context makes a new reader over the same savepoint.
+- **Order.** Keys come in the reader's order — key-groups ascending, Flink's on-disk order inside
+  one — not sorted (they used to be, by the index).
+- **Counts** are shown as known: `N keys` once counted or paged to the end, `≥ N keys` before,
+  `? keys` when nothing is known yet; the pager rows' total likewise (`↓ 1-30 / ≥ 60`). A
+  background pass (`tui/jobs.rs`, a worker thread over the shared `Arc<StateReader>`, `scan` with a
+  predicate that matches nothing, 4 MiB of blocks a step) counts every operator with progress on
+  its row; `C` stops/restarts it, `q`/Ctrl-C/dropping the `App` cancel and **join** it. Complete
+  counts (no unreadable or malformed key-group) are saved by `tui/counts.rs` under the user cache
+  dir (`$XDG_CACHE_HOME`/`~/.cache` or `%LOCALAPPDATA%`, `std::env` only), one text file per
+  savepoint named by an FNV-1a hash of its canonical path: a 3-line header (format, `_metadata`
+  size + mtime in ns, path) checked before the body, then `<op hex> <count>` lines; written
+  through a side file of its own (`counts::temp_file`: `.<pid>-<n>.partial`), `sync_all`ed, then
+  renamed. Counts only,
+  never a key; never in the savepoint directory. `--no-cache` disables it (`AppOptions`).
+- **Filter.** A pattern is searched on a **worker thread** (`jobs::start_search`: `reader.scan`
+  one block per call, so a cancel is seen between any two blocks; a report every
+  `SEARCH_STEP_BYTES` 4 MiB of blocks or 1000 matches, through a bounded channel of 4 so the
+  worker never runs far ahead), operator after operator, with `searching N%` on the row. The
+  event loop applies the reports between frames (`TreeView::poll_search`, never waiting), so keys
+  are answered while it runs: `Esc` stops it and keeps its matches, Ctrl-C quits; dropping the
+  `Job` cancels and joins it (receiving meanwhile, which frees a worker blocked on a full
+  channel). `search_step()` waits for one report (tests, `bench_tui`). Still on the UI thread, and
+  not interruptible inside one key-group (a block is read whole): the window's `key_page`, an
+  exact key's `get`, a MAP window's `entries` — each bounded by a page of what it decodes, but a
+  single hot key's key-group costs its full read. Matches are kept as positions
+  (their rows fetched by `key_page(pos, 1)` when shown). An exact key goes through `reader.get`
+  (instant, no scan) and falls back to a scan only on `NeedsScan` (POJO keys…); a pattern without
+  wildcard is first looked up with `get` (then the scan adds its other cases; matches are
+  de-duplicated by position). A key-group range seeks its first key-group's cursor (the subtask
+  from `subtask_for_key_group`) and stops past its last.
+- **`E` export** streams from the reader on a worker thread (`export::export_json`, through
+  `export.json.partial`): every operator and every key, no cap; `"truncated": false` is still
+  written (top level and per operator) for older readers. A MAP is streamed entry by entry, the
+  record's entries then `reader.entries` pages of `EXPORT_ENTRY_PAGE` (10 000), checking the
+  cancel flag between pages (`ExportSummary::max_entries_held` proves it never holds a map: it
+  used to collect every entry, 1.43 GB peak on a 1.6M-entry map); a non-MAP state reads past the
+  record only when none of its entries is non-empty. Missing map keys go under `#<i>`. The
+  document's per-operator `total_keys`, `load_errors`, `malformed_key_groups` and `info` follow
+  its `keys` (they are known once the keys are read); a key's states are by name. Progress
+  (`ExportProgress`: keys, operators done) is on the status bar; **`q` while it runs asks first**
+  (`App::quit_or_confirm`: a second `q` in a row aborts it and quits, any other key disarms),
+  Ctrl-C aborts at once.
+- **Measured** on `savepoint-big` (release, `examples/bench_tui.rs`, warm page cache): first frame
+  after 1 ms at 5 MB RSS (was 4–5 s and 1.06 GB); expand + first page 12 ms; 100 000 keys paged with
+  PageDown in 0.8 s (0.5 ms a press, frames 0.15 ms) at 26 MB; the count pass over 1M keys 1.4 s;
+  a `*99999*` search over 1M keys 1.6 s; peak 37 MB.
 - **Operator-state elements** page like keyed partitions: 500 rows at a time behind `↑`/`↓` pager
   rows (`StateSnapshot::entry_offset`), each row showing the element's **real** index, also under a
   filter (`(12/1200 entries)` in the header). `↓`/`↑` onto a pager row scroll its window by one;
   `PageDown`/`PageUp` move a page (the list's height at the last render) and, at a pager row,
   scroll by the rest of the page (`TreeView::scroll` takes the amount); `G` lands on the last
   `Data` row, never on a pager row.
-- **Decoded values are cached per rebuild** (`TreeView::decoded`, by operator × partition ×
-  descriptor): `rebuild_flat_list` runs on every expand / collapse / toggle / scroll, and used to
-  decode every value of every expanded key each time (~70 ms with a 300k-entry MAP). It keeps only
-  what the last rebuild showed (a collapsed key's values are dropped) and is cleared by
-  `set_proto_context`. `decode_calls()` counts decodes, for tests.
 - **Raw bytes.** `x` (or Enter on a leaf) opens the hex `DetailOverlay` on the selected row's bytes
-  (`TreeView::selected_raw_bytes(&index)`): a keyed value — from its state row or any row under
-  it — as the index stores it (for a MAP, the per-key blob `index::builder` assembles: the panel
-  title says `per-key blob`, its layout is in the README; the key panel holds the rendered key,
-  since the index keeps no raw key bytes), or an operator-state element's own bytes, read from
-  the `IndexCache` the `App` holds (the tree keeps no copy). `expand()` returns `false` on a leaf,
-  and the app then opens the bytes.
+  (`TreeView::selected_raw_bytes()`): a keyed value — from its state row or any row under it — as
+  the reader returns the entry (`StateEntry.raw`; the key panel holds the rendered key, since no
+  raw key bytes are kept), under a MAP the entry the row shows (or the first one, on the state's
+  row: title `m [Map<String,Long>]: entry 1 of N`, key panel = its namespace, `VoidNamespace` byte
+  + serialized map key), or an operator-state element's own bytes (from `OperatorSummary`, the one
+  copy). `expand()` returns `false` on a leaf, and the app then opens the bytes.
 - **Text.** Shorten display text only through `src/tui/text.rs` (`width`, `truncate_to_width`,
   `ellipsize`): it measures terminal columns and cuts on a `char` boundary. `&s[..n]` on display
   text panicked as soon as `n` fell inside `é`, CJK or an emoji. Widths come from ratatui's own
@@ -459,9 +508,9 @@ key-group per request. Feature `web` is **on by default** (users take the releas
   enabled (restore the terminal, then chain to the previous hook, so the message prints on the
   normal screen), and its `Drop` restores raw mode, the alternate screen and the cursor on every
   other way out. Ctrl-C (`app::is_interrupt`) quits from any mode: raw mode delivers it as a key
-  event, so `App::handle_key` takes the whole `KeyEvent`. While the index loads, `main.rs` checks
-  for it at each progress step (exit 130; the build is not cancellable), and keys typed meanwhile
-  are dropped instead of replayed.
+  event, so `App::handle_key` takes the whole `KeyEvent`; it also stops the count pass and the
+  search. While the headers load, `main.rs` checks for it at each step (one per operator; exit
+  130), and keys typed meanwhile are dropped instead of replayed.
 
 ## Decoder architecture — IMPORTANT
 
@@ -472,9 +521,9 @@ pojo_info, proto)`. The JSON export (`src/export.rs`), the streaming export and 
 add it here once.
 
 - **TUI.** Every label is `value_to_display` of the decoded Value; a MAP's rows are the decoded
-  object's entries (`decode_state_value` reads the index's per-key MAP blob via `decode_map_blob`),
-  a LIST's rows the decoded array's elements, a structure's rows its decoded fields (first 50 map
-  entries / 100 elements, then `… +N more`). The TUI only adds presentation: `auto_date` (a `Long`
+  entries (one `StateEntry` per map entry from the reader, `decode_map_entry`), 50 at a time in
+  on-disk order behind pager rows, a LIST's rows the decoded array's elements, a structure's rows
+  its decoded fields (first 100 elements, then `… +N more`). The TUI only adds presentation: `auto_date` (a `Long`
   in the 2000–2040 epoch-millis range shown as a date — on by default, so compare with the export
   with it off) and the debug hex suffix. It used to have ~900 lines of decoders of its own, which
   disagreed with the export on 18 of 43 states of `savepoint-gitlab` (MAP values read with their
@@ -491,8 +540,8 @@ add it here once.
 - Serializer snapshot classes are matched by their **exact** name (`keyed_state::serializer_name` +
   `leaf_serializer_type`, a table shared with `pojo.rs`): a substring match read `BigIntSerializer`
   as `Int`.
-- **Keys** are decoded in `value.rs` too (`decode_key`), for the index/TUI and the streaming export
-  alike. The index groups entries by the rendered key, so the rendering is **injective**:
+- **Keys** are decoded in `value.rs` too (`decode_key`), for the reader/TUI and the streaming export
+  alike. The reader groups a block's entries by the rendered key, so the rendering is **injective**:
   String/Long/Int/Short/Byte/Char/Boolean/Float/Double/BigInteger/BigDecimal/Date/LocalDate as
   their value, `Tuple<…>` of those as compact JSON (`["user-1",1]`, strings escaped), POJOs as
   `{ id: 7, name: "x" }`; anything else (Kryo, custom serializers, NaN, …) as `0x` + the hex of the
@@ -536,8 +585,7 @@ arrays
 (`window-contents`) and **timers** (priority-queue states `_timer_state/...`, shown as the firing
 timestamp), **TTL-wrapped values** (`Ttl<T>` → `{ _ttlLastAccess, value }`, via `TtlSerializer`),
 and **broadcast maps** (best-effort String key/value). Keyed state is merged across **all** subtasks
-(full key count; the index *stores* at most 100 000 keys per operator, see "TUI: key cap, text,
-terminal"), and the key-group parser handles the shared keyed/priority-queue stateId space
+(every key reachable, see "TUI: on the reader, text, terminal"), and the key-group parser handles the shared keyed/priority-queue stateId space
 (terminating on `END_OF_KEY_GROUP_MARK`). A state's run of entries ends on Flink's
 **metadata-follows flag** (`0x80` on `key[0]` of its last entry) and on nothing else — keys of any
 length (a 12 KB map key included) parse; the old `keyLen > 10000` heuristic dropped the rest of the
@@ -560,7 +608,9 @@ produces continuously (`startContinuousProducer`) to force one. Operator-state e
 from the shared operator-state reader below, so they work on file-backed and compressed streams.
 
 ### Operator info
-`CachedOperator::info_lines()` aggregates everything extractable about an operator (OperatorID/uuid,
+`OperatorSummary::info_lines(keyed)` (`src/operators.rs`; the keyed part — key type, key count,
+state names, load errors, malformed key-groups — is what the TUI knows from the reader) aggregates
+everything extractable about an operator (OperatorID/uuid,
 parallelism, max parallelism, subtasks, coordinator-state presence, key type, keyed-state names,
 operator-state names + distribution mode, sizes, fully-finished). Shown via the `i` key in the TUI
 and in the JSON export (`info` block per operator; the export includes **all** operators, not just
@@ -580,13 +630,12 @@ list state's elements, then every broadcast map; with compression, **everything 
 one** Snappy-framed stream (stream identifier once, right after the header), flushed before every
 recorded offset, so each element is its own run of chunks and is inflated on its own
 (`inflate_snappy_chunks`, no checksum check, like Flink). An element ends at the next offset of
-**any** state (binary search over all offsets). The decoded label is the entry's `key`, and the
-element's bytes are kept (`ValueRef::Inline`, cache format 8) for the TUI's hex view (`x`), **once**:
-in the index (and its cache file); `TreeView` copies only the labels and reads the bytes from the
-index when `x` asks (`selected_raw_bytes(&index)`). Their total is the elements' size, which is the
-stream's size without compression but **more** with it (each element is kept inflated), and a
-label does not bound them: an undecoded element's label is `[N bytes] <16-byte hex preview>`
-whatever N. Only an element that could not be read is `ValueRef::Decoded` (label, no bytes).
+**any** state (binary search over all offsets). The decoded label is `OperatorElement.label`, and
+the element's bytes are kept (`OperatorElement.bytes`) for the TUI's hex view (`x`), **once**: in
+the `OperatorSummary` the tree owns. Their total is the elements' size, which is the stream's size
+without compression but **more** with it (each element is kept inflated), and a label does not
+bound them: an undecoded element's label is `[N bytes] <16-byte hex preview>` whatever N. Only an
+element that could not be read has `bytes: None` (label `[error: …]`).
 
 > A savepoint's metadata stores only the **OperatorID** (a hash of the uid). The operator's human
 > **name** and **uid** appear only in metadata **v5+** (our Flink 1.20 fixtures are v4 → shown as
@@ -611,11 +660,12 @@ don't store a user class — only the serializer class, which implies the type.
   `[undecodable: subclass …]`.
 - `MapSerializer` **POJO fields** (explicit `MapTypeInfo`) are not decoded (`[undecodable: Map<…>]`).
 - The **window namespace** itself (TimeWindow start/end) isn't surfaced as a field — only the
-  window's buffered contents and its firing timer are shown; if one key has multiple windows, only
-  the first window's contents is kept per key.
+  window's buffered contents and its firing timer are shown; if one key has multiple windows, the
+  TUI and the `E` export show the first window's contents (the reader and `--export-state` keep
+  one entry per window).
 - **Snapshot compression** (keyed state) is handled on **both** paths: `extract_keyed_entries`
   reads `usingKeyGroupCompression` from the header — which is never compressed — and inflates each
-  key-group through `key_group_block`, so the index/TUI and the streaming export both work on a
+  key-group through `key_group_block`, so the reader/TUI and the streaming export both work on a
   compressed savepoint. Exercised by the real `savepoint-compressed` fixture, generated by
   `SavepointGeneratorIT.generatesCompressedSavepoint` (pass `compress` to `ClusterJob`, which calls
   `ExecutionConfig.setUseSnapshotCompression`). **Operator** state's own `usingStateCompression` is
@@ -718,20 +768,23 @@ source** (branch `release-1.20`, https://github.com/apache/flink) rather than gu
   `Ttl<Long>`, and a key holding none of them) rendered through `TreeView` + `TestBackend` equals
   `value_to_display` of the `--export-state` value, MAP/LIST rows included; the exported values are
   the written ones (the TTL'd one `{ _ttlLastAccess, value }`); `auto_date` only touches `Long`s;
-  and a rebuild decodes only values it did not show before. Helpers in `tests/common/tui.rs`.
+  and a rebuild reads no key again (a new proto context reads the shown ones again). Helpers in
+  `tests/common/tui.rs` (a key is isolated with the Exact filter, i.e. `reader.get`), and
+  `tests/common/keyed.rs` reads an operator's keyed state whole through the reader (no entry
+  limit) for tests that look keys and values up — what the index used to give them.
   `synth::Ser::Ttl(&inner)` writes a `TtlSerializerSnapshot` (composite, outer version 2, nested
   `[LongSerializer, inner]`) and `Val::Ttl(ts, v)` a `TtlValue` (`writeLong(ts)` + the value), per
   `TtlStateFactory.java` (release-1.20).
 - `tests/tui_gitlab_parity_test.rs` — the same over every (key, state) of `savepoint-gitlab`
   (2262 pairs, 66 states incl. timers and windows).
 - `tests/tui_raw_bytes_test.rs` (CI) — `x` on a keyed value gives its bytes (and the overlay shows
-  them), on a MAP the per-key blob; an operator state of 1,200 elements pages to `[1199]` (with its
+  them), on a MAP state and on a map entry's row that entry (namespace + map key, value behind
+  its null byte); an operator state of 1,200 elements pages to `[1199]` (with its
   bytes) and keeps real indices under a filter; keys and elements whose labels look like pager
   rows (`↓ 1-30 / 99`) do not trap the cursor; `PageDown`/`PageUp` cross 1,200 elements (and 99
-  keys) a page at a time; `G` lands on a data row; element bytes are read from the index; the MAP
-  overlay title fits 80 columns.
+  keys) a page at a time; `G` lands on a data row; the MAP overlay title fits 80 columns.
 - `tests/decode_e2e_test.rs` — protobuf, tuples, primitive arrays, full-POJO, scrollbar, and
-  `AllFieldsPojo` field by field (chars decoded, then explicit markers — no `null`) on the index,
+  `AllFieldsPojo` field by field (chars decoded, then explicit markers — no `null`) on the reader,
   streaming and `deserialize_pojo_to_json` display paths. It does **not** check the TUI: the
   `tui_*parity_test`s do.
 - `tests/value_decode_test.rs` (CI) — `parser::value` on hand-written Flink bytes: `Char`, `char[]`,
@@ -744,21 +797,21 @@ source** (branch `release-1.20`, https://github.com/apache/flink) rather than gu
   namespace width / map key type as read off the headers Flink wrote.
 - `tests/key_types_test.rs` — fixture-free: Short, Double (±0, NaN, ±∞), Boolean, BigInteger,
   Tuple2, Byte, Float, Char and undecodable keys in VALUE and MAP states (plus timers) stay
-  distinct on the export and the index, with their values, Flink's key-group, and the map key in
+  distinct on the export and the reader, with their values, Flink's key-group, and the map key in
   `map_key`; BigInteger/BigDecimal/Char layouts; JDK `hashCode()` known answers.
 - `tests/export_parquet_test.rs` — **needs `--features parquet`**: the file is well-formed, the
   `value` column is typed per state, map rows keep `map_key`, key-groups are absolute, columns are
   zstd, and the rows read back equal the NDJSON ones. Verified by reading with arrow-rs, not with
   a third-party engine (DuckDB/Polars were not available here).
 - `tests/compressed_savepoint_test.rs` — needs `savepoint-compressed`: the fixture really sets
-  the compression flag, the index path inflates its key-groups (same key sets as the uncompressed
-  run), the streaming export agrees with the index path on those bytes, and the operator states
-  (`"user-bob"`, the broadcast map) decode like the uncompressed run's, in the index and the JSON
-  export.
+  the compression flag, the reader path inflates its key-groups (same key sets as the uncompressed
+  run), the streaming export agrees with the reader path on those bytes, and the operator states
+  (`"user-bob"`, the broadcast map) decode like the uncompressed run's, in the operator summaries
+  and the JSON export.
 - `tests/operator_state_test.rs` — fixture-free (CI): operator-state streams decode the same
   inline, relative / absolute file, segment, and compressed (incl. an element over 64 KiB, i.e.
   several `0x00` Snappy chunks); a missing or truncated stream file shows `[error: …]` entries;
-  1M elements index in well under a second (release; 200k in debug) and time grows linearly.
+  1M elements are summarized (`operators::summarize`) in well under a second (release; 200k in debug) and time grows linearly.
   Locally it also checks synth's operator streams byte for byte against both real fixtures.
 - `tests/key_group_assignment_test.rs` — the reported key-group is the one Flink assigned
   (`parser::key_group`: `MathUtils.murmurHash` + `KeyGroupRangeAssignment`), and every streamed row
@@ -792,24 +845,39 @@ source** (branch `release-1.20`, https://github.com/apache/flink) rather than gu
   every `BlockDefect` (truncation, missing end mark, bad lengths, unknown stateId) and the
   header-declared state count as the stateId bound.
 - `tests/synth_savepoint_test.rs` (fixture-free, CI) — synthetic savepoints: the header against a
-  real one, file-backed/inline/compressed parity, every subtask on the index, long keys and long map
-  keys on both paths (maxParallelism 32768), a > 50 KB header (321 states) on `list_states`, the
-  index and the export, the index reading its header from the header only (a state value that
-  spells a state record is not a state), one-letter state names located at their own record, and
-  a corrupted key-group reported by the export, the index and the CLI.
+  real one, file-backed/inline/compressed parity, every subtask on the reader, long keys and long
+  map keys on both paths (maxParallelism 32768), a > 50 KB header (321 states) on `list_states`,
+  the reader and the export, the header read from the header only (a state value that spells a
+  state record is not a state), one-letter state names located at their own record, and a
+  corrupted key-group reported by the export, the reader and the CLI.
 - `tests/state_file_errors_test.rs` — fixture-free (CI): a 2-subtask file-backed synthetic
-  savepoint with one state file deleted, truncated or (unix) `chmod 000`. The index records an
-  error naming the file and keeps the other subtask's keys; the TUI keeps and flags the operator;
-  `export_state_ndjson`, `list_states`, `find_state` and the CLI (exit code) fail naming the file;
-  no cache is written after a partial build or with `--no-cache`, which does not read it either.
-- `tests/cache_test.rs` — round trip, staleness decided from the header without decoding the body,
-  header-less (older) caches rejected, `may_save_cache`.
-- `tests/tui_cap_test.rs` (fixture-free, CI) — the key cap: a `TestBackend` pages a hand-built
-  capped `IndexCache` to the end and back without panicking, with both counts on the operator,
-  pager, filter and trailing rows; on synthetic multi-subtask savepoints the kept keys come from
-  every subtask in equal shares (each subtask's smallest), a small subtask keeps all its keys, and
-  the `E` export carries `truncated` / `stored_keys` / `total_keys`. Also: a key containing `↓` is
-  not taken for the pager.
+  savepoint with one state file deleted, truncated or (unix) `chmod 000`. The reader reports an
+  error naming the file and keeps the other subtask's keys; the TUI keeps and flags the operator
+  (`≥ N keys` once counted, a "keys are missing" row after the last key); `export_state_ndjson`,
+  `list_states`, `find_state` and the CLI (exit code) fail naming the file; no counts are cached
+  after a partial count, complete ones are (in the cache dir, nothing in the savepoint's).
+- `tests/tui_cap_test.rs` (fixture-free, CI) — no cap: 150 000 keys (more than the old 100 000)
+  over 2 subtasks paged with PageDown to the very last key (subtask 1's) and back, keys of both
+  subtasks shown, the pager's total exact at the end (`↑ 149971-150000 / 150000`); `↓` row by row
+  shows every key once in the reader's order; 3 and 4 subtasks all reachable; the `E` export
+  (`write_json`) streams every key (valid JSON, `truncated: false`, cancellable) and the app runs
+  it in the background; a tree over a subset of operators. A key with a 200 000-entry MAP:
+  expanding it reads one page of 50 entries (`entries_read`), the pager scrolls it a page at a
+  time, its hex detail works on a paged entry; the export streams it with at most one page held
+  (`max_entries_held`), in on-disk order, and a cancel lands inside the map; missing map keys
+  don't collide (`#<i>`); keys containing `↓`/`↑` are not pager rows; `q` during an export asks
+  first (a second `q` aborts, another key disarms), Ctrl-C aborts at once. Each was reverted once
+  to check its test fails.
+- `tests/tui_search_test.rs` (fixture-free, CI) — a glob is scanned step by step (progress on the
+  row, every match of both subtasks); an exact String or Long key is found by `get` with no scan
+  (one key read), an absent one at once, a pattern without wildcard shown before the scan and not
+  twice; a key-group range across the subtask split; Ctrl-C stops (and joins) the count, `C`
+  toggles it; Ctrl-C and `Esc` stop a search; the search runs on a worker (`poll_search` never
+  waits, `cancel_search` joins it), and a `Job` blocked on a full bounded channel is still
+  cancelled and joined; the counts cache goes through a unique side file (pid + counter), none
+  left behind; opening, paging, filtering and counting change
+  nothing in the savepoint directory, the counts file holds counts only, is reused, and is stale
+  once `_metadata` changes; `--no-cache` and `XDG_CACHE_HOME`/`HOME` give the cache dir.
 - `tests/tui_text_test.rs` (fixture-free, CI) — `TestBackend` renders of long non-ASCII values (é,
   CJK, Greek, `☕`) at 80 and 120 columns, with and without debug labels, and of the loading screen
   with a non-ASCII operator name; Ctrl-C quits from the tree, the filter input and the overlays.
@@ -825,16 +893,10 @@ advisory, including `unmaintained`/`unsound` *warnings* (not just vulnerabilitie
 stay clean.
 - Prefer **removing** a dep if it's unused (`tui-tree-widget` and `dirs` were dead and were dropped;
   removing `tui-tree-widget` also deduped a second `ratatui`).
-- The index cache carries a `cache_format` version (`src/index/cache.rs`): bump it whenever an
-  older cache would decode cleanly but hold values this build computes differently — a mismatch, or
-  a cache predating the field, falls back to a full rebuild. The file starts with a fixed 24-byte
-  header (magic `FXIC`, format, `_metadata` size and mtime), so a stale cache is rejected without
-  decoding its body.
-- The index cache (`src/index/cache.rs`) uses **`postcard`** (not `bincode`, which is unmaintained —
-  RUSTSEC-2025-0141, and whose 3.0.0 is a serde-less tombstone). Use
-  `postcard = { default-features = false, features = ["use-std"] }` to avoid `heapless →
-  atomic-polyfill` (also unmaintained). An undecodable cache falls back to a full rebuild, so the
-  on-disk format may change freely.
+- The value-holding index cache and its `postcard` dependency are gone (#24). The counts cache
+  (`src/tui/counts.rs`) is plain text written with `std` alone; do not add a serialization crate
+  for it (and never `bincode`: unmaintained, RUSTSEC-2025-0141). Bump its `MAGIC` line if its
+  meaning changes: a mismatching header is simply ignored.
 - Keep `ratatui`/`crossterm` current (≥0.30/0.29) — older `ratatui` pulls `paste`/`lru` advisories.
 
 <!-- MANUAL ADDITIONS END -->

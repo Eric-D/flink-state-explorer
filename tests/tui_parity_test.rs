@@ -8,15 +8,16 @@
 mod common;
 
 use common::synth::{self, Item, KeyedOperator, Kind, Ser, Spec, Storage, Val};
-use common::tui::{compare_operator, draw, expand_all, export_operator, labels};
-use flink_explorer::index::builder::build_index;
+use common::tui::{compare_operator, draw, expand_all, export_operator, labels, open_tree};
+use flink_explorer::operators::summarize;
 use flink_explorer::parser;
 use flink_explorer::parser::pojo::millis_to_iso;
 use flink_explorer::parser::value::value_to_display;
 use flink_explorer::proto::ProtoContext;
-use flink_explorer::tui::tree::TreeView;
+use flink_explorer::reader::StateReader;
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
+use std::sync::Arc;
 
 const COLORS: &[&str] = &["RED", "GREEN", "BLUE"];
 
@@ -49,7 +50,7 @@ fn operator() -> KeyedOperator {
             op.items.push(item(7, Val::Byte(-1)));
             continue;
         }
-        // Key 0 has more entries and elements than the TUI lists ("… +N more").
+        // Key 0 has more entries and elements than the TUI lists (a `↓` pager row, "… +N more").
         let (n_map, n_list) = if i == 0 {
             (57, 130)
         } else {
@@ -130,14 +131,14 @@ fn written() -> (synth::TempDir, parser::metadata::Savepoint) {
 #[test]
 fn every_key_and_state_renders_as_the_export_decodes_it() {
     let (dir, savepoint) = written();
-    let index = build_index(&savepoint, 0, 0, &dir);
-    let op = &index.operators[0];
-    let ks = op.keyed_state.as_ref().unwrap();
-    assert_eq!(ks.descriptors.len(), 12);
-    assert_eq!(ks.descriptors[11].value_type, "Ttl<Long>");
-    assert_eq!(ks.partitions.len(), 6);
+    let reader = Arc::new(StateReader::open(&dir).unwrap());
+    let op = &summarize(&savepoint, &dir)[0];
+    let ks = common::keyed::keyed(&dir, &op.operator_id_hex()).unwrap();
+    assert_eq!(ks.states.len(), 12);
+    assert_eq!(ks.states[11].value_type, "Ttl<Long>");
+    assert_eq!(ks.keys.len(), 6);
 
-    let (pairs, diffs) = compare_operator(&savepoint, &dir, &index, op);
+    let (pairs, diffs) = compare_operator(&savepoint, &dir, &reader, op);
     assert_eq!(pairs, 72);
     assert!(
         diffs.is_empty(),
@@ -153,8 +154,9 @@ fn every_key_and_state_renders_as_the_export_decodes_it() {
 #[test]
 fn the_exported_values_are_the_written_ones() {
     let (dir, savepoint) = written();
-    let index = build_index(&savepoint, 0, 0, &dir);
-    let exported = export_operator(&savepoint, &dir, &index.operators[0]).unwrap();
+    let hex = summarize(&savepoint, &dir)[0].operator_id_hex();
+    let states = common::keyed::keyed(&dir, &hex).unwrap().states;
+    let exported = export_operator(&savepoint, &dir, &hex, &states).unwrap();
     let get = |key: &str, state: &str| {
         exported
             .values
@@ -202,9 +204,8 @@ fn the_exported_values_are_the_written_ones() {
 /// date, everything else as `value_to_display`.
 #[test]
 fn auto_date_shows_a_long_state_as_a_date() {
-    let (dir, savepoint) = written();
-    let index = build_index(&savepoint, 0, 0, &dir);
-    let mut tree = TreeView::new(&index);
+    let (dir, _savepoint) = written();
+    let mut tree = open_tree(&dir);
     let mut terminal = Terminal::new(TestBackend::new(200, 4)).unwrap();
     draw(&mut terminal, &mut tree);
     tree.apply_filter(&Some(flink_explorer::tui::filter::AppliedFilter::Exact(
@@ -238,43 +239,45 @@ fn auto_date_shows_a_long_state_as_a_date() {
     );
 }
 
-/// A rebuild (expand, collapse, toggle, scroll) reuses the values the previous one decoded:
-/// only a key newly expanded is decoded, and a new proto context decodes them all again.
+/// The tree holds no value of its own: it asks the reader for the keys it shows, once. A rebuild
+/// (expand, collapse, toggle) reads nothing; the keys of a window are read when it is first
+/// shown, and again after a new proto context (the reader decodes with it).
 #[test]
-fn a_rebuild_decodes_only_what_it_did_not_show_before() {
-    let (dir, savepoint) = written();
-    let index = build_index(&savepoint, 0, 0, &dir);
-    let mut tree = TreeView::new(&index);
+fn a_rebuild_reads_no_key_again() {
+    let (dir, _savepoint) = written();
+    let mut tree = open_tree(&dir);
+    assert_eq!(
+        tree.decode_calls(),
+        0,
+        "no key is read before an operator is expanded"
+    );
     tree.jump_first();
-    tree.expand(); // the operator
-    assert_eq!(tree.decode_calls(), 0);
+    tree.expand(); // the operator: its 6 keys, read once
+    let first = tree.decode_calls();
+    assert_eq!(first, 6);
     while !tree.selected_path().ends_with("> user-0") {
         tree.move_down();
     }
-    tree.expand(); // user-0: each of its 12 values decoded, once
-    let first = tree.decode_calls();
-    assert_eq!(first, 12);
+    tree.expand(); // user-0: its values come with it
     for _ in 0..3 {
         tree.toggle_debug();
         tree.toggle_auto_date();
         tree.toggle_hide_empty();
     }
     tree.move_down();
-    assert!(tree.selected_path().ends_with("> user-0 > m-str"));
+    assert!(
+        tree.selected_path().ends_with("> user-0 > m-str"),
+        "{}",
+        tree.selected_path()
+    );
     let rows = tree.row_count();
     tree.expand(); // its 57-entry MAP: the rows come from the value already decoded
     assert!(tree.row_count() > rows + 50);
     tree.collapse();
-    assert_eq!(
-        tree.decode_calls(),
-        first,
-        "a rebuild decoded the same values again"
-    );
-
     tree.collapse(); // to the key
-    tree.collapse(); // close it: its values are dropped
-    tree.expand(); // and decoded again on reopening
-    assert_eq!(tree.decode_calls(), 2 * first);
+    tree.collapse(); // close it
+    tree.expand(); // and open it again
+    assert_eq!(tree.decode_calls(), first, "a rebuild read keys again");
 
     tree.set_proto_context(std::sync::Arc::new(ProtoContext {
         pool: prost_reflect::DescriptorPool::new(),
@@ -283,7 +286,7 @@ fn a_rebuild_decodes_only_what_it_did_not_show_before() {
     }));
     assert_eq!(
         tree.decode_calls(),
-        3 * first,
-        "decoded with the old context"
+        2 * first,
+        "the keys shown are read again through the new context"
     );
 }

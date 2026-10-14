@@ -1,16 +1,14 @@
 //! The TUI reaches every value's bytes and every operator-state element (#19), fixture-free:
-//! `x` (or Enter on a leaf) opens the hex overlay on a keyed value or an operator-state element
-//! with its real bytes; operator-state elements page past the first 500 like keyed partitions,
+//! `x` (or Enter on a leaf) opens the hex overlay on a keyed value (the entry's bytes as the
+//! reader returns them; under a MAP, the entry the row shows) or an operator-state element with
+//! its real bytes; operator-state elements page past the first 500 like keyed partitions,
 //! with their real index under a filter; and pager rows are told apart by what they are, so a
 //! label holding `↓` or `↑` does not trap the cursor.
 
 mod common;
 
 use common::synth::{self, Item, KeyedOperator, Kind, OpState, Ser, Spec, Storage, Val};
-use common::tui::{draw, labels};
-use flink_explorer::index::builder::build_index;
-use flink_explorer::index::cache::IndexCache;
-use flink_explorer::parser;
+use common::tui::{draw, labels, open_tree};
 use flink_explorer::tui::detail::DetailOverlay;
 use flink_explorer::tui::filter::AppliedFilter;
 use flink_explorer::tui::tree::TreeView;
@@ -23,7 +21,7 @@ fn element(i: usize) -> Val {
     Val::Str(format!("e-{:04}", i))
 }
 
-fn savepoint() -> (synth::TempDir, IndexCache) {
+fn savepoint() -> synth::TempDir {
     let mut keyed = KeyedOperator::new(0x31, 1, 128, Ser::String)
         .state("count", Kind::Value(Ser::Long))
         .state("m", Kind::Map(Ser::String, Ser::Long))
@@ -57,9 +55,7 @@ fn savepoint() -> (synth::TempDir, IndexCache) {
     spec.operators.push(big);
     let dir = synth::temp_dir("tui-raw-bytes");
     synth::write_savepoint(&spec, &dir);
-    let savepoint = parser::parse_metadata(&dir.join("_metadata")).unwrap();
-    let index = build_index(&savepoint, 0, 0, &dir);
-    (dir, index)
+    dir
 }
 
 /// Move down until the selected row's path satisfies `want`; panics after `limit` moves.
@@ -80,10 +76,8 @@ fn rows(tree: &mut TreeView, width: u16, height: u16) -> Vec<String> {
 
 #[test]
 fn the_overlay_opens_on_a_keyed_value_with_its_bytes() {
-    let (_dir, index) = savepoint();
-    let ks = index.operators[0].keyed_state.as_ref().unwrap();
-    let part = ks.partitions.iter().find(|p| p.key == "alpha").unwrap();
-    let mut tree = TreeView::new(&index);
+    let dir = savepoint();
+    let mut tree = open_tree(&dir);
     tree.jump_first();
     tree.expand(); // the keyed operator
     goto(&mut tree, 20, |p| p.ends_with("> alpha"));
@@ -91,14 +85,13 @@ fn the_overlay_opens_on_a_keyed_value_with_its_bytes() {
     goto(&mut tree, 5, |p| p.ends_with("> alpha > count"));
 
     let raw = tree
-        .selected_raw_bytes(&index)
+        .selected_raw_bytes()
         .expect("bytes behind a keyed value");
     assert_eq!(raw.value, 7i64.to_be_bytes());
-    assert_eq!(raw.value, part.values[0].clone().unwrap());
     assert_eq!(raw.key, b"alpha");
     // Enter on the leaf expands nothing: the app opens these bytes instead.
     assert!(!tree.expand());
-    assert_eq!(tree.selected_raw_bytes(&index), Some(raw.clone()));
+    assert_eq!(tree.selected_raw_bytes(), Some(raw.clone()));
 
     let mut overlay = DetailOverlay::new();
     overlay.open_raw(raw);
@@ -112,31 +105,45 @@ fn the_overlay_opens_on_a_keyed_value_with_its_bytes() {
         screen
     );
 
-    // A MAP value: the per-key blob the index builds, and said to be one.
+    // A MAP value: one entry of it, as stored — the value behind its `NullableSerializer` byte,
+    // the map key in the namespace (after the `VoidNamespace` byte).
     tree.move_down();
     assert!(tree.selected_path().ends_with("> alpha > m"));
-    let raw = tree.selected_raw_bytes(&index).unwrap();
-    assert_eq!(raw.value, part.values[1].clone().unwrap());
-    assert_eq!(raw.value_title, "m [Map<String,Long>]: per-key blob");
-    // The overlay's title fits on an 80-column terminal (its layout is in the README).
+    let raw = tree.selected_raw_bytes().unwrap();
+    let mut want = vec![0u8];
+    want.extend_from_slice(&1i64.to_be_bytes());
+    assert_eq!(raw.value, want);
+    assert_eq!(raw.value_title, "m [Map<String,Long>]: entry 1 of 1");
+    assert_eq!(raw.key_title, "m[a]: namespace + map key");
+    assert_eq!(raw.key[0], 0, "VoidNamespace");
+    assert_eq!(&raw.key[1..], Val::str("a").encode());
+    // The same bytes from the map entry's own row.
+    tree.expand();
+    tree.move_down();
+    assert!(
+        tree.selected_path().ends_with("> alpha > m[a]"),
+        "{}",
+        tree.selected_path()
+    );
+    assert_eq!(tree.selected_raw_bytes(), Some(raw.clone()));
+    // The overlay's title fits on an 80-column terminal.
     let mut overlay = DetailOverlay::new();
     overlay.open_raw(raw);
     let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
     terminal.draw(|f| overlay.render(f, f.area())).unwrap();
     let screen = common::tui::screen(&terminal).join("\n");
     assert!(
-        screen.contains("m [Map<String,Long>]: per-key blob"),
+        screen.contains("m [Map<String,Long>]: entry 1 of 1"),
         "{}",
         screen
     );
 }
 
-/// The tree keeps no operator-state bytes of its own: `x` reads them from the index it is
-/// handed, so a change there shows (a copy taken by `TreeView::new` would not see it).
+/// `x` on an operator-state element gives the element's own bytes.
 #[test]
-fn operator_state_bytes_are_read_from_the_index() {
-    let (_dir, mut index) = savepoint();
-    let mut tree = TreeView::new(&index);
+fn operator_state_bytes_are_the_elements() {
+    let dir = savepoint();
+    let mut tree = open_tree(&dir);
     tree.jump_first();
     goto(&mut tree, 20, |p| !p.contains('>') && p.contains("3232"));
     tree.expand();
@@ -144,35 +151,15 @@ fn operator_state_bytes_are_read_from_the_index() {
     tree.expand();
     tree.move_down();
     assert!(tree.selected_path().ends_with("big[0]"));
-    assert_eq!(
-        tree.selected_raw_bytes(&index).unwrap().value,
-        element(0).encode()
-    );
-    let op = index
-        .operators
-        .iter()
-        .position(|o| o.states.iter().any(|s| s.name == "big"))
-        .unwrap();
-    index.operators[op].states[0].entries[0].value_ref =
-        flink_explorer::index::cache::ValueRef::Inline {
-            data: vec![0xab, 0xcd],
-        };
-    assert_eq!(tree.selected_raw_bytes(&index).unwrap().value, [0xab, 0xcd]);
-    index.operators[op].states[0].entries[0].value_ref =
-        flink_explorer::index::cache::ValueRef::Decoded;
-    let raw = tree.selected_raw_bytes(&index).unwrap();
-    assert!(raw.value.is_empty());
-    assert!(
-        raw.value_title.starts_with("no bytes"),
-        "{}",
-        raw.value_title
-    );
+    let raw = tree.selected_raw_bytes().unwrap();
+    assert_eq!(raw.value, element(0).encode());
+    assert_eq!(raw.value_title, "element big[0]");
 }
 
 /// Open the `big` operator state (1200 elements, a window of 500) and return the tree, its
 /// cursor on the state's row.
-fn open_big(index: &IndexCache) -> TreeView {
-    let mut tree = TreeView::new(index);
+fn open_big(dir: &std::path::Path) -> TreeView {
+    let mut tree = open_tree(dir);
     tree.jump_first();
     goto(&mut tree, 20, |p| !p.contains('>') && p.contains("3232"));
     tree.expand();
@@ -193,8 +180,8 @@ fn element_at(tree: &TreeView) -> usize {
 
 #[test]
 fn page_down_and_up_move_a_page_through_the_elements() {
-    let (_dir, index) = savepoint();
-    let mut tree = open_big(&index);
+    let dir = savepoint();
+    let mut tree = open_big(&dir);
     // Rendered 22 rows high: 20 rows inside the borders, a page.
     rows(&mut tree, 120, 22);
     tree.page_down();
@@ -249,14 +236,13 @@ fn page_down_scrolls_the_keyed_partitions() {
     spec.operators.push(keyed);
     let dir = synth::temp_dir("tui-page-keys");
     synth::write_savepoint(&spec, &dir);
-    let savepoint = parser::parse_metadata(&dir.join("_metadata")).unwrap();
-    let index = build_index(&savepoint, 0, 0, &dir);
-    let mut tree = TreeView::new(&index);
+    let mut tree = open_tree(&dir);
     tree.jump_first();
     tree.expand();
-    let last_key = index.operators[0].keyed_state.as_ref().unwrap().partitions[98]
-        .key
-        .clone();
+    // The last key in the reader's order (key-groups ascending, on-disk order inside one).
+    let keyed = common::keyed::operators(&dir).remove(0).1.unwrap();
+    assert_eq!(keyed.keys.len(), 99);
+    let last_key = keyed.keys[98].key.clone();
     rows(&mut tree, 120, 12); // a page of 10 rows
     let mut presses = 0;
     while !tree.selected_path().ends_with(&format!("> {}", last_key)) {
@@ -277,8 +263,8 @@ fn page_down_scrolls_the_keyed_partitions() {
 /// `G` lands on the last data row, not on a `↓` pager row (stepping onto one scrolls).
 #[test]
 fn jump_last_lands_on_data() {
-    let (_dir, index) = savepoint();
-    let mut tree = open_big(&index);
+    let dir = savepoint();
+    let mut tree = open_big(&dir);
     let n = tree.row_count() as u16;
     let shown = rows(&mut tree, 120, n + 2);
     assert_eq!(shown.last().unwrap(), "    ↓ 1-500 / 1200");
@@ -297,8 +283,8 @@ fn jump_last_lands_on_data() {
 
 #[test]
 fn an_operator_state_of_1200_elements_pages_to_the_last_one() {
-    let (_dir, index) = savepoint();
-    let mut tree = TreeView::new(&index);
+    let dir = savepoint();
+    let mut tree = open_tree(&dir);
     tree.jump_first();
     goto(&mut tree, 20, |p| !p.contains('>') && p.contains("3232"));
     tree.expand(); // the operator holding `big`
@@ -312,12 +298,13 @@ fn an_operator_state_of_1200_elements_pages_to_the_last_one() {
     let shown = rows(&mut tree, 120, 600);
     assert!(shown.iter().any(|r| r == "    • [1199] \"e-1199\""));
     assert!(shown.iter().any(|r| r == "    ↑ 701-1200 / 1200"));
-    let raw = tree.selected_raw_bytes(&index).expect("an element's bytes");
+    let raw = tree.selected_raw_bytes().expect("an element's bytes");
     assert_eq!(raw.value, element(1199).encode());
     assert_eq!(raw.key, b"\"e-1199\"");
 
     // Under a filter, an element keeps its real index, and its bytes.
     tree.apply_filter(&Some(AppliedFilter::Pattern("*119*".to_string())));
+    tree.finish_search();
     let shown = rows(&mut tree, 120, 60);
     assert!(
         shown
@@ -333,16 +320,18 @@ fn an_operator_state_of_1200_elements_pages_to_the_last_one() {
     tree.jump_first();
     goto(&mut tree, 100, |p| p.ends_with("big[1195]"));
     assert_eq!(
-        tree.selected_raw_bytes(&index).unwrap().value,
+        tree.selected_raw_bytes().unwrap().value,
         element(1195).encode()
     );
 }
 
 #[test]
 fn a_label_with_an_arrow_does_not_trap_the_cursor() {
-    let (_dir, mut index) = savepoint();
-    index.operators.truncate(1); // the keys and elements with arrows, all on one page
-    let mut tree = TreeView::new(&index);
+    let dir = savepoint();
+    // The keys and elements with arrows, all on one page: the first operator alone.
+    let reader = std::sync::Arc::new(flink_explorer::reader::StateReader::open(&dir).unwrap());
+    let first = flink_explorer::operators::summarize(reader.savepoint(), &dir).remove(0);
+    let mut tree = TreeView::new(reader, vec![first]);
     // Expand everything.
     common::tui::expand_all(&mut tree);
     let n = tree.row_count();

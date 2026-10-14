@@ -1,5 +1,6 @@
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -8,20 +9,51 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use ratatui::Terminal;
 
 use crate::error::{AppError, ParseError, UiError};
-use crate::index::builder::build_index_with_progress;
-use crate::index::cache::{load_cache, may_save_cache, save_cache, CachedOperator, IndexCache};
 use crate::parser;
 use crate::profile::storage::{self as profile_storage, Profile};
+use crate::reader::StateReader;
 use crate::tui::detail::DetailOverlay;
 use crate::tui::filter::FilterBar;
+use crate::tui::jobs::{CountMsg, CountTarget, ExportMsg, Job};
 use crate::tui::loading::LoadingStep;
 use crate::tui::profile_picker::{ProfileAction, ProfilePicker};
-use crate::tui::tree::TreeView;
+use crate::tui::tree::{KeyCount, TreeView};
+
+/// Options for [`App::open`].
+#[derive(Debug, Clone, Default)]
+pub struct AppOptions {
+    /// Where the key counts cache lives (`None`: no cache, neither read nor written).
+    pub cache_dir: Option<PathBuf>,
+    /// Start the background count pass once the tree is up.
+    pub count_keys: bool,
+    /// Stored bytes one count step reads (0: [`crate::tui::jobs::COUNT_STEP_BYTES`]).
+    pub count_step_bytes: u64,
+    /// Stored bytes the search reads between two reports (0:
+    /// [`crate::tui::tree::SEARCH_STEP_BYTES`]).
+    pub search_step_bytes: u64,
+}
+
+impl AppOptions {
+    /// What `flink-explorer` runs with: counts cached under the user cache dir unless
+    /// `no_cache`, and counted in the background.
+    pub fn from_env(no_cache: bool) -> AppOptions {
+        AppOptions {
+            cache_dir: if no_cache {
+                None
+            } else {
+                crate::tui::counts::default_cache_dir()
+            },
+            count_keys: true,
+            count_step_bytes: crate::tui::jobs::COUNT_STEP_BYTES,
+            search_step_bytes: crate::tui::tree::SEARCH_STEP_BYTES,
+        }
+    }
+}
 
 /// Main application state.
 pub struct App {
     savepoint_dir: PathBuf,
-    index: IndexCache,
+    checkpoint_id: i64,
     tree_view: TreeView,
     filter: FilterBar,
     detail: DetailOverlay,
@@ -36,13 +68,40 @@ pub struct App {
     summary_visible: bool,
     summary_entries: Vec<String>,
     summary_scroll: usize,
+    options: AppOptions,
+    /// The background count pass, while it runs.
+    count_job: Option<Job<CountMsg>>,
+    /// Counts completed exactly, by operator hex id (saved to the cache once all are).
+    counted: Vec<(String, usize)>,
+    /// False once the pass met an unreadable key-group: the counts are then not cached.
+    count_complete: bool,
+    export_job: Option<Job<ExportMsg>>,
+    /// The export's last progress report, while it runs.
+    export_progress: Option<crate::export::ExportProgress>,
+    /// A `q` was pressed while the export ran: the next `q` aborts it and quits.
+    quit_armed: bool,
 }
 
 impl App {
-    /// Create a new App with progress callbacks for each loading phase.
+    /// Open `savepoint_dir` with what `flink-explorer` runs with ([`AppOptions::from_env`]),
+    /// reporting each loading step to `on_step`.
     pub fn new_with_progress<F>(
         savepoint_dir: PathBuf,
         no_cache: bool,
+        on_step: F,
+    ) -> Result<Self, AppError>
+    where
+        F: FnMut(LoadingStep),
+    {
+        Self::open(savepoint_dir, AppOptions::from_env(no_cache), on_step)
+    }
+
+    /// Open `savepoint_dir`: parse `_metadata`, read the operator states and each keyed
+    /// operator's headers — nothing else, so the first frame comes right after. Keys are read
+    /// when an operator is expanded; counts come from the cache, or from a background pass.
+    pub fn open<F>(
+        savepoint_dir: PathBuf,
+        options: AppOptions,
         mut on_step: F,
     ) -> Result<Self, AppError>
     where
@@ -56,10 +115,10 @@ impl App {
                 format!("No _metadata file found in {}", savepoint_dir.display()),
             ))));
         }
-        let index = load_index(&savepoint_dir, no_cache, &mut on_step)?;
 
-        on_step(LoadingStep::BuildingTree);
-        let mut tree_view = TreeView::new(&index);
+        on_step(LoadingStep::ParsingMetadata);
+        let savepoint = parser::parse_metadata(&metadata_path)?;
+        let checkpoint_id = savepoint.checkpoint_id;
 
         on_step(LoadingStep::LoadingProtos);
         let active_profile = profile_storage::load_config_as_profile().ok().or_else(|| {
@@ -68,11 +127,11 @@ impl App {
                 .and_then(|gc| gc.last_profile)
                 .and_then(|name| profile_storage::load_profile(&name).ok())
         });
-
         let mut proto_list_entries = Vec::new();
+        let mut proto = None;
         if let Some(ref profile) = active_profile {
             if let Some((ctx, loaded_paths)) = build_proto_context(profile) {
-                tree_view.set_proto_context(std::sync::Arc::new(ctx));
+                proto = Some(Arc::new(ctx));
                 proto_list_entries = loaded_paths;
             }
         }
@@ -94,11 +153,33 @@ impl App {
             proto_list_entries.push("5. Select profile with P key".to_string());
         }
 
-        let summary_entries = build_summary_entries(&index);
+        let summaries = crate::operators::summarize(&savepoint, &savepoint_dir);
+        let mut reader = StateReader::from_savepoint(savepoint, &savepoint_dir);
+        if let Some(ctx) = &proto {
+            reader = reader.with_proto(ctx.clone());
+        }
+        // Each operator's headers, one operator at a time (a Ctrl-C between two ends the load):
+        // the reader keeps them, the tree only asks what they say.
+        let total_operators = summaries.len();
+        for (i, s) in summaries.iter().enumerate() {
+            on_step(LoadingStep::ReadingHeaders {
+                total_operators,
+                current_operator: i + 1,
+                operator_name: s.display_name.clone(),
+            });
+            let _ = reader.states(&s.operator_id_hex());
+        }
+        let mut tree_view = TreeView::new(Arc::new(reader), summaries);
+        if options.search_step_bytes > 0 {
+            tree_view.set_search_step_bytes(options.search_step_bytes);
+        }
+        if let Some(ctx) = proto {
+            tree_view.note_proto_context(ctx);
+        }
 
-        Ok(Self {
+        let mut app = Self {
             savepoint_dir,
-            index,
+            checkpoint_id,
             tree_view,
             filter: FilterBar::new(),
             detail: DetailOverlay::new(),
@@ -111,9 +192,244 @@ impl App {
             proto_list_entries,
             proto_list_scroll: 0,
             summary_visible: false,
-            summary_entries,
+            summary_entries: Vec::new(),
             summary_scroll: 0,
-        })
+            options,
+            count_job: None,
+            counted: Vec::new(),
+            count_complete: true,
+            export_job: None,
+            export_progress: None,
+            quit_armed: false,
+        };
+        app.load_cached_counts();
+        if app.options.count_keys {
+            app.start_count();
+        }
+        Ok(app)
+    }
+
+    /// The tree (tests drive it directly).
+    pub fn tree(&mut self) -> &mut TreeView {
+        &mut self.tree_view
+    }
+
+    /// Counts from the cache, when it is fresh: the count pass then skips those operators.
+    fn load_cached_counts(&mut self) {
+        let Some(dir) = &self.options.cache_dir else {
+            return;
+        };
+        let Some(counts) = crate::tui::counts::load(dir, &self.savepoint_dir) else {
+            return;
+        };
+        for (op, hex, _) in self.tree_view.keyed_operators() {
+            if let Some(&n) = counts.get(&hex) {
+                self.tree_view.set_key_count(op, KeyCount::Exact(n));
+                self.counted.push((hex, n));
+            }
+        }
+    }
+
+    /// Start the background count pass over the keyed operators not counted yet.
+    pub fn start_count(&mut self) {
+        if self.count_job.as_ref().is_some_and(|j| j.is_running()) {
+            return;
+        }
+        let targets: Vec<CountTarget> = self
+            .tree_view
+            .keyed_operators()
+            .into_iter()
+            .filter(|(op, _, _)| !matches!(self.tree_view.key_count(*op), Some(KeyCount::Exact(_))))
+            .map(|(op, hex, max_parallelism)| CountTarget {
+                op,
+                hex,
+                max_parallelism,
+            })
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        self.count_complete = true;
+        let step = match self.options.count_step_bytes {
+            0 => crate::tui::jobs::COUNT_STEP_BYTES,
+            n => n,
+        };
+        self.count_job = Some(crate::tui::jobs::start_count(
+            self.tree_view.reader().clone(),
+            targets,
+            step,
+        ));
+    }
+
+    /// Stop the count pass: what it counted so far stays, as a lower bound.
+    pub fn cancel_count(&mut self) {
+        if let Some(mut job) = self.count_job.take() {
+            job.cancel();
+            for m in job.drain() {
+                self.apply_count(m);
+            }
+            for (op, _, _) in self.tree_view.keyed_operators() {
+                if let Some(KeyCount::Counting { keys, .. }) = self.tree_view.key_count(op) {
+                    self.tree_view.set_key_count(op, KeyCount::AtLeast(keys));
+                }
+            }
+        }
+    }
+
+    /// Whether the count pass is running.
+    pub fn counting(&self) -> bool {
+        self.count_job.as_ref().is_some_and(|j| j.is_running())
+    }
+
+    /// Whether a background job (count or export) is running, or a search.
+    pub fn busy(&self) -> bool {
+        self.counting() || self.exporting() || self.tree_view.searching()
+    }
+
+    /// Wait for the count pass to finish, then apply what it found (tests).
+    pub fn wait_for_count(&mut self) {
+        if let Some(job) = self.count_job.as_mut() {
+            job.join();
+        }
+        self.poll_jobs();
+    }
+
+    /// Wait for the export to finish, then apply what it reported (tests).
+    pub fn wait_for_export(&mut self) {
+        if let Some(job) = self.export_job.as_mut() {
+            job.join();
+        }
+        self.poll_jobs();
+    }
+
+    /// The status line's message, if any.
+    pub fn status(&self) -> Option<&str> {
+        self.status_message.as_deref()
+    }
+
+    fn apply_count(&mut self, m: CountMsg) {
+        match m {
+            CountMsg::Progress { op, keys, percent } => {
+                self.tree_view
+                    .set_key_count(op, KeyCount::Counting { keys, percent });
+            }
+            CountMsg::Done { op, keys, complete } => {
+                if complete {
+                    self.tree_view.set_key_count(op, KeyCount::Exact(keys));
+                    if let Some(s) = self.tree_view.summary(op) {
+                        self.counted.push((s.operator_id_hex(), keys));
+                    }
+                } else {
+                    self.count_complete = false;
+                    self.tree_view.set_key_count(op, KeyCount::AtLeast(keys));
+                }
+            }
+        }
+    }
+
+    /// Apply what the background jobs reported since the last call.
+    pub fn poll_jobs(&mut self) {
+        if let Some(job) = self.count_job.as_mut() {
+            let finished = !job.is_running();
+            let msgs = job.drain();
+            for m in msgs {
+                self.apply_count(m);
+            }
+            if finished {
+                self.count_job = None;
+                self.save_counts();
+            }
+        }
+        if let Some(job) = self.export_job.as_mut() {
+            let finished = !job.is_running();
+            let msgs = job.drain();
+            let output = self.export_path();
+            for m in msgs {
+                match m {
+                    // Shown by the status bar whenever no message is.
+                    ExportMsg::Progress(p) => self.export_progress = Some(p),
+                    ExportMsg::Done(Ok(s)) if s.errors.is_empty() => {
+                        self.set_status(format!("Exported {} keys to {}", s.keys, output.display()))
+                    }
+                    ExportMsg::Done(Ok(s)) => self.set_status(format!(
+                        "Exported {} keys to {}; {} unreadable file(s)/key-group(s): their keys \
+                         are missing (load_errors)",
+                        s.keys,
+                        output.display(),
+                        s.errors.len()
+                    )),
+                    ExportMsg::Done(Err(e)) => self.set_status(format!("Export failed: {}", e)),
+                }
+            }
+            if finished {
+                self.export_job = None;
+                self.export_progress = None;
+                self.quit_armed = false;
+            }
+        }
+    }
+
+    /// Whether the `E` export is running.
+    pub fn exporting(&self) -> bool {
+        self.export_job.as_ref().is_some_and(|j| j.is_running())
+    }
+
+    /// "Exporting… N keys, operator a/b".
+    fn export_progress_text(&self) -> String {
+        match self.export_progress {
+            Some(p) => format!(
+                "Exporting… {} keys, operator {}/{}",
+                p.keys,
+                (p.operators_done + 1).min(p.operators),
+                p.operators
+            ),
+            None => "Exporting…".to_string(),
+        }
+    }
+
+    /// `q`: quit — but while an export runs, quitting would abort it, so the first `q` only
+    /// says so, and a second one (with no other key between) aborts it and quits. Ctrl-C quits
+    /// at once.
+    fn quit_or_confirm(&mut self) {
+        if self.exporting() && !self.quit_armed {
+            self.quit_armed = true;
+            self.set_status(format!(
+                "{} — q again to abort the export and quit, or wait for it",
+                self.export_progress_text()
+            ));
+            return;
+        }
+        self.should_quit = true;
+        self.shutdown();
+    }
+
+    /// Save the counts when every keyed operator was counted exactly and nothing was unreadable
+    /// (a lower bound must not be served as a count next time).
+    fn save_counts(&mut self) {
+        let Some(dir) = &self.options.cache_dir else {
+            return;
+        };
+        let keyed = self.tree_view.keyed_operators().len();
+        if !self.count_complete || self.counted.len() < keyed || self.tree_view.load_errors() > 0 {
+            return;
+        }
+        let _ = crate::tui::counts::save(dir, &self.savepoint_dir, &self.counted);
+    }
+
+    /// One turn of the event loop, between frames: apply what the background jobs (count,
+    /// export, search) reported, without waiting for them. Returns whether a search goes on.
+    pub fn tick(&mut self) -> bool {
+        self.poll_jobs();
+        self.tree_view.poll_search()
+    }
+
+    /// Draw the whole screen into `frame` (any backend: tests use `TestBackend`).
+    pub fn draw(&mut self, frame: &mut Frame) {
+        self.render(frame);
+    }
+
+    fn export_path(&self) -> PathBuf {
+        self.savepoint_dir.join("export.json")
     }
 
     /// Run the TUI event loop on an already-initialized terminal.
@@ -128,12 +444,27 @@ impl App {
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     ) -> Result<(), AppError> {
+        let mut last_draw = std::time::Instant::now() - Duration::from_secs(1);
         loop {
-            terminal
-                .draw(|frame| self.render(frame))
-                .map_err(UiError::Render)?;
+            // The count, the export and the search run on worker threads: a turn only applies
+            // what they reported, so keys are answered while they run — `Esc` stops a search
+            // and Ctrl-C everything between two blocks they read (one key-group is read whole).
+            // While a search runs, frames are drawn every 50 ms to show its matches.
+            let searching = self.tick();
+            if !searching || last_draw.elapsed() >= Duration::from_millis(50) {
+                terminal
+                    .draw(|frame| self.render(frame))
+                    .map_err(UiError::Render)?;
+                last_draw = std::time::Instant::now();
+            }
 
-            if event::poll(Duration::from_millis(100)).map_err(UiError::Event)? {
+            let wait = if searching {
+                Duration::from_millis(50)
+            } else {
+                Duration::from_millis(100)
+            };
+            // One event per turn, so that a held key still lets frames through.
+            if event::poll(wait).map_err(UiError::Event)? {
                 if let Event::Key(key) = event::read().map_err(UiError::Event)? {
                     if key.kind == KeyEventKind::Press {
                         self.handle_key(key);
@@ -142,25 +473,41 @@ impl App {
             }
 
             if self.should_quit {
+                self.shutdown();
                 return Ok(());
             }
         }
     }
 
-    /// Whether the last key handled asked to quit (`q`, or Ctrl-C from anywhere).
+    /// Stop every background job and search (they end at their next step).
+    pub fn shutdown(&mut self) {
+        self.tree_view.cancel_search();
+        if let Some(mut job) = self.count_job.take() {
+            job.cancel();
+        }
+        if let Some(mut job) = self.export_job.take() {
+            job.cancel();
+        }
+    }
+
+    /// Whether the last key handled asked to quit (`q` — twice while an export runs — or Ctrl-C
+    /// from anywhere).
     pub fn should_quit(&self) -> bool {
         self.should_quit
     }
 
     /// Handle one key press. The whole event is needed, not just its code: Ctrl-C arrives here as
     /// `c` + CONTROL (raw mode turns it into a key event instead of SIGINT) and must quit from
-    /// any overlay or input, where a plain `c` would be typed or ignored.
+    /// any overlay or input — or a search or count — where a plain `c` would be typed or ignored.
     pub fn handle_key(&mut self, key: KeyEvent) {
         if is_interrupt(&key) {
             self.should_quit = true;
+            self.shutdown();
             return;
         }
         let code = key.code;
+        // A `q` asking to confirm is confirmed by the very next key only.
+        let quit_armed = std::mem::take(&mut self.quit_armed);
         // Profile picker takes priority
         if self.profile_picker.visible {
             if let Some(action) = self.profile_picker.handle_key(code) {
@@ -219,7 +566,10 @@ impl App {
         }
 
         match code {
-            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('q') => {
+                self.quit_armed = quit_armed;
+                self.quit_or_confirm();
+            }
             KeyCode::Char('/') => self.filter.activate(),
             KeyCode::Char('P') => self.profile_picker.open(),
             KeyCode::Char('I') => {
@@ -227,8 +577,18 @@ impl App {
                 self.proto_list_scroll = 0;
             }
             KeyCode::Char('S') => {
+                self.summary_entries = build_summary_entries(self);
                 self.summary_visible = true;
                 self.summary_scroll = 0;
+            }
+            KeyCode::Char('C') => {
+                if self.counting() {
+                    self.cancel_count();
+                    self.set_status("Key count stopped".to_string());
+                } else {
+                    self.start_count();
+                    self.set_status("Counting keys…".to_string());
+                }
             }
             KeyCode::Char('E') => {
                 self.export_json();
@@ -248,27 +608,32 @@ impl App {
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 if !self.tree_view.expand() {
                     // A leaf: open the bytes behind it, if any.
-                    if let Some(raw) = self.tree_view.selected_raw_bytes(&self.index) {
+                    if let Some(raw) = self.tree_view.selected_raw_bytes() {
                         self.detail.open_raw(raw);
                     }
                 }
             }
             KeyCode::PageDown => self.tree_view.page_down(),
             KeyCode::PageUp => self.tree_view.page_up(),
-            KeyCode::Char('x') => match self.tree_view.selected_raw_bytes(&self.index) {
+            KeyCode::Char('x') => match self.tree_view.selected_raw_bytes() {
                 Some(raw) => self.detail.open_raw(raw),
                 None => self.set_status("x: no bytes behind this row".to_string()),
             },
             KeyCode::Char('i') => {
                 // Show all info for the selected operator.
                 if let Some(op_idx) = self.tree_view.selected_op_idx() {
-                    if let Some(op) = self.index.operators.get(op_idx) {
-                        self.detail.open_info(op.info_lines());
+                    let keyed = self.tree_view.keyed_info(op_idx);
+                    if let Some(op) = self.tree_view.summary(op_idx) {
+                        let lines = op.info_lines(keyed.as_ref());
+                        self.detail.open_info(lines);
                     }
                 }
             }
             KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => {
-                if self.filter.applied.is_some() {
+                if self.tree_view.searching() {
+                    // Stop the search, keep what it found.
+                    self.tree_view.cancel_search();
+                } else if self.filter.applied.is_some() {
                     self.filter.deactivate();
                     self.tree_view.apply_filter(&None);
                 } else {
@@ -286,33 +651,19 @@ impl App {
         self.status_message_at = Some(std::time::Instant::now());
     }
 
+    /// `E`: stream every operator and every key to `export.json`, on a worker thread.
     fn export_json(&mut self) {
-        let output = self.savepoint_dir.join("export.json");
-        let proto_ctx = self.tree_view.proto_context();
-        match crate::export::export_json(&self.index, proto_ctx, &output) {
-            Ok(count) => {
-                let total: usize = self
-                    .index
-                    .operators
-                    .iter()
-                    .filter_map(|op| op.keyed_state.as_ref())
-                    .map(|ks| ks.total_keys)
-                    .sum();
-                self.set_status(if count < total {
-                    format!(
-                        "Exported {} of {} keys to {} (truncated: index cap; --export-state reads them all)",
-                        count,
-                        total,
-                        output.display()
-                    )
-                } else {
-                    format!("Exported {} keys to {}", count, output.display())
-                });
-            }
-            Err(e) => {
-                self.set_status(format!("Export failed: {}", e));
-            }
+        if self.export_job.as_ref().is_some_and(|j| j.is_running()) {
+            self.set_status("An export is already running".to_string());
+            return;
         }
+        let output = self.export_path();
+        self.export_job = Some(crate::tui::jobs::start_export(
+            self.tree_view.reader().clone(),
+            self.tree_view.summaries(),
+            output.clone(),
+        ));
+        self.set_status(format!("Exporting to {}…", output.display()));
     }
 
     fn reload_proto_context(&mut self, profile: &Profile) {
@@ -424,7 +775,7 @@ impl App {
             " flink-explorer — {}{} (checkpoint {}) ",
             profile_part,
             self.savepoint_dir.display(),
-            self.index.checkpoint_id,
+            self.checkpoint_id,
         );
         let block = Block::default().borders(Borders::ALL).title(title);
         self.tree_view.render(frame, block, chunks[0]);
@@ -471,11 +822,18 @@ impl App {
 
         // Status bar
         let status_idx = path_idx + 1;
-        let default_shortcuts = "q:quit  ↑↓:nav  Enter:expand  x:hex  i:op-info  /:filter  S:summary  H:hide  D:debug  P:profile  I:protos  E:export";
+        let searching;
+        let default_shortcuts = "q:quit  ↑↓:nav  Enter:expand  x:hex  i:op-info  /:filter  S:summary  C:count  H:hide  D:debug  P:profile  I:protos  E:export";
         let status = if self.detail.visible {
             "↑↓:scroll  Tab:key/value  Esc:close"
         } else if self.filter.active {
             "Tab:mode  Enter:apply  Esc:cancel"
+        } else if let (None, Some(p)) = (&self.status_message, self.tree_view.search_percent()) {
+            searching = format!("Searching keys… {}%  Esc:stop  q:quit", p);
+            &searching
+        } else if let (None, true) = (&self.status_message, self.exporting()) {
+            searching = format!("{}  q q:abort and quit", self.export_progress_text());
+            &searching
         } else {
             self.status_message.as_deref().unwrap_or(default_shortcuts)
         };
@@ -725,120 +1083,42 @@ pub fn build_proto_context(profile: &Profile) -> Option<(crate::proto::ProtoCont
     }
 }
 
-/// The index the TUI opens `savepoint_dir` with: the cache when allowed and fresh, else a build
-/// from `_metadata` and the state files, which is then cached if [`may_save_cache`] allows.
-///
-/// `no_cache` means the cache is neither read nor written. A build that could not read some state
-/// file is not cached either: it would be served again after the file was repaired.
-pub fn load_index<F>(
-    savepoint_dir: &Path,
-    no_cache: bool,
-    on_step: &mut F,
-) -> Result<IndexCache, AppError>
-where
-    F: FnMut(LoadingStep),
-{
-    let metadata_path = savepoint_dir.join("_metadata");
-    let (metadata_size, metadata_mtime) = get_file_stats(&metadata_path);
-
-    if !no_cache {
-        on_step(LoadingStep::LoadingCache);
-        match load_cache(savepoint_dir, metadata_size, metadata_mtime) {
-            // Never written with load errors; refuse one anyway rather than show a partial index.
-            Ok(cache) if !cache.has_load_errors() => return Ok(cache),
-            _ => {}
-        }
-    }
-
-    let idx = parse_and_build(
-        &metadata_path,
-        metadata_size,
-        metadata_mtime,
-        savepoint_dir,
-        on_step,
-    )?;
-    if may_save_cache(&idx, no_cache) {
-        if let Err(e) = save_cache(&idx, savepoint_dir) {
-            eprintln!("Warning: could not save index cache: {}", e);
-        }
-    }
-    Ok(idx)
-}
-
-fn parse_and_build<F>(
-    metadata_path: &Path,
-    metadata_size: u64,
-    metadata_mtime: u64,
-    savepoint_dir: &Path,
-    on_step: &mut F,
-) -> Result<IndexCache, AppError>
-where
-    F: FnMut(LoadingStep),
-{
-    on_step(LoadingStep::ParsingMetadata);
-    let savepoint = parser::parse_metadata(metadata_path)?;
-    let num_ops = savepoint.operators.len();
-    on_step(LoadingStep::BuildingIndex {
-        total_operators: num_ops,
-        current_operator: 0,
-        operator_name: String::new(),
-        total_keys: 0,
-    });
-    let idx = build_index_with_progress(
-        &savepoint,
-        metadata_size,
-        metadata_mtime,
-        savepoint_dir,
-        |op_idx, op_name, total_keys| {
-            on_step(LoadingStep::BuildingIndex {
-                total_operators: num_ops,
-                current_operator: op_idx + 1,
-                operator_name: op_name.to_string(),
-                total_keys,
-            });
-        },
-    );
-    Ok(idx)
-}
-
-fn build_summary_entries(index: &IndexCache) -> Vec<String> {
+fn build_summary_entries(app: &App) -> Vec<String> {
+    let tree = &app.tree_view;
+    let reader = tree.reader();
+    let savepoint = reader.savepoint();
     let mut lines = Vec::new();
 
-    let total_operators = index.operators.len();
-    let operators_with_keys: usize = index
-        .operators
+    let ops: Vec<usize> = (0..tree.operator_count()).collect();
+    let summary = |i: usize| tree.summary(i).expect("in range");
+    let keyed: Vec<usize> = tree.keyed_operators().into_iter().map(|t| t.0).collect();
+    let total_known = keyed
         .iter()
-        .filter(|o| o.keyed_state.as_ref().map_or(false, |k| k.total_keys > 0))
-        .count();
-    let total_keys: usize = index
-        .operators
+        .all(|&op| matches!(tree.key_count(op), Some(KeyCount::Exact(_))));
+    let total_keys: usize = keyed.iter().map(|&op| tree.keys_at_least(op)).sum();
+    let keys_text = |n: usize, exact: bool| {
+        if exact {
+            n.to_string()
+        } else {
+            format!("≥ {}", n)
+        }
+    };
+    let infos: Vec<_> = ops.iter().map(|&i| tree.keyed_info(i)).collect();
+    let total_states: usize = infos.iter().flatten().map(|k| k.state_names.len()).sum();
+    let total_data_size: u64 = ops.iter().map(|&i| summary(i).keyed_state_size).sum();
+    let finished_count = ops.iter().filter(|&&i| summary(i).fully_finished).count();
+    let coordinator_count = ops
         .iter()
-        .filter_map(|o| o.keyed_state.as_ref())
-        .map(|k| k.total_keys)
-        .sum();
-    let total_states: usize = index
-        .operators
-        .iter()
-        .filter_map(|o| o.keyed_state.as_ref())
-        .map(|k| k.descriptors.len())
-        .sum();
-    let total_data_size: u64 = index.operators.iter().map(|o| o.keyed_state_size).sum();
-    let finished_count = index.operators.iter().filter(|o| o.fully_finished).count();
-    let coordinator_count = index
-        .operators
-        .iter()
-        .filter(|o| o.has_coordinator_state)
+        .filter(|&&i| summary(i).has_coordinator_state)
         .count();
 
     // Count state types
-    let mut value_count = 0usize;
-    let mut map_count = 0usize;
-    let mut list_count = 0usize;
-    let mut other_count = 0usize;
-    for op in &index.operators {
-        if let Some(ks) = &op.keyed_state {
-            for d in &ks.descriptors {
-                match d.state_type.as_str() {
+    let (mut value_count, mut map_count, mut list_count, mut other_count) = (0, 0, 0, 0);
+    for &op in &keyed {
+        let hex = summary(op).operator_id_hex();
+        if let Ok(states) = reader.states(&hex) {
+            for s in &states.states {
+                match s.state_type.as_str() {
                     "VALUE" => value_count += 1,
                     "MAP" => map_count += 1,
                     "LIST" => list_count += 1,
@@ -848,26 +1128,26 @@ fn build_summary_entries(index: &IndexCache) -> Vec<String> {
         }
     }
 
-    // Parallelism stats
-    let max_par: i32 = index
-        .operators
+    let max_par: i32 = ops
         .iter()
-        .map(|o| o.parallelism)
+        .map(|&i| summary(i).parallelism)
         .max()
         .unwrap_or(0);
-    let max_max_par: i32 = index
-        .operators
+    let max_max_par: i32 = ops
         .iter()
-        .map(|o| o.max_parallelism)
+        .map(|&i| summary(i).max_parallelism)
         .max()
+        .unwrap_or(0);
+    let metadata_size = std::fs::metadata(app.savepoint_dir.join("_metadata"))
+        .map(|m| m.len())
         .unwrap_or(0);
 
     lines.push("--- Savepoint ---".to_string());
-    lines.push(format!("  Format version:     {}", index.savepoint_version));
-    lines.push(format!("  Checkpoint ID:      {}", index.checkpoint_id));
+    lines.push(format!("  Format version:     {}", savepoint.version));
+    lines.push(format!("  Checkpoint ID:      {}", savepoint.checkpoint_id));
     lines.push(format!(
         "  Metadata size:      {}",
-        format_size(index.metadata_size)
+        format_size(metadata_size)
     ));
     lines.push(format!(
         "  State data size:    {}",
@@ -876,95 +1156,104 @@ fn build_summary_entries(index: &IndexCache) -> Vec<String> {
     lines.push(String::new());
 
     lines.push("--- Operators ---".to_string());
-    lines.push(format!("  Total:              {}", total_operators));
-    lines.push(format!("  With keyed state:   {}", operators_with_keys));
+    lines.push(format!("  Total:              {}", ops.len()));
+    lines.push(format!("  With keyed state:   {}", keyed.len()));
     lines.push(format!("  Fully finished:     {}", finished_count));
     lines.push(format!("  With coordinator:   {}", coordinator_count));
     lines.push(format!(
         "  Max parallelism:    {} (configured max: {})",
         max_par, max_max_par
     ));
-    let unread_files: usize = index.operators.iter().map(|o| o.load_errors.len()).sum();
-    if unread_files > 0 {
-        let ops = index
-            .operators
+    let unread: usize = infos.iter().flatten().map(|k| k.errors.len()).sum();
+    if unread > 0 {
+        let with = infos
             .iter()
-            .filter(|o| !o.load_errors.is_empty())
+            .flatten()
+            .filter(|k| !k.errors.is_empty())
             .count();
         lines.push(format!(
             "  ⚠ Unread files:     {} in {} operator(s): keys are missing (i: details)",
-            unread_files, ops
+            unread, with
         ));
     }
     lines.push(String::new());
 
     lines.push("--- Keyed State ---".to_string());
-    lines.push(format!("  Total keys:         {}", total_keys));
-    let stored_keys: usize = index
-        .operators
-        .iter()
-        .filter_map(|o| o.keyed_state.as_ref())
-        .map(|k| k.stored_keys())
-        .sum();
-    if stored_keys < total_keys {
-        lines.push(format!(
-            "  Keys shown:         {} (the index keeps at most {} per operator)",
-            stored_keys,
-            crate::index::builder::MAX_STORED_PARTITIONS
-        ));
-    }
+    lines.push(format!(
+        "  Total keys:         {}{}",
+        keys_text(total_keys, total_known),
+        if app.counting() {
+            " (counting…)"
+        } else if total_known {
+            ""
+        } else {
+            " (C: count them all)"
+        }
+    ));
     lines.push(format!(
         "  Registered states:  {} (VALUE:{} MAP:{} LIST:{} other:{})",
         total_states, value_count, map_count, list_count, other_count
     ));
     lines.push(String::new());
 
-    if !index.master_states.is_empty() {
+    if !savepoint.master_states.is_empty() {
         lines.push("--- Master / Coordinator States ---".to_string());
-        for ms in &index.master_states {
-            lines.push(format!("  {}", ms));
+        for m in &savepoint.master_states {
+            lines.push(format!(
+                "  {} (v{}, {} bytes)",
+                m.name,
+                m.version,
+                m.data.len()
+            ));
         }
         lines.push(String::new());
     }
 
     // Top operators by key count
-    let mut ops_by_keys: Vec<(&CachedOperator, usize)> = index
-        .operators
+    let mut ops_by_keys: Vec<(usize, usize)> = keyed
         .iter()
-        .filter_map(|o| o.keyed_state.as_ref().map(|ks| (o, ks.total_keys)))
+        .map(|&op| (op, tree.keys_at_least(op)))
         .filter(|(_, k)| *k > 0)
         .collect();
-    ops_by_keys.sort_by(|a, b| b.1.cmp(&a.1));
+    ops_by_keys.sort_by_key(|o| std::cmp::Reverse(o.1));
+    let shown_keys =
+        |op: usize, n: usize| keys_text(n, matches!(tree.key_count(op), Some(KeyCount::Exact(_))));
 
     if !ops_by_keys.is_empty() {
         lines.push("--- Top Operators by Keys ---".to_string());
         for (op, keys) in ops_by_keys.iter().take(15) {
-            let size = format_size(op.keyed_state_size);
+            let s = summary(*op);
             lines.push(format!(
                 "  {:>8} keys  {:>8}  {}",
-                keys, size, op.display_name
+                shown_keys(*op, *keys),
+                format_size(s.keyed_state_size),
+                s.display_name
             ));
         }
         lines.push(String::new());
     }
 
     // Top operators by data size
-    let mut ops_by_size: Vec<&CachedOperator> = index
-        .operators
+    let mut ops_by_size: Vec<usize> = ops
         .iter()
-        .filter(|o| o.keyed_state_size > 0)
+        .copied()
+        .filter(|&i| summary(i).keyed_state_size > 0)
         .collect();
-    ops_by_size.sort_by(|a, b| b.keyed_state_size.cmp(&a.keyed_state_size));
+    ops_by_size.sort_by(|a, b| {
+        summary(*b)
+            .keyed_state_size
+            .cmp(&summary(*a).keyed_state_size)
+    });
 
     if !ops_by_size.is_empty() {
         lines.push("--- Top Operators by Data Size ---".to_string());
-        for op in ops_by_size.iter().take(15) {
-            let keys = op.keyed_state.as_ref().map_or(0, |k| k.total_keys);
+        for &op in ops_by_size.iter().take(15) {
+            let s = summary(op);
             lines.push(format!(
                 "  {:>8}  {:>8} keys  {}",
-                format_size(op.keyed_state_size),
-                keys,
-                op.display_name
+                format_size(s.keyed_state_size),
+                shown_keys(op, tree.keys_at_least(op)),
+                s.display_name
             ));
         }
     }
@@ -984,18 +1273,8 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-fn get_file_stats(path: &Path) -> (u64, u64) {
-    match std::fs::metadata(path) {
-        Ok(meta) => {
-            let size = meta.len();
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            (size, mtime)
-        }
-        Err(_) => (0, 0),
+impl Drop for App {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }

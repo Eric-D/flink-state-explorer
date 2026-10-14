@@ -3,7 +3,7 @@
 //!
 //! This is the fixture the compressed read path needs: everything else only exercises a Snappy
 //! frame built in a unit test, never bytes Flink wrote. Both reading paths are checked — the
-//! streaming export and the index/TUI one — and the operator-state stream, which the operator
+//! streaming export and the reader/TUI one — and the operator-state stream, which the operator
 //! backend compresses as a whole (`usingStateCompression`).
 //!
 //! Needs `tests/fixtures/savepoint-compressed` (run `cd test-flink-job && mvn verify` first).
@@ -12,10 +12,10 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use flink_explorer::export_state::{export_state_ndjson, list_states};
-use flink_explorer::index::builder::build_index;
 use flink_explorer::parser;
 use flink_explorer::parser::keyed_state::read_keyed_stream_header;
 use flink_explorer::parser::state_handle::{StateHandle, StreamStateHandle};
+use flink_explorer::reader::StateReader;
 use serde_json::Value;
 
 const COMPRESSED: &str = "tests/fixtures/savepoint-compressed";
@@ -55,28 +55,40 @@ fn compression_flags(dir: &str) -> Vec<bool> {
     flags
 }
 
-/// Keys per state, from the index/TUI path.
-fn index_keys(dir: &str) -> std::collections::BTreeMap<String, BTreeSet<String>> {
+/// The TUI's `E` export of `dir` (streamed from the reader), written to a temp file — never into
+/// the fixture.
+fn export_json(dir: &str) -> Value {
     let path = Path::new(dir);
-    let metadata_path = path.join("_metadata");
-    let sp = savepoint(dir);
-    let len = std::fs::metadata(&metadata_path).unwrap().len();
-    let index = build_index(&sp, len, 0u64, path);
-
+    savepoint(dir); // asserts the fixture exists
+    let reader = StateReader::open(path).unwrap();
+    let summaries = flink_explorer::operators::summarize(reader.savepoint(), path);
     // Unique per call: these tests run in parallel threads of one process and more than one of
-    // them indexes the same fixture, so a path derived only from the pid and the directory would
+    // them exports the same fixture, so a path derived only from the pid and the directory would
     // have them clobbering each other's file.
     use std::sync::atomic::{AtomicU32, Ordering};
     static N: AtomicU32 = AtomicU32::new(0);
     let tmp = std::env::temp_dir().join(format!(
-        "compressed_keys_{}_{}_{}.json",
+        "compressed_export_{}_{}_{}.json",
         std::process::id(),
         N.fetch_add(1, Ordering::Relaxed),
         dir.replace('/', "_")
     ));
-    flink_explorer::export::export_json(&index, None, &tmp).expect("export_json");
+    flink_explorer::export::export_json(
+        &reader,
+        &summaries,
+        &tmp,
+        &std::sync::atomic::AtomicBool::new(false),
+        &mut |_| {},
+    )
+    .expect("export_json");
     let root: Value = serde_json::from_str(&std::fs::read_to_string(&tmp).unwrap()).unwrap();
     std::fs::remove_file(&tmp).ok();
+    root
+}
+
+/// Keys per state, from the reader/TUI path.
+fn reader_keys(dir: &str) -> std::collections::BTreeMap<String, BTreeSet<String>> {
+    let root = export_json(dir);
 
     let mut out: std::collections::BTreeMap<String, BTreeSet<String>> = Default::default();
     for op in root["operators"].as_array().unwrap() {
@@ -115,8 +127,8 @@ fn fixture_really_uses_key_group_compression() {
 }
 
 #[test]
-fn index_path_decodes_compressed_key_groups() {
-    let compressed = index_keys(COMPRESSED);
+fn reader_path_decodes_compressed_key_groups() {
+    let compressed = reader_keys(COMPRESSED);
     assert!(
         !compressed.is_empty(),
         "no state decoded from the compressed savepoint — key-groups were not inflated"
@@ -124,7 +136,7 @@ fn index_path_decodes_compressed_key_groups() {
 
     // Same job, same deterministic sources, so each state holds the same key set. Values can
     // differ (counters depend on how long the job ran before the savepoint), keys cannot.
-    let plain = index_keys(PLAIN);
+    let plain = reader_keys(PLAIN);
     for (state, keys) in &plain {
         // Timers fire on wall-clock and may or may not be pending in either run.
         if state.starts_with("_timer_state/") {
@@ -145,11 +157,11 @@ fn index_path_decodes_compressed_key_groups() {
 }
 
 #[test]
-fn streaming_export_matches_the_index_path_on_compressed_bytes() {
+fn streaming_export_matches_the_reader_path_on_compressed_bytes() {
     let sp = savepoint(COMPRESSED);
     let states = list_states(&sp, Path::new(COMPRESSED)).states;
     assert!(!states.is_empty());
-    let index = index_keys(COMPRESSED);
+    let from_reader = reader_keys(COMPRESSED);
 
     let mut compared = 0;
     for (op, state, state_type) in &states {
@@ -173,15 +185,15 @@ fn streaming_export_matches_the_index_path_on_compressed_bytes() {
         if streamed.is_empty() {
             continue;
         }
-        let from_index = index
+        let from_reader = from_reader
             .get(state)
-            .unwrap_or_else(|| panic!("state {:?} absent from the index export", state));
+            .unwrap_or_else(|| panic!("state {:?} absent from the reader export", state));
         // A MAP state streams one row per entry, so its key set is a subset of (and for this
-        // fixture equal to) the index's keys; either way every streamed key must be known.
+        // fixture equal to) the reader's keys; either way every streamed key must be known.
         for k in &streamed {
             assert!(
-                from_index.contains(k),
-                "streamed key {:?} of {:?} ({}) is unknown to the index path",
+                from_reader.contains(k),
+                "streamed key {:?} of {:?} ({}) is unknown to the reader path",
                 k,
                 state,
                 state_type
@@ -193,34 +205,21 @@ fn streaming_export_matches_the_index_path_on_compressed_bytes() {
 }
 
 /// Every operator state's `(name, mode)` → its element labels (all subtasks, sorted), from the
-/// index and from the full JSON export.
+/// operator summaries and from the full JSON export.
 fn operator_states(dir: &str) -> [std::collections::BTreeMap<(String, String), Vec<String>>; 2] {
     let path = Path::new(dir);
     let sp = savepoint(dir);
-    let index = build_index(&sp, 0, 0u64, path);
-    let mut from_index: std::collections::BTreeMap<(String, String), Vec<String>> =
+    let ops = flink_explorer::operators::summarize(&sp, path);
+    let mut from_summary: std::collections::BTreeMap<(String, String), Vec<String>> =
         Default::default();
-    for s in index.operators.iter().flat_map(|op| &op.states) {
-        from_index
+    for s in ops.iter().flat_map(|op| &op.states) {
+        from_summary
             .entry((s.name.clone(), s.state_type.clone()))
             .or_default()
-            .extend(
-                s.entries
-                    .iter()
-                    .map(|e| String::from_utf8(e.key.clone()).unwrap()),
-            );
+            .extend(s.elements.iter().map(|e| e.label.clone()));
     }
 
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static N: AtomicU32 = AtomicU32::new(0);
-    let tmp = std::env::temp_dir().join(format!(
-        "compressed_op_states_{}_{}.json",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ));
-    flink_explorer::export::export_json(&index, None, &tmp).expect("export_json");
-    let root: Value = serde_json::from_str(&std::fs::read_to_string(&tmp).unwrap()).unwrap();
-    std::fs::remove_file(&tmp).ok();
+    let root = export_json(dir);
     let mut from_json: std::collections::BTreeMap<(String, String), Vec<String>> =
         Default::default();
     for op in root["operators"].as_array().unwrap() {
@@ -238,10 +237,10 @@ fn operator_states(dir: &str) -> [std::collections::BTreeMap<(String, String), V
             );
         }
     }
-    for m in [&mut from_index, &mut from_json] {
+    for m in [&mut from_summary, &mut from_json] {
         m.values_mut().for_each(|v| v.sort());
     }
-    [from_index, from_json]
+    [from_summary, from_json]
 }
 
 #[test]
@@ -250,7 +249,10 @@ fn operator_states_inflate_like_the_uncompressed_run() {
     // inflating it every element showed as a hex preview of its Snappy chunk.
     let [compressed, compressed_json] = operator_states(COMPRESSED);
     let [plain, _] = operator_states(PLAIN);
-    assert_eq!(compressed_json, compressed, "JSON export = index");
+    assert_eq!(
+        compressed_json, compressed,
+        "JSON export = operator summaries"
+    );
     assert_eq!(compressed, plain, "same job, same operator-state elements");
     let buffer = &compressed[&(
         "operator-buffer".to_string(),

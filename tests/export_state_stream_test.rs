@@ -3,14 +3,16 @@
 //!
 //! Needs `tests/fixtures/savepoint-gitlab` (run `cd test-flink-job && mvn verify` first).
 
+mod common;
+
 use std::collections::HashMap;
 use std::path::Path;
 
 use flink_explorer::export_state::{export_state_ndjson, list_states};
-use flink_explorer::index::builder::build_index;
 use flink_explorer::parser;
 use flink_explorer::parser::keyed_state::read_keyed_stream_header;
 use flink_explorer::parser::state_handle::{StateHandle, StreamStateHandle};
+use flink_explorer::reader::StateReader;
 use serde_json::Value;
 
 const SAVEPOINT_DIR: &str = "tests/fixtures/savepoint-gitlab";
@@ -50,10 +52,8 @@ fn stream(operator: &str, state: &str) -> Vec<Value> {
 /// state names, and keys, repeat across operators.
 fn full_export() -> HashMap<(String, String, String), Value> {
     let dir = Path::new(SAVEPOINT_DIR);
-    let metadata_path = dir.join("_metadata");
-    let sp = parser::parse_metadata(&metadata_path).expect("parse metadata");
-    let len = std::fs::metadata(&metadata_path).unwrap().len();
-    let index = build_index(&sp, len, 0u64, dir);
+    let reader = StateReader::open(dir).expect("open savepoint");
+    let summaries = flink_explorer::operators::summarize(reader.savepoint(), dir);
 
     // Unique per call: several tests here call this concurrently (cargo runs them in parallel
     // threads), so a pid-only path would have them overwriting each other's file.
@@ -64,7 +64,14 @@ fn full_export() -> HashMap<(String, String, String), Value> {
         std::process::id(),
         N.fetch_add(1, Ordering::Relaxed)
     ));
-    flink_explorer::export::export_json(&index, None, &tmp).expect("export_json");
+    flink_explorer::export::export_json(
+        &reader,
+        &summaries,
+        &tmp,
+        &std::sync::atomic::AtomicBool::new(false),
+        &mut |_| {},
+    )
+    .expect("export_json");
     let root: Value = serde_json::from_str(&std::fs::read_to_string(&tmp).unwrap()).unwrap();
     std::fs::remove_file(&tmp).ok();
 
@@ -210,7 +217,7 @@ fn peak_block_is_one_key_group_not_the_whole_stream() {
 fn every_key_group_flink_wrote_reads_to_its_end_mark() {
     // Runs end on Flink's metadata-follows flag; on blocks Flink wrote, every run is flagged and
     // every key-group ends with END_OF_KEY_GROUP_MARK, so nothing may be reported as malformed —
-    // plain or Snappy-compressed, on the export path or the index path.
+    // plain or Snappy-compressed, on the export path or the reader (TUI) path.
     for dir in [SAVEPOINT_DIR, "tests/fixtures/savepoint-compressed"] {
         let dir = Path::new(dir);
         let sp = parser::parse_metadata(&dir.join("_metadata")).expect("parse metadata");
@@ -228,12 +235,11 @@ fn every_key_group_flink_wrote_reads_to_its_end_mark() {
                 name
             );
         }
-        let index = build_index(&sp, 0, 0, dir);
-        for op in &index.operators {
-            if let Some(ks) = &op.keyed_state {
+        for (op, keyed) in common::keyed::operators(dir) {
+            if let Some(ks) = keyed {
                 assert_eq!(
-                    (ks.malformed_key_groups, &ks.first_malformed),
-                    (0, &None),
+                    (&ks.malformed, &ks.errors),
+                    (&Vec::<String>::new(), &Vec::<String>::new()),
                     "{} {}",
                     dir.display(),
                     op.operator_id_hex()

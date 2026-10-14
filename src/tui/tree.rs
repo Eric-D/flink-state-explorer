@@ -1,30 +1,53 @@
 //! The savepoint tree: operators → keys → states → values, plus operator states.
 //!
-//! Every value shown here comes from [`crate::parser::value::decode_state_value`], rendered by
-//! [`value_to_display`] — the same decoding the JSON and `--export-state` exports use. This module
-//! decodes no bytes itself: a MAP's rows are the entries of the decoded object, a LIST's rows the
-//! elements of the decoded array, a POJO's rows its decoded fields. What it adds is presentation:
-//! display limits, `auto_date` (an epoch-millis `Long` shown as a date) and the debug hex suffix.
+//! The tree holds **navigation state only**. Keys are not loaded up front: an expanded keyed
+//! operator asks the [`StateReader`] for the page of keys it shows (`key_page` from the cursor of
+//! its first visible key), so every key of every subtask is reachable and memory is bounded by a
+//! few pages and the reader's block cache — never by the savepoint. Keys come in the reader's
+//! order: key-groups ascending, and inside one key-group in Flink's on-disk order (not sorted).
+//!
+//! Every value shown here was decoded by [`crate::parser::value`] (inside the reader), rendered by
+//! [`value_to_display`] — the same decoding the JSON and `--export-state` exports use. A MAP's
+//! rows are its entries, a window of [`MAP_DISPLAY_LIMIT`] at a time in on-disk order behind
+//! pager rows (a window past the entries returned with the key is read alone, never the whole
+//! map), a LIST's rows the elements of the decoded array, a POJO's rows its decoded fields. What
+//! this module adds is presentation: display limits, `auto_date` (an epoch-millis `Long` shown as
+//! a date) and the debug hex suffix.
+//!
+//! A filter (`/`) searches the keys with [`StateReader::scan`] on a **worker thread**
+//! ([`crate::tui::jobs::start_search`]), one block per call, so the UI keeps drawing and
+//! answering keys while it runs, shows matches as they are reported ([`TreeView::poll_search`]),
+//! and a cancel stops it between two blocks; an exact key is looked up with [`StateReader::get`]
+//! (its key-group computed, one block read) when the key type is hashable.
+//!
+//! What still runs on the UI thread is bounded by a page, not by the savepoint — but each read
+//! is a whole key-group, which cannot be interrupted: the window of keys (`key_page`), an exact
+//! key (`get`), and the page of a MAP's entries shown (`entries`). One huge key-group (a single
+//! hot key with millions of entries) makes each of them take as long as reading it.
 
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, List, ListItem, ListState};
 use serde_json::Value;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 
-use crate::index::cache::{IndexCache, StateDescriptor, ValueRef};
-use crate::parser::pojo::{millis_to_iso, PojoInfo};
-use crate::parser::value::{decode_state_value, split_map_types, value_to_display};
+use crate::export::{map_key_of, state_value};
+use crate::operators::{KeyedInfo, OperatorSummary};
+use crate::parser::pojo::millis_to_iso;
+use crate::parser::value::{split_map_types, value_to_display};
 use crate::proto::ProtoContext;
+use crate::reader::{Cursor, KeyRecord, Lookup, ReaderError, StateEntry, StateReader};
 use crate::tui::filter::AppliedFilter;
+use crate::tui::jobs::{start_search, Job, SearchMsg, SearchTarget};
 use crate::tui::text;
 
 /// Operator-state elements listed at once; past it, `↑`/`↓` pager rows scroll the window.
 const ENTRY_PAGE_SIZE: usize = 500;
 /// Rows `PageUp`/`PageDown` move by before the tree has been rendered (then: the list's height).
 const DEFAULT_PAGE_ROWS: usize = 20;
-/// Maximum number of partitions (keys) to display at once.
+/// Keys listed at once under an expanded operator.
 const PARTITION_PAGE_SIZE: usize = 30;
 /// Entries of an expanded MAP value listed before a "… +N more" row.
 const MAP_DISPLAY_LIMIT: usize = 50;
@@ -38,6 +61,9 @@ const AUTO_DATE_MILLIS: std::ops::Range<i64> = 946_684_800_000..2_208_988_800_00
 const KAFKA_ICON: &str = "📨 ";
 /// Marker on an operator some of whose state files could not be read (details under `i`).
 const LOAD_ERROR_MARK: &str = "⚠ ";
+/// Stored bytes of blocks the search worker reads between two reports
+/// ([`TreeView::set_search_step_bytes`]).
+pub const SEARCH_STEP_BYTES: u64 = 4 << 20;
 
 /// Whether an operator-state name is a Kafka connector state (source reader / sink writer+committer).
 fn is_kafka_state(name: &str) -> bool {
@@ -61,12 +87,12 @@ enum NodeLevel {
 enum NodeKind {
     /// Data: an operator, a key, a state, a value, an element.
     Data,
-    /// `↑ a-b / n`: moving onto it scrolls its window back (keyed partitions when `state_idx` is
-    /// `None`, else the elements of operator state `state_idx`).
+    /// `↑ a-b / n`: moving onto it scrolls its window back (keys when `state_idx` is `None`,
+    /// else the elements of operator state `state_idx`).
     PagerUp,
     /// `↓ a-b / n`: moving onto it scrolls its window forward.
     PagerDown,
-    /// A note, not data: "… +N more", keys not indexed.
+    /// A note, not data: "… +N more", unreadable key-groups.
     Marker,
 }
 
@@ -77,12 +103,15 @@ struct FlatNode {
     label: String,
     /// Breadcrumb path for status bar display
     path: String,
-    /// Index into the parent collection
     op_idx: usize,
-    /// An operator state's index, or `op.states.len() + partition index` for a key.
+    /// An operator state's index (its header, elements and pagers).
     state_idx: Option<usize>,
-    /// A key's descriptor index, or an operator-state element's index in its state.
+    /// A key's position (its row and the rows under it).
+    key: Option<Cursor>,
+    /// A key's state (descriptor) index, or an operator-state element's index in its state.
     entry_idx: Option<usize>,
+    /// Under a MAP state: the index of the entry a row shows, among the key's entries of it.
+    item: Option<usize>,
     expanded: bool,
     has_children: bool,
 }
@@ -96,7 +125,9 @@ impl FlatNode {
             path,
             op_idx,
             state_idx: None,
+            key: None,
             entry_idx: None,
+            item: None,
             expanded: false,
             has_children: false,
         }
@@ -112,6 +143,12 @@ impl FlatNode {
         self.entry_idx = entry_idx;
         self
     }
+
+    fn of_key(mut self, key: Cursor, entry_idx: Option<usize>) -> Self {
+        self.key = Some(key);
+        self.entry_idx = entry_idx;
+        self
+    }
 }
 
 /// The bytes behind the selected row, for the hex overlay (`x`).
@@ -123,7 +160,366 @@ pub struct RawBytes {
     pub value: Vec<u8>,
 }
 
+/// How many keys an operator has, as far as is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KeyCount {
+    /// Not counted.
+    #[default]
+    Unknown,
+    /// The count pass is on it: `keys` so far, `percent` of the key-groups passed.
+    Counting { keys: usize, percent: u8 },
+    /// Every key counted.
+    Exact(usize),
+    /// Counted, but some key-group could not be read (or the count was stopped): a lower bound.
+    AtLeast(usize),
+}
+
+/// A keyed state of an operator, as the tree labels it.
+#[derive(Debug, Clone)]
+struct StateDesc {
+    name: String,
+    state_type: String,
+    value_type: String,
+    /// ` → com.example.Pojo { a: Long, … }` for a POJO value, else empty.
+    pojo_detail: String,
+}
+
+/// One state of one key: its entries (those the reader returned with the key — at most its
+/// entry limit), how many it has, and the value they make. An expanded MAP shows a window of
+/// [`MAP_DISPLAY_LIMIT`] entries from `map_offset` on, scrolled by its pager rows; a window past
+/// the entries returned with the key is read alone ([`StateReader::entries`]) into `page`, so a
+/// map of millions of entries never is read whole.
+#[derive(Debug, Clone)]
+struct Slot {
+    entries: Vec<StateEntry>,
+    total: usize,
+    value: Option<Value>,
+    /// First MAP entry shown.
+    map_offset: usize,
+    /// The MAP entries shown, read from `.0` on, when they lie past `entries`.
+    page: Option<(usize, Vec<StateEntry>)>,
+}
+
+impl Slot {
+    /// The MAP entries shown: `map_offset..` up to [`MAP_DISPLAY_LIMIT`] of them, as far as they
+    /// were read.
+    fn map_window(&self) -> (usize, &[StateEntry]) {
+        let start = self.map_offset.min(self.total);
+        let end = (start + MAP_DISPLAY_LIMIT).min(self.total);
+        if end <= self.entries.len() {
+            return (start, &self.entries[start..end]);
+        }
+        match &self.page {
+            Some((off, page)) if *off == start => (start, page),
+            _ => (start, &[]),
+        }
+    }
+
+    /// The `i`-th entry of the state, if it was read.
+    fn entry(&self, i: usize) -> Option<&StateEntry> {
+        self.entries.get(i).or_else(|| match &self.page {
+            Some((off, page)) => page.get(i.checked_sub(*off)?),
+            None => None,
+        })
+    }
+}
+
+/// A key the tree shows, built from a [`KeyRecord`] once (its values are decoded by the reader):
+/// a rebuild of the rows reuses it.
+#[derive(Debug, Clone)]
+struct KeyRow {
+    key: String,
+    key_group: u16,
+    /// By descriptor index.
+    slots: Vec<Slot>,
+}
+
+impl KeyRow {
+    fn new(record: KeyRecord, descriptors: &[StateDesc]) -> KeyRow {
+        let mut slots: Vec<Slot> = descriptors
+            .iter()
+            .map(|_| Slot {
+                entries: Vec::new(),
+                total: 0,
+                value: None,
+                map_offset: 0,
+                page: None,
+            })
+            .collect();
+        for e in record.entries {
+            if let Some(i) = descriptors.iter().position(|d| *d.name == *e.state) {
+                slots[i].entries.push(e);
+            }
+        }
+        for (i, slot) in slots.iter_mut().enumerate() {
+            slot.total = record
+                .truncated
+                .iter()
+                .find(|t| *t.state == *descriptors[i].name)
+                .map_or(slot.entries.len(), |t| t.total);
+            let refs: Vec<&StateEntry> = slot.entries.iter().collect();
+            slot.value = state_value(&descriptors[i].state_type, &refs);
+        }
+        KeyRow {
+            key: record.key,
+            key_group: record.key_group,
+            slots,
+        }
+    }
+}
+
+/// An ordered sequence of keys the tree pages through: every key of the operator, the keys of a
+/// key-group range, or the matches of a search.
+#[derive(Debug, Clone)]
+struct KeySeq {
+    /// The positions known so far, in order.
+    positions: Vec<Cursor>,
+    /// Where to go on finding keys (`None`: all found). For a browsing sequence the next
+    /// `key_page`, for a search the next `scan`.
+    next: Option<Cursor>,
+    /// A key-group range's last key-group: a key past it ends the sequence.
+    stop_kg: Option<u16>,
+    /// A range's first key-group: keys before it are skipped (when its start could not be
+    /// sought directly).
+    start_kg: u16,
+    /// Search matches: not contiguous in reader order (each fetched on its own), found by
+    /// the search worker ([`TreeView::poll_search`]) rather than by paging.
+    matches: bool,
+    /// Matches already in `positions` (a key found by `get` and again by the scan).
+    seen: HashSet<Cursor>,
+    /// First visible key, moved by the pager rows.
+    offset: usize,
+}
+
+impl KeySeq {
+    fn browse(from: Cursor) -> KeySeq {
+        KeySeq {
+            positions: Vec::new(),
+            next: Some(from),
+            stop_kg: None,
+            start_kg: 0,
+            matches: false,
+            seen: HashSet::new(),
+            offset: 0,
+        }
+    }
+
+    fn done(&self) -> bool {
+        self.next.is_none()
+    }
+
+    fn push_match(&mut self, pos: Cursor) {
+        if self.seen.insert(pos) {
+            self.positions.push(pos);
+        }
+    }
+}
+
+/// Keyed state of one operator, for display.
+struct KeyedSnapshot {
+    op_hex: String,
+    key_type: String,
+    descriptors: Vec<StateDesc>,
+    /// State files and key-groups that could not be read, naming them: from the headers, then
+    /// from every page that met one.
+    errors: Vec<String>,
+    malformed: Vec<String>,
+    count: KeyCount,
+    /// Every key.
+    all: KeySeq,
+    /// Under a filter: its matches (or range).
+    filtered: Option<KeySeq>,
+    /// The keys of the current window (and the next one), by position.
+    rows: HashMap<Cursor, KeyRow>,
+}
+
+impl KeyedSnapshot {
+    fn seq(&self) -> &KeySeq {
+        self.filtered.as_ref().unwrap_or(&self.all)
+    }
+
+    fn seq_mut(&mut self) -> &mut KeySeq {
+        self.filtered.as_mut().unwrap_or(&mut self.all)
+    }
+
+    /// The operator's key count when it is known exactly: counted, or paged to the end.
+    fn total(&self) -> Option<usize> {
+        match self.count {
+            KeyCount::Exact(n) => Some(n),
+            _ if self.all.done() && self.errors.is_empty() => Some(self.all.positions.len()),
+            _ => None,
+        }
+    }
+
+    /// A lower bound of the key count: what was paged, counted or seen.
+    fn at_least(&self) -> usize {
+        let counted = match self.count {
+            KeyCount::Counting { keys, .. } | KeyCount::AtLeast(keys) | KeyCount::Exact(keys) => {
+                keys
+            }
+            KeyCount::Unknown => 0,
+        };
+        counted.max(self.all.positions.len())
+    }
+
+    /// `1000 keys`, `≥ 60 keys`, `≥ 60 keys, counting 37%`, `? keys`.
+    fn keys_text(&self) -> String {
+        match (self.total(), self.count) {
+            (Some(n), _) => format!("{} keys", n),
+            (None, KeyCount::Counting { percent, .. }) => {
+                format!("≥ {} keys, counting {}%", self.at_least(), percent)
+            }
+            (None, _) if self.at_least() == 0 => "? keys".to_string(),
+            (None, _) => format!("≥ {} keys", self.at_least()),
+        }
+    }
+
+    /// The key count on the operator row: with a filter, `matches/keys`.
+    fn count_label(&self, search_percent: Option<u8>) -> String {
+        match &self.filtered {
+            None => self.keys_text(),
+            Some(f) => {
+                let total = match self.total() {
+                    Some(n) => n.to_string(),
+                    None if self.at_least() == 0 => "?".to_string(),
+                    None => format!("≥ {}", self.at_least()),
+                };
+                let found = f.positions.len();
+                match (f.done(), search_percent) {
+                    (true, _) => format!("{}/{} keys", found, total),
+                    (false, Some(p)) => format!("{}/{} keys, searching {}%", found, total, p),
+                    (false, None) => format!("≥ {}/{} keys", found, total),
+                }
+            }
+        }
+    }
+
+    /// The `/ n` of a pager row: exact once the sequence is complete.
+    fn pager_total(&self) -> String {
+        let seq = self.seq();
+        if seq.done() {
+            seq.positions.len().to_string()
+        } else if self.filtered.is_none() {
+            match self.total() {
+                Some(n) => n.to_string(),
+                None => format!("≥ {}", seq.positions.len()),
+            }
+        } else {
+            format!("≥ {}", seq.positions.len())
+        }
+    }
+
+    /// Rows under the operator (for `hide_empty`): an operator with keyed states may hold keys
+    /// until it is known not to.
+    fn child_estimate(&self) -> usize {
+        if self.descriptors.is_empty() {
+            return 0;
+        }
+        match &self.filtered {
+            Some(f) if f.done() => f.positions.len(),
+            Some(f) => f.positions.len().max(1),
+            None => self.total().unwrap_or(1),
+        }
+    }
+
+    fn note_page(&mut self, unreadable: &[crate::reader::Unreadable], malformed: &[String]) {
+        for u in unreadable {
+            if !self.errors.contains(&u.error) {
+                self.errors.push(u.error.clone());
+            }
+        }
+        for m in malformed {
+            if !self.malformed.contains(m) {
+                self.malformed.push(m.clone());
+            }
+        }
+    }
+
+    fn note_error(&mut self, e: ReaderError) {
+        let e = e.to_string();
+        if !self.errors.contains(&e) {
+            self.errors.push(e);
+        }
+    }
+}
+
+struct OperatorSnapshot {
+    summary: OperatorSummary,
+    /// Short operator type (e.g. "KeyedBroadcastProcess", "RichFlatMap")
+    operator_type: String,
+    /// Non-keyed operator states (their elements stay in `summary`).
+    states: Vec<StateSnapshot>,
+    /// Keyed state, read through the reader.
+    keyed: Option<KeyedSnapshot>,
+}
+
+impl OperatorSnapshot {
+    /// Count user-visible children: keys (or matches) **plus** non-keyed operator states.
+    /// Operators with only operator state (e.g. a Kafka source/sink) have no keys, so they must be
+    /// counted here too — otherwise `hide_empty` would hide them and their decoded state.
+    fn child_count(&self) -> usize {
+        self.keyed.as_ref().map_or(0, KeyedSnapshot::child_estimate) + self.states.len()
+    }
+
+    fn load_errors(&self) -> usize {
+        self.keyed.as_ref().map_or(0, |k| k.errors.len())
+    }
+
+    /// A Kafka connector operator (source or sink), detected from its operator-state names.
+    fn is_kafka(&self) -> bool {
+        self.states.iter().any(|s| is_kafka_state(&s.name))
+    }
+}
+
+struct StateSnapshot {
+    name: String,
+    state_type: String,
+    /// Number of elements (they are read from the operator's summary).
+    len: usize,
+    /// Indices of the elements that match the current filter (None = no filter, show all).
+    filtered_indices: Option<Vec<usize>>,
+    /// First visible element (an index into the filtered list), moved by the pager rows.
+    entry_offset: usize,
+}
+
+impl StateSnapshot {
+    fn visible_count(&self) -> usize {
+        self.filtered_indices.as_ref().map_or(self.len, Vec::len)
+    }
+
+    /// The element index of the `vi`-th visible element.
+    fn real_index(&self, vi: usize) -> usize {
+        self.filtered_indices.as_ref().map_or(vi, |f| f[vi])
+    }
+
+    fn count_label(&self) -> String {
+        let (visible, total) = (self.visible_count(), self.len);
+        if visible == total {
+            format!("{} entries", total)
+        } else {
+            format!("{}/{} entries", visible, total)
+        }
+    }
+}
+
+/// A pager row: `  ↑ 31-60 / 500`.
+fn pager_label(indent: &str, arrow: char, start: usize, end: usize, of: &str) -> String {
+    format!("{}{} {}-{} / {}", indent, arrow, start + 1, end, of)
+}
+
+/// A search over the keys of every keyed operator, run by a worker thread
+/// ([`crate::tui::jobs::start_search`]) whose reports the tree applies as they come.
+struct Search {
+    /// Keyed operators still to scan, in order.
+    queue: std::collections::VecDeque<usize>,
+    /// Operators it was started on, for the progress.
+    total_ops: usize,
+    /// Dropping it stops the worker (between two blocks) and joins it.
+    job: Job<SearchMsg>,
+}
+
 pub struct TreeView {
+    reader: Arc<StateReader<'static>>,
     nodes: Vec<FlatNode>,
     list_state: ListState,
     operators: Vec<OperatorSnapshot>,
@@ -135,225 +531,53 @@ pub struct TreeView {
     /// Rows the list showed at its last render: what `PageUp`/`PageDown` move by.
     page_rows: usize,
     proto_ctx: Option<Arc<ProtoContext>>,
-    /// The decoded values of the expanded keys, by (operator, partition, descriptor): a rebuild
-    /// (any expand, collapse, toggle or scroll) reuses them instead of decoding every value of
-    /// every expanded key again — a 300k-entry MAP took ~70 ms per rebuild. Holds only what the
-    /// last rebuild showed, and is dropped when the proto context changes.
-    decoded: HashMap<(usize, usize, usize), Value>,
-    /// Values decoded so far (`decode_state_value` calls), for tests.
-    decode_calls: usize,
-}
-
-struct OperatorSnapshot {
-    display_name: String,
-    /// Short operator type (e.g. "KeyedBroadcastProcess", "RichFlatMap")
-    operator_type: String,
-    /// Non-keyed operator states
-    states: Vec<StateSnapshot>,
-    /// Structured keyed state
-    keyed: Option<KeyedSnapshot>,
-    /// State files of this operator that could not be read: its key set is partial.
-    load_errors: usize,
-}
-
-impl OperatorSnapshot {
-    /// Count user-visible children: keyed partitions (filtered count if a filter is active) **plus**
-    /// non-keyed operator states. Operators with only operator state (e.g. a Kafka source/sink:
-    /// reader splits, writer/committer states) have no keyed partitions, so they must be counted
-    /// here too — otherwise `hide_empty` would hide them and their decoded state entirely.
-    fn child_count(&self) -> usize {
-        self.keyed.as_ref().map_or(0, |k| {
-            // A capped operator stays listed under a filter that matched none of its stored keys:
-            // the key may be among the ones not indexed, and the row saying so must be reachable.
-            let unsearched = (k.filtered_indices.is_some() && k.hidden_keys() > 0) as usize;
-            k.visible_count() + unsearched
-        }) + self.states.len()
-    }
-
-    /// A Kafka connector operator (source or sink), detected from its operator-state names.
-    fn is_kafka(&self) -> bool {
-        self.states.iter().any(|s| is_kafka_state(&s.name))
-    }
-}
-
-impl KeyedSnapshot {
-    /// Number of partitions that can be browsed: the filter's matches, or every **stored**
-    /// partition. Never the savepoint's key count: past the index cap, the keys beyond
-    /// `partitions` are not in memory, and paging up to that count indexed past the end.
-    fn visible_count(&self) -> usize {
-        match &self.filtered_indices {
-            Some(indices) => indices.len(),
-            None => self.partitions.len(),
-        }
-    }
-
-    /// Keys of the savepoint that the index did not keep (0 below the cap).
-    fn hidden_keys(&self) -> usize {
-        self.total_partitions.saturating_sub(self.partitions.len())
-    }
-
-    /// The key count on the operator row. Past the cap it gives both numbers, and with a filter
-    /// it says the filter searched only the stored keys.
-    fn count_label(&self) -> String {
-        let visible = self.visible_count();
-        let (stored, total) = (self.partitions.len(), self.total_partitions);
-        match (&self.filtered_indices, self.hidden_keys() > 0) {
-            (Some(_), true) => format!("{} match in {} of {} keys shown", visible, stored, total),
-            (None, true) => format!("{} of {} keys shown", stored, total),
-            _ if visible != total => format!("{}/{} keys", visible, total),
-            _ => format!("{} keys", total),
-        }
-    }
-
-    /// Appended to the pager rows past the cap, so that `n / stored` is not read as the whole.
-    fn pager_note(&self) -> String {
-        if self.hidden_keys() == 0 {
-            String::new()
-        } else if self.filtered_indices.is_some() {
-            format!(
-                " (filter searched {} of {} keys)",
-                self.partitions.len(),
-                self.total_partitions
-            )
-        } else {
-            format!(
-                " ({} of {} keys shown)",
-                self.partitions.len(),
-                self.total_partitions
-            )
-        }
-    }
-}
-
-/// Keyed state snapshot for display.
-struct KeyedSnapshot {
-    descriptors: Vec<StateDescriptor>,
-    /// Each descriptor's POJO layout, converted once for the decoder.
-    pojo_infos: Vec<Option<PojoInfo>>,
-    /// The keys the index stored: at most `index::builder::MAX_STORED_PARTITIONS`.
-    partitions: Vec<PartitionSnapshot>,
-    /// The savepoint's key count, which may exceed `partitions.len()`.
-    total_partitions: usize,
-    partition_offset: usize,
-    /// Key serializer type (e.g. "String", "Pojo")
-    key_type: String,
-    /// Indices into `partitions` that match the current filter (None = no filter, show all).
-    filtered_indices: Option<Vec<usize>>,
-}
-
-struct PartitionSnapshot {
-    key: String,
-    key_group: u16,
-    /// Raw value bytes per descriptor, as the index stores them (a MAP's is the per-key blob
-    /// `index::builder` assembles). Decoded when a row is built, with the proto context.
-    entry_raw: Vec<Option<Vec<u8>>>,
-}
-
-/// One operator-state element. Its bytes stay in the index, where `selected_raw_bytes` reads
-/// them: a copy here held them twice in memory.
-struct OpElement {
-    /// The decoded element, as the index labelled it.
-    label: Vec<u8>,
-    key_group: u16,
-}
-
-struct StateSnapshot {
-    name: String,
-    state_type: String,
-    elements: Vec<OpElement>,
-    /// Indices into `elements` that match the current filter (None = no filter, show all).
-    filtered_indices: Option<Vec<usize>>,
-    /// First visible element (an index into the filtered list), moved by the pager rows.
-    entry_offset: usize,
-}
-
-impl StateSnapshot {
-    fn visible_count(&self) -> usize {
-        self.filtered_indices
-            .as_ref()
-            .map_or(self.elements.len(), Vec::len)
-    }
-
-    /// The element index of the `vi`-th visible element.
-    fn real_index(&self, vi: usize) -> usize {
-        self.filtered_indices.as_ref().map_or(vi, |f| f[vi])
-    }
-
-    fn count_label(&self) -> String {
-        let (visible, total) = (self.visible_count(), self.elements.len());
-        if visible == total {
-            format!("{} entries", total)
-        } else {
-            format!("{}/{} entries", visible, total)
-        }
-    }
-}
-
-/// A pager row: `  ↑ 31-60 / 500`.
-fn pager_label(indent: &str, arrow: char, start: usize, end: usize, of: usize) -> String {
-    format!("{}{} {}-{} / {}", indent, arrow, start + 1, end, of)
+    search: Option<Search>,
+    /// Stored bytes of blocks the search worker reads between two reports.
+    search_step_bytes: u64,
+    /// Keys received from the reader (each decoded once, by it), for tests.
+    fetched: usize,
+    /// Entries of keyed states received from [`StateReader::entries`] (MAP pages), for tests.
+    entries_fetched: usize,
 }
 
 impl TreeView {
-    pub fn new(index: &IndexCache) -> Self {
-        let operators: Vec<OperatorSnapshot> = index
-            .operators
-            .iter()
-            .map(|op| {
-                // Non-keyed operator states
-                let states: Vec<StateSnapshot> = op
+    /// Open `dir`: parse `_metadata`, read the operator states and the keyed headers. No key is
+    /// read until an operator is expanded.
+    pub fn open(dir: &Path) -> Result<TreeView, ReaderError> {
+        let reader = StateReader::open(dir)?;
+        let operators = crate::operators::summarize(reader.savepoint(), dir);
+        Ok(TreeView::new(Arc::new(reader), operators))
+    }
+
+    /// A tree over `operators` (summaries of operators of the reader's savepoint, in any order
+    /// or subset), reading their keys from `reader`.
+    pub fn new(reader: Arc<StateReader<'static>>, operators: Vec<OperatorSummary>) -> Self {
+        let operators: Vec<OperatorSnapshot> = operators
+            .into_iter()
+            .map(|summary| {
+                let states = summary
                     .states
                     .iter()
                     .map(|s| StateSnapshot {
                         name: s.name.clone(),
                         state_type: s.state_type.clone(),
-                        elements: s
-                            .entries
-                            .iter()
-                            .map(|e| OpElement {
-                                label: e.key.clone(),
-                                key_group: e.key_group,
-                            })
-                            .collect(),
+                        len: s.elements.len(),
                         filtered_indices: None,
                         entry_offset: 0,
                     })
                     .collect();
-
-                // Structured keyed state
-                let keyed = op.keyed_state.as_ref().map(|ks| KeyedSnapshot {
-                    descriptors: ks.descriptors.clone(),
-                    pojo_infos: ks
-                        .descriptors
-                        .iter()
-                        .map(|d| d.pojo_info.as_ref().map(|p| p.to_pojo_info()))
-                        .collect(),
-                    partitions: ks
-                        .partitions
-                        .iter()
-                        .map(|p| PartitionSnapshot {
-                            key: p.key.clone(),
-                            key_group: p.key_group,
-                            entry_raw: p.values.clone(),
-                        })
-                        .collect(),
-                    total_partitions: ks.total_keys,
-                    partition_offset: 0,
-                    key_type: ks.key_type.clone(),
-                    filtered_indices: None,
-                });
-
+                let keyed = keyed_snapshot(&reader, &summary);
                 OperatorSnapshot {
-                    display_name: op.display_name.clone(),
-                    operator_type: shorten_operator_type(&op.identifier_name),
+                    operator_type: shorten_operator_type(&summary.identifier_name),
+                    summary,
                     states,
                     keyed,
-                    load_errors: op.load_errors.len(),
                 }
             })
             .collect();
 
         let mut tv = Self {
+            reader,
             nodes: Vec::new(),
             list_state: ListState::default(),
             operators,
@@ -363,8 +587,10 @@ impl TreeView {
             display_width: 120,
             page_rows: DEFAULT_PAGE_ROWS,
             proto_ctx: None,
-            decoded: HashMap::new(),
-            decode_calls: 0,
+            search: None,
+            search_step_bytes: SEARCH_STEP_BYTES,
+            fetched: 0,
+            entries_fetched: 0,
         };
         tv.rebuild_flat_list();
         if !tv.nodes.is_empty() {
@@ -373,29 +599,270 @@ impl TreeView {
         tv
     }
 
+    /// The reader the tree reads from.
+    pub fn reader(&self) -> &Arc<StateReader<'static>> {
+        &self.reader
+    }
+
+    /// Number of operators (shown or hidden).
+    pub fn operator_count(&self) -> usize {
+        self.operators.len()
+    }
+
+    /// The summary of operator `op_idx`.
+    pub fn summary(&self, op_idx: usize) -> Option<&OperatorSummary> {
+        self.operators.get(op_idx).map(|o| &o.summary)
+    }
+
+    /// Every operator summary, in order.
+    pub fn summaries(&self) -> Vec<OperatorSummary> {
+        self.operators.iter().map(|o| o.summary.clone()).collect()
+    }
+
+    /// The key count of operator `op_idx` (`None`: no keyed state).
+    pub fn key_count(&self, op_idx: usize) -> Option<KeyCount> {
+        let k = self.operators.get(op_idx)?.keyed.as_ref()?;
+        Some(match k.total() {
+            Some(n) => KeyCount::Exact(n),
+            None => k.count,
+        })
+    }
+
+    /// A lower bound of the key count of operator `op_idx`.
+    pub fn keys_at_least(&self, op_idx: usize) -> usize {
+        self.operators
+            .get(op_idx)
+            .and_then(|o| o.keyed.as_ref())
+            .map_or(0, KeyedSnapshot::at_least)
+    }
+
+    /// Record what the count pass found for operator `op_idx`.
+    pub fn set_key_count(&mut self, op_idx: usize, count: KeyCount) {
+        if let Some(k) = self
+            .operators
+            .get_mut(op_idx)
+            .and_then(|o| o.keyed.as_mut())
+        {
+            k.count = count;
+        }
+        self.rebuild_flat_list();
+    }
+
+    /// Keyed operators to count: `(op_idx, hex id, maxParallelism)`.
+    pub fn keyed_operators(&self) -> Vec<(usize, String, i32)> {
+        self.operators
+            .iter()
+            .enumerate()
+            .filter_map(|(i, o)| {
+                o.keyed
+                    .as_ref()
+                    .filter(|k| !k.descriptors.is_empty())
+                    .map(|k| (i, k.op_hex.clone(), o.summary.max_parallelism))
+            })
+            .collect()
+    }
+
+    /// What the `i` overlay and the export say about the keyed state of `op_idx`.
+    pub fn keyed_info(&self, op_idx: usize) -> Option<KeyedInfo> {
+        let k = self.operators.get(op_idx)?.keyed.as_ref()?;
+        Some(KeyedInfo {
+            key_type: k.key_type.clone(),
+            state_names: k.descriptors.iter().map(|d| d.name.clone()).collect(),
+            keys: k
+                .keys_text()
+                .trim_end_matches(" keys")
+                .replace(" keys,", ","),
+            errors: k.errors.clone(),
+            malformed: k.malformed.clone(),
+        })
+    }
+
+    /// Unreadable state files / key-groups met so far, over all operators.
+    pub fn load_errors(&self) -> usize {
+        self.operators
+            .iter()
+            .map(OperatorSnapshot::load_errors)
+            .sum()
+    }
+
+    // --- fetching keys -------------------------------------------------------------------------
+
+    /// Make sure operator `op_idx`'s current window of keys is loaded: find positions up to two
+    /// pages past its offset (one page of look-ahead tells whether a `↓` row is needed), read the
+    /// window's keys that are not loaded yet, and drop the ones far from it.
+    fn ensure_window(&mut self, op_idx: usize) {
+        let reader = self.reader.clone();
+        let Some(k) = self.operators[op_idx].keyed.as_mut() else {
+            return;
+        };
+        if k.descriptors.is_empty() {
+            return;
+        }
+        let page = PARTITION_PAGE_SIZE;
+        let mut fetched = 0;
+
+        // Browsing (all keys, or a key-group range): discover positions by paging forward.
+        if !k.seq().matches {
+            loop {
+                let seq = k.seq();
+                let want = seq.offset + 2 * page;
+                let Some(next) = seq.next else { break };
+                if seq.positions.len() >= want {
+                    break;
+                }
+                let limit = (want - seq.positions.len()).max(page);
+                match reader.key_page(&k.op_hex, &next, limit) {
+                    Ok(p) => {
+                        k.note_page(&p.unreadable, &p.malformed);
+                        let (start_kg, stop_kg) = (k.seq().start_kg, k.seq().stop_kg);
+                        let mut ended = false;
+                        for record in p.keys {
+                            if stop_kg.is_some_and(|s| record.key_group > s) {
+                                ended = true;
+                                break;
+                            }
+                            if record.key_group < start_kg {
+                                continue;
+                            }
+                            k.seq_mut().positions.push(record.position);
+                            fetched += 1;
+                            k.rows
+                                .insert(record.position, KeyRow::new(record, &k.descriptors));
+                        }
+                        k.seq_mut().next = if ended { None } else { p.next };
+                    }
+                    Err(e) => {
+                        k.note_error(e);
+                        k.seq_mut().next = None;
+                    }
+                }
+            }
+        }
+
+        // The window's keys not loaded yet.
+        let seq = k.seq();
+        let start = seq.offset.min(seq.positions.len());
+        let end = (start + page).min(seq.positions.len());
+        let missing: Vec<usize> = (start..end)
+            .filter(|&i| !k.rows.contains_key(&seq.positions[i]))
+            .collect();
+        let contiguous = !seq.matches;
+        let mut i = 0;
+        while i < missing.len() {
+            // Consecutive browsing positions are consecutive keys: one page reads the run.
+            let mut run = 1;
+            if contiguous {
+                while i + run < missing.len() && missing[i + run] == missing[i] + run {
+                    run += 1;
+                }
+            }
+            let from = k.seq().positions[missing[i]];
+            match reader.key_page(&k.op_hex, &from, run) {
+                Ok(p) => {
+                    k.note_page(&p.unreadable, &p.malformed);
+                    for record in p.keys {
+                        fetched += 1;
+                        k.rows
+                            .insert(record.position, KeyRow::new(record, &k.descriptors));
+                    }
+                }
+                Err(e) => k.note_error(e),
+            }
+            i += run;
+        }
+
+        // Keep the window, the page before and the page after it.
+        let seq = k.seq();
+        let lo = seq.offset.saturating_sub(page).min(seq.positions.len());
+        let hi = (seq.offset + 2 * page).min(seq.positions.len());
+        let keep: HashSet<Cursor> = seq.positions[lo..hi].iter().copied().collect();
+        k.rows.retain(|c, _| keep.contains(c));
+        self.fetched += fetched;
+    }
+
+    /// Read the window of an expanded MAP state when it lies past the entries returned with its
+    /// key: one page of [`MAP_DISPLAY_LIMIT`] entries, never the whole map.
+    fn ensure_map_window(&mut self, op_idx: usize, key: Cursor, ei: usize) {
+        let reader = self.reader.clone();
+        let Some(k) = self.operators[op_idx].keyed.as_mut() else {
+            return;
+        };
+        let Some(desc) = k.descriptors.get(ei) else {
+            return;
+        };
+        let Some(row) = k.rows.get_mut(&key) else {
+            return;
+        };
+        let slot = &mut row.slots[ei];
+        if desc.state_type != "MAP" {
+            return;
+        }
+        let start = slot.map_offset.min(slot.total);
+        let end = (start + MAP_DISPLAY_LIMIT).min(slot.total);
+        if end <= slot.entries.len() || slot.page.as_ref().is_some_and(|(o, _)| *o == start) {
+            return;
+        }
+        match reader.entries(&k.op_hex, &key, &desc.name, start, MAP_DISPLAY_LIMIT) {
+            Ok(p) => {
+                self.entries_fetched += p.entries.len();
+                slot.page = Some((start, p.entries));
+            }
+            Err(e) => {
+                slot.page = Some((start, Vec::new()));
+                k.note_error(e);
+            }
+        }
+    }
+
+    /// Entries of keyed states read by the tree with [`StateReader::entries`] since this view
+    /// was created: the pages of MAP windows past the entries returned with their keys.
+    #[doc(hidden)]
+    pub fn entries_read(&self) -> usize {
+        self.entries_fetched
+    }
+
+    /// Before rows are built: load the windows of the expanded keyed operators, and of their
+    /// expanded MAP states.
+    fn prepare(&mut self) {
+        let expanded_ops: Vec<usize> = self
+            .nodes
+            .iter()
+            .filter(|n| n.level == NodeLevel::Operator && n.kind == NodeKind::Data && n.expanded)
+            .map(|n| n.op_idx)
+            .collect();
+        for op in expanded_ops {
+            self.ensure_window(op);
+        }
+        let expanded_entries: Vec<(usize, Cursor, usize)> = self
+            .nodes
+            .iter()
+            .filter(|n| n.level == NodeLevel::Entry && n.kind == NodeKind::Data && n.expanded)
+            .filter_map(|n| Some((n.op_idx, n.key?, n.entry_idx?)))
+            .collect();
+        for (op, key, ei) in expanded_entries {
+            self.ensure_map_window(op, key, ei);
+        }
+    }
+
     fn rebuild_flat_list(&mut self) {
+        self.prepare();
         let mut nodes = Vec::new();
-        // Values decoded by the last rebuild; those this one shows move to `decoded`.
-        let mut previous = std::mem::take(&mut self.decoded);
-        let mut decoded = HashMap::new();
-        let mut decode_calls = 0;
         let style = ValueStyle {
-            proto: self.proto_ctx.as_deref(),
             debug: self.debug_mode,
             auto_date: self.auto_date,
             max_inline: self.display_width.saturating_sub(12) as usize,
         };
+        let search_percent = self.search_percent();
 
         for (op_idx, op) in self.operators.iter().enumerate() {
             let child_count = op.child_count();
             // An operator whose files could not be read may look empty only because of that:
             // hiding it would hide the error too.
-            if self.hide_empty && child_count == 0 && op.load_errors == 0 {
+            if self.hide_empty && child_count == 0 && op.load_errors() == 0 {
                 continue;
             }
-            let op_expanded = self.is_expanded(NodeLevel::Operator, op_idx, None, None);
+            let op_expanded = self.is_expanded(NodeLevel::Operator, op_idx, None, None, None);
 
-            let total_keys = op.keyed.as_ref().map_or(0, |k| k.total_partitions);
             let desc_count = op.keyed.as_ref().map_or(0, |k| k.descriptors.len());
             let key_type_tag = if self.debug_mode {
                 op.keyed
@@ -405,192 +872,54 @@ impl TreeView {
             } else {
                 String::new()
             };
-            let key_label = format!(
-                "{}{}",
-                op.keyed
-                    .as_ref()
-                    .map(|k| k.count_label())
-                    .unwrap_or_default(),
-                key_type_tag
-            );
             let type_tag = if self.debug_mode && !op.operator_type.is_empty() {
                 format!(" [{}]", op.operator_type)
             } else {
                 String::new()
             };
             let icon = if op.is_kafka() { KAFKA_ICON } else { "" };
-            let label = if total_keys > 0 && desc_count > 0 {
-                format!(
-                    "⯈ {}{}{} ({}, {} states)",
-                    icon, op.display_name, type_tag, key_label, desc_count
-                )
-            } else if total_keys > 0 {
-                format!("⯈ {}{}{} ({})", icon, op.display_name, type_tag, key_label)
-            } else {
-                format!("⯈ {}{}{}", icon, op.display_name, type_tag)
+            let name = &op.summary.display_name;
+            let label = match &op.keyed {
+                Some(k) if desc_count > 0 => format!(
+                    "⯈ {}{}{} ({}{}, {} states)",
+                    icon,
+                    name,
+                    type_tag,
+                    k.count_label(search_percent.filter(|_| self.is_searching(op_idx))),
+                    key_type_tag,
+                    desc_count
+                ),
+                _ => format!("⯈ {}{}{}", icon, name, type_tag),
             };
-            let label = if op.load_errors > 0 {
+            let label = if op.load_errors() > 0 {
                 format!(
                     "{}  {}{} state file(s) not read (i: details)",
-                    label, LOAD_ERROR_MARK, op.load_errors
+                    label,
+                    LOAD_ERROR_MARK,
+                    op.load_errors()
                 )
             } else {
                 label
             };
 
-            let op_path = op.display_name.clone();
+            let op_path = name.clone();
             let mut op_node = FlatNode::new(NodeLevel::Operator, label, op_path.clone(), op_idx);
             op_node.expanded = op_expanded;
-            op_node.has_children = child_count > 0 || !op.states.is_empty();
+            op_node.has_children = desc_count > 0 || !op.states.is_empty();
             nodes.push(op_node);
 
             if !op_expanded {
                 continue;
             }
 
-            // Keyed state partitions (user states — shown first)
-            if let Some(keyed) = &op.keyed {
-                let base = op.states.len();
-                let visible_count = keyed.visible_count();
-                let pager_note = keyed.pager_note();
-
-                // Build the list of partition indices to show on this page
-                let page_start = keyed.partition_offset.min(visible_count);
-                let page_end = (page_start + PARTITION_PAGE_SIZE).min(visible_count);
-                let pager = |arrow: char, kind: NodeKind| {
-                    let label = pager_label("  ", arrow, page_start, page_end, visible_count);
-                    FlatNode::new(
-                        NodeLevel::State,
-                        format!("{}{}", label, pager_note),
-                        op_path.clone(),
-                        op_idx,
-                    )
-                    .kind(kind)
-                };
-
-                if page_start > 0 {
-                    nodes.push(pager('↑', NodeKind::PagerUp));
-                }
-                for vi in page_start..page_end {
-                    // Map visible index to real partition index
-                    let pi = match &keyed.filtered_indices {
-                        Some(indices) => indices[vi],
-                        None => vi,
-                    };
-                    // `visible_count` is bounded by the stored partitions, so this always holds.
-                    let Some(part) = keyed.partitions.get(pi) else {
-                        continue;
-                    };
-                    let state_idx = base + pi;
-                    let expanded =
-                        self.is_expanded(NodeLevel::State, op_idx, Some(state_idx), None);
-                    let desc_count = keyed.descriptors.len();
-
-                    let part_path = format!("{} > {}", op_path, part.key);
-                    let part_label = if self.debug_mode {
-                        format!(
-                            "  ⯈ {} ({} states, kg:{})",
-                            part.key, desc_count, part.key_group
-                        )
-                    } else {
-                        format!("  ⯈ {} ({} states)", part.key, desc_count)
-                    };
-                    let mut part_node =
-                        FlatNode::new(NodeLevel::State, part_label, part_path.clone(), op_idx)
-                            .at(Some(state_idx), None);
-                    part_node.expanded = expanded;
-                    part_node.has_children = desc_count > 0;
-                    nodes.push(part_node);
-
-                    if !expanded {
-                        continue;
-                    }
-                    for (ei, desc) in keyed.descriptors.iter().enumerate() {
-                        let raw = part
-                            .entry_raw
-                            .get(ei)
-                            .and_then(|v| v.as_deref())
-                            .filter(|r| !r.is_empty());
-                        let pojo = keyed.pojo_infos.get(ei).and_then(Option::as_ref);
-                        let cache_key = (op_idx, pi, ei);
-                        let value = raw.map(|r| {
-                            previous.remove(&cache_key).unwrap_or_else(|| {
-                                decode_calls += 1;
-                                decode_state_value(r, &desc.value_type, pojo, style.proto)
-                            })
-                        });
-                        let row = entry_row(desc, value.as_ref(), raw, &style);
-                        let entry_expanded = row.expandable
-                            && self.is_expanded(
-                                NodeLevel::Entry,
-                                op_idx,
-                                Some(state_idx),
-                                Some(ei),
-                            );
-                        // Columns, not bytes: a byte count overstates non-ASCII text, and
-                        // cutting at one panicked inside a multi-byte character.
-                        let display_lbl =
-                            if !entry_expanded && text::width(&row.label) > style.max_inline {
-                                text::ellipsize(&row.label, style.max_inline, "...").into_owned()
-                            } else {
-                                row.label
-                            };
-                        let entry_path = format!("{} > {}", part_path, desc.name);
-                        let mut entry_node = FlatNode::new(
-                            NodeLevel::Entry,
-                            format!(
-                                "    {} {}",
-                                if row.expandable { "⯈" } else { "•" },
-                                display_lbl
-                            ),
-                            entry_path.clone(),
-                            op_idx,
-                        )
-                        .at(Some(state_idx), Some(ei));
-                        entry_node.expanded = entry_expanded;
-                        entry_node.has_children = row.expandable;
-                        nodes.push(entry_node);
-
-                        if let (true, Some(value)) = (entry_expanded, &value) {
-                            let mut children = Vec::new();
-                            child_rows(desc, value, &entry_path, &style, &mut children);
-                            nodes.extend(children.into_iter().map(|c| {
-                                FlatNode::new(NodeLevel::MapEntry, c.label, c.path, op_idx)
-                                    .kind(c.kind)
-                                    .at(Some(state_idx), Some(ei))
-                            }));
-                        }
-                        if let Some(value) = value {
-                            decoded.insert(cache_key, value);
-                        }
-                    }
-                }
-                // Show "... N more keys" if paginated
-                let remaining = visible_count.saturating_sub(page_end);
-                if remaining > 0 {
-                    nodes.push(pager('↓', NodeKind::PagerDown));
-                } else if keyed.hidden_keys() > 0 {
-                    // The end of the stored keys is not the end of the operator's keys.
-                    nodes.push(
-                        FlatNode::new(
-                            NodeLevel::State,
-                            format!(
-                                "  … {} more keys not indexed (not shown, not searched by /); \
-                                 --export-state reads them all",
-                                keyed.hidden_keys()
-                            ),
-                            op_path.clone(),
-                            op_idx,
-                        )
-                        .kind(NodeKind::Marker),
-                    );
-                }
+            if let Some(keyed) = op.keyed.as_ref().filter(|k| !k.descriptors.is_empty()) {
+                self.key_rows(op_idx, keyed, &op_path, &style, &mut nodes);
             }
 
             // Technical operator states (managed-operator) — shown last, dimmed
             for (state_idx, state) in op.states.iter().enumerate() {
                 let state_expanded =
-                    self.is_expanded(NodeLevel::State, op_idx, Some(state_idx), None);
+                    self.is_expanded(NodeLevel::State, op_idx, Some(state_idx), None, None);
                 let int_path = format!("{} > [internal] {}", op_path, state.name);
                 let visible = state.visible_count();
                 let mut header = FlatNode::new(
@@ -618,10 +947,11 @@ impl TreeView {
                 }
                 let page_start = state.entry_offset.min(visible);
                 let page_end = (page_start + ENTRY_PAGE_SIZE).min(visible);
+                let of = visible.to_string();
                 let pager = |arrow: char, kind: NodeKind| {
                     FlatNode::new(
                         NodeLevel::Entry,
-                        pager_label("    ", arrow, page_start, page_end, visible),
+                        pager_label("    ", arrow, page_start, page_end, &of),
                         int_path.clone(),
                         op_idx,
                     )
@@ -631,14 +961,14 @@ impl TreeView {
                 if page_start > 0 {
                     nodes.push(pager('↑', NodeKind::PagerUp));
                 }
+                let elements = &op.summary.states[state_idx].elements;
                 for vi in page_start..page_end {
                     // The element's real index, also under a filter.
                     let ri = state.real_index(vi);
-                    let element = &state.elements[ri];
                     nodes.push(
                         FlatNode::new(
                             NodeLevel::Entry,
-                            format!("    • [{}] {}", ri, format_key_preview(&element.label)),
+                            format!("    • [{}] {}", ri, format_key_preview(&elements[ri].label)),
                             format!("{}[{}]", int_path, ri),
                             op_idx,
                         )
@@ -651,14 +981,131 @@ impl TreeView {
             }
         }
 
-        self.decoded = decoded;
-        self.decode_calls += decode_calls;
-
         // Preserve selection
         let selected = self.list_state.selected().unwrap_or(0);
         self.nodes = nodes;
         let max = self.nodes.len().saturating_sub(1);
         self.list_state.select(Some(selected.min(max)));
+    }
+
+    /// The rows of an expanded keyed operator: its window of keys between pager rows, each key's
+    /// states when it is expanded, and a note per unreadable file or key-group.
+    fn key_rows(
+        &self,
+        op_idx: usize,
+        keyed: &KeyedSnapshot,
+        op_path: &str,
+        style: &ValueStyle,
+        nodes: &mut Vec<FlatNode>,
+    ) {
+        let seq = keyed.seq();
+        let known = seq.positions.len();
+        let page_start = seq.offset.min(known);
+        let page_end = (page_start + PARTITION_PAGE_SIZE).min(known);
+        let of = keyed.pager_total();
+        let pager = |arrow: char, kind: NodeKind| {
+            FlatNode::new(
+                NodeLevel::State,
+                pager_label("  ", arrow, page_start, page_end, &of),
+                op_path.to_string(),
+                op_idx,
+            )
+            .kind(kind)
+        };
+        if page_start > 0 {
+            nodes.push(pager('↑', NodeKind::PagerUp));
+        }
+        let desc_count = keyed.descriptors.len();
+        for &pos in &seq.positions[page_start..page_end] {
+            let Some(row) = keyed.rows.get(&pos) else {
+                continue; // could not be read: the error is listed below
+            };
+            let expanded = self.is_expanded(NodeLevel::State, op_idx, None, Some(pos), None);
+            let part_path = format!("{} > {}", op_path, row.key);
+            let part_label = if self.debug_mode {
+                format!(
+                    "  ⯈ {} ({} states, kg:{})",
+                    row.key, desc_count, row.key_group
+                )
+            } else {
+                format!("  ⯈ {} ({} states)", row.key, desc_count)
+            };
+            let mut part_node =
+                FlatNode::new(NodeLevel::State, part_label, part_path.clone(), op_idx)
+                    .of_key(pos, None);
+            part_node.expanded = expanded;
+            part_node.has_children = desc_count > 0;
+            nodes.push(part_node);
+            if !expanded {
+                continue;
+            }
+            for (ei, desc) in keyed.descriptors.iter().enumerate() {
+                let slot = &row.slots[ei];
+                let shown = slot
+                    .entries
+                    .iter()
+                    .find(|e| !e.raw.is_empty())
+                    .map(|e| e.raw.as_slice());
+                let entry = entry_row(desc, slot, shown, style);
+                let entry_expanded = entry.expandable
+                    && self.is_expanded(NodeLevel::Entry, op_idx, None, Some(pos), Some(ei));
+                // Columns, not bytes: a byte count overstates non-ASCII text, and cutting at one
+                // panicked inside a multi-byte character.
+                let display_lbl = if !entry_expanded && text::width(&entry.label) > style.max_inline
+                {
+                    text::ellipsize(&entry.label, style.max_inline, "...").into_owned()
+                } else {
+                    entry.label
+                };
+                let entry_path = format!("{} > {}", part_path, desc.name);
+                let mut entry_node = FlatNode::new(
+                    NodeLevel::Entry,
+                    format!(
+                        "    {} {}",
+                        if entry.expandable { "⯈" } else { "•" },
+                        display_lbl
+                    ),
+                    entry_path.clone(),
+                    op_idx,
+                )
+                .of_key(pos, Some(ei));
+                entry_node.expanded = entry_expanded;
+                entry_node.has_children = entry.expandable;
+                nodes.push(entry_node);
+
+                if let (true, Some(value)) = (entry_expanded, &slot.value) {
+                    let mut children = Vec::new();
+                    child_rows(desc, value, slot, &entry_path, style, &mut children);
+                    nodes.extend(children.into_iter().map(|c| {
+                        let mut n = FlatNode::new(NodeLevel::MapEntry, c.label, c.path, op_idx)
+                            .kind(c.kind)
+                            .of_key(pos, Some(ei));
+                        n.item = c.item;
+                        n
+                    }));
+                }
+            }
+        }
+        if page_end < known {
+            nodes.push(pager('↓', NodeKind::PagerDown));
+        }
+        // What could not be read is said where the keys are missing.
+        if page_end >= known && !keyed.errors.is_empty() {
+            nodes.push(
+                FlatNode::new(
+                    NodeLevel::State,
+                    format!(
+                        "  {}{} state file(s) or key-group(s) could not be read: their keys \
+                         are missing (i: details)",
+                        LOAD_ERROR_MARK,
+                        keyed.errors.len()
+                    ),
+                    op_path.to_string(),
+                    op_idx,
+                )
+                .kind(NodeKind::Marker),
+            );
+        }
     }
 
     /// Number of rows in the tree as it is expanded now.
@@ -672,15 +1119,16 @@ impl TreeView {
         self.nodes.get(i).map(|n| n.op_idx)
     }
 
-    /// Whether the node uniquely identified by (level, op_idx, state_idx, entry_idx) is expanded.
-    /// Matching on **both** state_idx and entry_idx matters: an entry's `entry_idx` is its
-    /// descriptor index, which repeats across keys (partitions), so without `state_idx` a map
-    /// under a non-first expanded key would read the wrong key's flag and never expand.
+    /// Whether the node uniquely identified by (level, op, operator state, key, entry) is
+    /// expanded. All of them matter: an entry's `entry_idx` is its state index, which repeats
+    /// across keys, so without the key a map under a second expanded key would read the first
+    /// key's flag.
     fn is_expanded(
         &self,
         level: NodeLevel,
         op_idx: usize,
         state_idx: Option<usize>,
+        key: Option<Cursor>,
         entry_idx: Option<usize>,
     ) -> bool {
         self.nodes
@@ -690,6 +1138,7 @@ impl TreeView {
                     && n.kind == NodeKind::Data
                     && n.op_idx == op_idx
                     && n.state_idx == state_idx
+                    && n.key == key
                     && n.entry_idx == entry_idx
             })
             .map(|n| n.expanded)
@@ -709,18 +1158,41 @@ impl TreeView {
         self.proto_ctx.as_deref()
     }
 
+    /// Decode protobuf-in-POJO values with `ctx`: the reader decodes values, so a new one is made
+    /// over the same savepoint (its headers are read again, nothing else), and the loaded keys
+    /// are read again through it.
     pub fn set_proto_context(&mut self, ctx: Arc<ProtoContext>) {
+        let reader = StateReader::from_savepoint(
+            self.reader.savepoint().clone(),
+            self.reader.savepoint_dir(),
+        )
+        .with_proto(ctx.clone());
+        self.set_reader(Arc::new(reader));
         self.proto_ctx = Some(ctx);
-        // Decoded with the previous context: protobuf fields may decode differently now.
-        self.decoded.clear();
         self.rebuild_flat_list();
     }
 
-    /// How many values have been decoded since this view was created. A rebuild decodes only the
-    /// values the previous one did not show.
+    /// Record that the reader the tree was made with already decodes with `ctx`.
+    pub fn note_proto_context(&mut self, ctx: Arc<ProtoContext>) {
+        self.proto_ctx = Some(ctx);
+    }
+
+    /// Read from `reader` from now on (over the same savepoint): the loaded keys are dropped, to
+    /// be read again.
+    pub fn set_reader(&mut self, reader: Arc<StateReader<'static>>) {
+        self.reader = reader;
+        for op in &mut self.operators {
+            if let Some(k) = op.keyed.as_mut() {
+                k.rows.clear();
+            }
+        }
+    }
+
+    /// How many keys have been received from the reader since this view was created (the reader
+    /// decodes each one's values once; a rebuild of the rows reads none).
     #[doc(hidden)]
     pub fn decode_calls(&self) -> usize {
-        self.decode_calls
+        self.fetched
     }
 
     pub fn toggle_hide_empty(&mut self) {
@@ -739,26 +1211,43 @@ impl TreeView {
     }
 
     /// Scroll the window a pager row belongs to by up to `amount` items, keeping the cursor where
-    /// it is: the keyed partitions of its operator, or the elements of its operator state.
-    /// Returns how far it scrolled.
+    /// it is: the keys of its operator, or the elements of its operator state. Returns how far it
+    /// scrolled.
     fn scroll(&mut self, pager_idx: usize, forward: bool, amount: usize) -> usize {
         let selected_before = self.list_state.selected().unwrap_or(0);
-        let (op_idx, state_idx) = {
+        let (op_idx, state_idx, map) = {
             let n = &self.nodes[pager_idx];
-            (n.op_idx, n.state_idx)
+            let map = match (n.level, n.key, n.entry_idx) {
+                (NodeLevel::MapEntry, Some(key), Some(ei)) => Some((key, ei)),
+                _ => None,
+            };
+            (n.op_idx, n.state_idx, map)
         };
         let Some(op) = self.operators.get_mut(op_idx) else {
             return 0;
         };
-        let (offset, visible, page) = match state_idx {
-            None => match &mut op.keyed {
+        let (offset, visible, page) = match (map, state_idx) {
+            // The entries of an expanded MAP.
+            (Some((key, ei)), _) => {
+                match op
+                    .keyed
+                    .as_mut()
+                    .and_then(|k| k.rows.get_mut(&key))
+                    .and_then(|r| r.slots.get_mut(ei))
+                {
+                    Some(slot) => (&mut slot.map_offset, slot.total, MAP_DISPLAY_LIMIT),
+                    None => return 0,
+                }
+            }
+            (None, None) => match &mut op.keyed {
                 Some(k) => {
-                    let visible = k.visible_count();
-                    (&mut k.partition_offset, visible, PARTITION_PAGE_SIZE)
+                    let seq = k.seq_mut();
+                    let visible = seq.positions.len();
+                    (&mut seq.offset, visible, PARTITION_PAGE_SIZE)
                 }
                 None => return 0,
             },
-            Some(si) => match op.states.get_mut(si) {
+            (None, Some(si)) => match op.states.get_mut(si) {
                 Some(s) => {
                     let visible = s.visible_count();
                     (&mut s.entry_offset, visible, ENTRY_PAGE_SIZE)
@@ -782,39 +1271,253 @@ impl TreeView {
         moved
     }
 
-    /// Apply a filter to keyed partition keys and operator-state elements.
+    // --- filter and search ---------------------------------------------------------------------
+
+    /// Apply a filter to the keys and the operator-state elements. Operator-state elements are
+    /// filtered at once; keys are looked up (`get`, for an exact key of a hashable type), sought
+    /// (a key-group range) or searched (a pattern): a search runs on
+    /// a worker thread, whose reports [`TreeView::poll_search`] applies.
     pub fn apply_filter(&mut self, filter: &Option<AppliedFilter>) {
-        for op in &mut self.operators {
-            // Filter keyed state partitions
-            if let Some(keyed) = &mut op.keyed {
-                keyed.partition_offset = 0;
-                keyed.filtered_indices = filter.as_ref().map(|f| {
-                    keyed
-                        .partitions
+        self.search = None;
+        let reader = self.reader.clone();
+        let mut queue = std::collections::VecDeque::new();
+        let mut found = 0;
+        for (op_idx, op) in self.operators.iter_mut().enumerate() {
+            for (si, state) in op.states.iter_mut().enumerate() {
+                state.entry_offset = 0;
+                let elements = &op.summary.states[si].elements;
+                state.filtered_indices = filter.as_ref().map(|f| {
+                    elements
                         .iter()
                         .enumerate()
-                        .filter(|(_, p)| f.matches_str(&p.key, p.key_group))
+                        .filter(|(_, e)| f.matches_str(&e.label, 0))
                         .map(|(i, _)| i)
                         .collect()
                 });
             }
-
-            // Filter non-keyed operator states
-            for state in &mut op.states {
-                state.entry_offset = 0;
-                state.filtered_indices = filter.as_ref().map(|f| {
-                    state
-                        .elements
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, e)| f.matches_bytes(&e.label, e.key_group))
-                        .map(|(i, _)| i)
-                        .collect()
+            let Some(k) = op.keyed.as_mut() else {
+                continue;
+            };
+            k.all.offset = 0;
+            k.filtered = None;
+            let Some(f) = filter else {
+                continue;
+            };
+            if k.descriptors.is_empty() {
+                continue;
+            }
+            let mut seq = KeySeq::browse(Cursor::START);
+            match f {
+                AppliedFilter::KeyGroupRange { start, end } => {
+                    seq.stop_kg = Some(*end);
+                    seq.start_kg = *start;
+                    let summary = &op.summary;
+                    let subtask = crate::parser::key_group::subtask_for_key_group(
+                        summary.max_parallelism,
+                        summary.parallelism,
+                        *start as i32,
+                    );
+                    let from = Cursor {
+                        subtask,
+                        key_group: *start,
+                        ordinal: 0,
+                    };
+                    // Seek the range's start when its cursor fits; else page from the first key.
+                    if reader.key_page(&k.op_hex, &from, 1).is_ok() {
+                        seq.next = Some(from);
+                    }
+                }
+                AppliedFilter::Exact(bytes) => {
+                    seq.matches = true;
+                    let text = String::from_utf8_lossy(bytes).into_owned();
+                    match reader.get(&k.op_hex, &text) {
+                        Ok(Lookup::Found { record, .. }) => {
+                            seq.push_match(record.position);
+                            k.rows
+                                .insert(record.position, KeyRow::new(record, &k.descriptors));
+                            found += 1;
+                            seq.next = None;
+                        }
+                        Ok(Lookup::Absent { .. }) => seq.next = None,
+                        // Not hashable here (a POJO key, …): scan for it.
+                        Ok(Lookup::NeedsScan { .. }) => queue.push_back(op_idx),
+                        Err(e) => {
+                            k.note_error(e);
+                            seq.next = None;
+                        }
+                    }
+                }
+                AppliedFilter::Pattern(p) => {
+                    seq.matches = true;
+                    // No wildcard: the key itself is most likely what was typed, and `get` finds
+                    // it at once; the scan then adds the other cases (the pattern ignores case).
+                    if !p.contains(['*', '?']) {
+                        if let Ok(Lookup::Found { record, .. }) = reader.get(&k.op_hex, p) {
+                            seq.push_match(record.position);
+                            k.rows
+                                .insert(record.position, KeyRow::new(record, &k.descriptors));
+                            found += 1;
+                        }
+                    }
+                    queue.push_back(op_idx);
+                }
+            }
+            k.filtered = Some(seq);
+        }
+        self.fetched += found;
+        if let Some(f) = filter {
+            if !queue.is_empty() {
+                let targets = queue
+                    .iter()
+                    .filter_map(|&op| {
+                        let k = self.operators[op].keyed.as_ref()?;
+                        Some(SearchTarget {
+                            op,
+                            hex: k.op_hex.clone(),
+                            from: k.filtered.as_ref()?.next?,
+                        })
+                    })
+                    .collect();
+                self.search = Some(Search {
+                    total_ops: queue.len(),
+                    queue,
+                    job: start_search(reader, targets, f.clone(), self.search_step_bytes),
                 });
             }
         }
         self.rebuild_flat_list();
     }
+
+    /// Stored bytes of blocks the search reads between two reports (at least one block): what
+    /// a filter applied from now on uses.
+    pub fn set_search_step_bytes(&mut self, bytes: u64) {
+        self.search_step_bytes = bytes.max(1);
+    }
+
+    /// Whether a search is still running.
+    pub fn searching(&self) -> bool {
+        self.search.is_some()
+    }
+
+    fn is_searching(&self, op_idx: usize) -> bool {
+        self.search
+            .as_ref()
+            .is_some_and(|s| s.queue.contains(&op_idx))
+    }
+
+    /// How far the search is, in percent: operators done, and key-groups of the current one.
+    pub fn search_percent(&self) -> Option<u8> {
+        let s = self.search.as_ref()?;
+        let done = s.total_ops - s.queue.len();
+        let current = s.queue.front().and_then(|&op| {
+            let o = &self.operators[op];
+            let next = o.keyed.as_ref()?.filtered.as_ref()?.next?;
+            Some(next.key_group as f64 / o.summary.max_parallelism.max(1) as f64)
+        });
+        let pct = (done as f64 + current.unwrap_or(0.0)) / s.total_ops.max(1) as f64 * 100.0;
+        Some(pct.clamp(0.0, 99.0) as u8)
+    }
+
+    /// Stop the search: the matches found so far stay, marked as a lower bound.
+    pub fn cancel_search(&mut self) {
+        if self.search.take().is_some() {
+            self.rebuild_flat_list();
+        }
+    }
+
+    /// Apply one report of the search worker.
+    fn apply_search(&mut self, msg: SearchMsg) {
+        let (op_idx, finished) = match msg {
+            SearchMsg::Page {
+                op,
+                matches,
+                next,
+                unreadable,
+                malformed,
+            } => {
+                let Some(k) = self.operators[op].keyed.as_mut() else {
+                    return;
+                };
+                k.note_page(&unreadable, &malformed);
+                let Some(seq) = k.filtered.as_mut() else {
+                    return;
+                };
+                let window = seq.offset..seq.offset + 2 * PARTITION_PAGE_SIZE;
+                for record in matches {
+                    let pos = record.position;
+                    let before = seq.positions.len();
+                    seq.push_match(pos);
+                    // The first windows are shown as the matches come: keep their rows.
+                    if seq.positions.len() > before && window.contains(&before) {
+                        k.rows.insert(pos, KeyRow::new(record, &k.descriptors));
+                        self.fetched += 1;
+                    }
+                }
+                seq.next = next;
+                (op, next.is_none())
+            }
+            SearchMsg::Failed { op, error } => {
+                if let Some(k) = self.operators[op].keyed.as_mut() {
+                    k.note_error(error);
+                    if let Some(seq) = k.filtered.as_mut() {
+                        seq.next = None;
+                    }
+                }
+                (op, true)
+            }
+        };
+        if finished {
+            if let Some(s) = self.search.as_mut() {
+                s.queue.retain(|&o| o != op_idx);
+                if s.queue.is_empty() {
+                    self.search = None;
+                }
+            }
+        }
+    }
+
+    /// Apply what the search worker reported since the last call, without waiting (the event
+    /// loop calls it between frames). Returns whether the search goes on.
+    pub fn poll_search(&mut self) -> bool {
+        let Some(search) = self.search.as_mut() else {
+            return false;
+        };
+        let ended = !search.job.is_running();
+        let msgs = search.job.drain();
+        let any = !msgs.is_empty();
+        for m in msgs {
+            self.apply_search(m);
+        }
+        if ended && self.search.is_some() {
+            // Every report was received: nothing more will come.
+            self.search = None;
+        }
+        if any || ended {
+            self.rebuild_flat_list();
+        }
+        self.search.is_some()
+    }
+
+    /// Wait for the search worker's next report and apply it (tests and headless use: each
+    /// report covers about the step bytes of blocks). Returns whether the search goes on.
+    pub fn search_step(&mut self) -> bool {
+        let Some(search) = self.search.as_mut() else {
+            return false;
+        };
+        match search.job.recv() {
+            Some(m) => self.apply_search(m),
+            None => self.search = None,
+        }
+        self.rebuild_flat_list();
+        self.search.is_some()
+    }
+
+    /// Run the search to its end (tests, and headless use).
+    pub fn finish_search(&mut self) {
+        while self.search_step() {}
+    }
+
+    // --- navigation ----------------------------------------------------------------------------
 
     pub fn move_up(&mut self) {
         if let Some(selected) = self.list_state.selected() {
@@ -906,59 +1609,78 @@ impl TreeView {
     }
 
     /// The bytes behind the selected row, for the hex overlay: a keyed value (from its state row
-    /// or any row under it) or an operator-state element. `None` on any other row. They are read
-    /// from `index`, the one this view was built from: the view keeps no operator-state bytes.
-    pub fn selected_raw_bytes(&self, index: &IndexCache) -> Option<RawBytes> {
+    /// or any row under it; under a MAP, the entry the row shows) or an operator-state element.
+    /// `None` on any other row. Keyed bytes are the entry's as the reader returned them.
+    pub fn selected_raw_bytes(&self) -> Option<RawBytes> {
         let node = self.nodes.get(self.list_state.selected()?)?;
         if node.kind != NodeKind::Data
             || !matches!(node.level, NodeLevel::Entry | NodeLevel::MapEntry)
         {
             return None;
         }
-        let (si, ei) = (node.state_idx?, node.entry_idx?);
         let op = self.operators.get(node.op_idx)?;
-        if let Some(state) = op.states.get(si) {
-            let entry = index
-                .operators
-                .get(node.op_idx)?
-                .states
-                .get(si)?
-                .entries
-                .get(ei)?;
-            let bytes = match &entry.value_ref {
-                ValueRef::Inline { data } => Some(data),
-                ValueRef::File { .. } | ValueRef::Decoded => None,
-            };
-            let label = String::from_utf8_lossy(&entry.key);
+        if let (Some(si), Some(ei)) = (node.state_idx, node.entry_idx) {
+            let state = op.summary.states.get(si)?;
+            let element = state.elements.get(ei)?;
             return Some(RawBytes {
                 key_title: format!("{}[{}], as decoded", state.name, ei),
-                key: entry.key.clone(),
-                value_title: match bytes {
+                key: element.label.clone().into_bytes(),
+                value_title: match element.bytes {
                     Some(_) => format!("element {}[{}]", state.name, ei),
-                    None => format!("no bytes: the element could not be read ({})", label),
+                    None => format!(
+                        "no bytes: the element could not be read ({})",
+                        element.label
+                    ),
                 },
-                value: bytes.cloned().unwrap_or_default(),
+                value: element.bytes.clone().unwrap_or_default(),
             });
         }
+        let (pos, ei) = (node.key?, node.entry_idx?);
         let keyed = op.keyed.as_ref()?;
-        let part = keyed.partitions.get(si - op.states.len())?;
+        let row = keyed.rows.get(&pos)?;
         let desc = keyed.descriptors.get(ei)?;
-        let raw = part.entry_raw.get(ei).and_then(|v| v.clone());
-        let value_title = match (&raw, desc.state_type.as_str()) {
-            (None, _) => format!("{}: no value for this key", desc.name),
-            // Its layout is in the README (detail overlay): spelled out here, the title took ~150
-            // columns and was cut.
-            (Some(_), "MAP") => format!("{} [{}]: per-key blob", desc.name, desc.value_type),
-            (Some(_), _) => format!("{} [{}]", desc.name, desc.value_type),
-        };
+        let slot = row.slots.get(ei)?;
+        let key_title = format!(
+            "key {} (as rendered: the reader keeps no raw key bytes)",
+            row.key
+        );
+        if desc.state_type == "MAP" {
+            let i = node.item.unwrap_or(0);
+            let Some(e) = slot.entry(i) else {
+                return Some(RawBytes {
+                    key_title,
+                    key: row.key.clone().into_bytes(),
+                    value_title: format!("{}: no value for this key", desc.name),
+                    value: Vec::new(),
+                });
+            };
+            // One entry of the map: its namespace holds the serialized map key.
+            return Some(RawBytes {
+                key_title: format!(
+                    "{}[{}]: namespace + map key",
+                    desc.name,
+                    e.map_key.as_deref().unwrap_or("?")
+                ),
+                key: e.namespace.clone(),
+                value_title: format!(
+                    "{} [{}]: entry {} of {}",
+                    desc.name,
+                    desc.value_type,
+                    i + 1,
+                    slot.total
+                ),
+                value: e.raw.clone(),
+            });
+        }
+        let value = slot.entries.iter().find(|e| !e.raw.is_empty());
         Some(RawBytes {
-            key_title: format!(
-                "key {} (as rendered: the index keeps no raw key bytes)",
-                part.key
-            ),
-            key: part.key.clone().into_bytes(),
-            value_title,
-            value: raw.unwrap_or_default(),
+            key_title,
+            key: row.key.clone().into_bytes(),
+            value_title: match value {
+                None => format!("{}: no value for this key", desc.name),
+                Some(_) => format!("{} [{}]", desc.name, desc.value_type),
+            },
+            value: value.map(|e| e.raw.clone()).unwrap_or_default(),
         })
     }
 
@@ -971,11 +1693,16 @@ impl TreeView {
                     self.rebuild_flat_list();
                 } else {
                     // Move to parent
-                    let (parent_level, state_idx, entry_idx) = match node.level {
-                        NodeLevel::MapEntry => (NodeLevel::Entry, node.state_idx, node.entry_idx),
-                        NodeLevel::Entry => (NodeLevel::State, node.state_idx, None),
-                        NodeLevel::State => (NodeLevel::Operator, None, None),
+                    let (parent_level, entry_idx) = match node.level {
+                        NodeLevel::MapEntry => (NodeLevel::Entry, node.entry_idx),
+                        NodeLevel::Entry if node.key.is_some() => (NodeLevel::State, None),
+                        NodeLevel::Entry => (NodeLevel::State, None),
+                        NodeLevel::State => (NodeLevel::Operator, None),
                         NodeLevel::Operator => return,
+                    };
+                    let (state_idx, key) = match parent_level {
+                        NodeLevel::Operator => (None, None),
+                        _ => (node.state_idx, node.key),
                     };
                     let op_idx = node.op_idx;
                     if let Some(i) = self.nodes.iter().position(|n| {
@@ -983,6 +1710,7 @@ impl TreeView {
                             && n.kind == NodeKind::Data
                             && n.op_idx == op_idx
                             && n.state_idx == state_idx
+                            && n.key == key
                             && n.entry_idx == entry_idx
                     }) {
                         self.list_state.select(Some(i));
@@ -995,6 +1723,14 @@ impl TreeView {
     pub fn jump_first(&mut self) {
         if !self.nodes.is_empty() {
             self.list_state.select(Some(0));
+        }
+    }
+
+    /// Select row `i` as it is (tests: unlike moving onto a pager row, this scrolls nothing).
+    #[doc(hidden)]
+    pub fn select_row(&mut self, i: usize) {
+        if i < self.nodes.len() {
+            self.list_state.select(Some(i));
         }
     }
 
@@ -1025,7 +1761,7 @@ impl TreeView {
                     Style::default().fg(Color::DarkGray)
                 } else {
                     match node.level {
-                        NodeLevel::Operator if self.operators[node.op_idx].load_errors > 0 => {
+                        NodeLevel::Operator if self.operators[node.op_idx].load_errors() > 0 => {
                             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
                         }
                         NodeLevel::Operator => Style::default()
@@ -1052,18 +1788,63 @@ impl TreeView {
     }
 }
 
+/// An operator's keyed state as its headers describe it (no key is read).
+fn keyed_snapshot(reader: &StateReader, summary: &OperatorSummary) -> Option<KeyedSnapshot> {
+    let hex = summary.operator_id_hex();
+    let states = reader.states(&hex).ok()?;
+    if states.states.is_empty() && states.errors.is_empty() {
+        return None;
+    }
+    let descriptors = states
+        .states
+        .iter()
+        .map(|s| {
+            let pojo_detail = reader
+                .value_pojo(&hex, &s.name)
+                .ok()
+                .flatten()
+                .map(|p| {
+                    let fields: Vec<String> = p
+                        .leaf_fields("")
+                        .iter()
+                        .map(|(path, t)| format!("{}: {}", path, t))
+                        .collect();
+                    // The fully-qualified value class (package + name), then the fields.
+                    format!(" → {} {{ {} }}", p.class_name, fields.join(", "))
+                })
+                .unwrap_or_default();
+            StateDesc {
+                name: s.name.clone(),
+                state_type: s.state_type.clone(),
+                value_type: s.value_type.clone(),
+                pojo_detail,
+            }
+        })
+        .collect();
+    Some(KeyedSnapshot {
+        op_hex: hex,
+        key_type: states.key_type,
+        descriptors,
+        errors: states.errors,
+        malformed: Vec::new(),
+        count: KeyCount::Unknown,
+        all: KeySeq::browse(Cursor::START),
+        filtered: None,
+        rows: HashMap::new(),
+    })
+}
+
 // --- presentation of decoded values ---------------------------------------------------------
 
 /// How values are presented: none of it changes what is decoded.
-struct ValueStyle<'a> {
-    proto: Option<&'a ProtoContext>,
+struct ValueStyle {
     debug: bool,
     auto_date: bool,
     /// Columns a state row may take before it is cut (and, for a structure, made expandable).
     max_inline: usize,
 }
 
-impl ValueStyle<'_> {
+impl ValueStyle {
     /// A decoded value of serializer type `type_name`, as displayed: [`value_to_display`], except
     /// that with `auto_date` a `Long` in the epoch-millis range of 2000–2040 shows as a date.
     fn show(&self, v: &Value, type_name: &str) -> String {
@@ -1087,16 +1868,13 @@ struct ChildRow {
     label: String,
     path: String,
     kind: NodeKind,
+    /// Under a MAP: the entry it shows.
+    item: Option<usize>,
 }
 
-/// The row of one (key, state): `value` is what `decode_state_value` made of `raw`, `None` when
-/// the key holds no value for the state.
-fn entry_row(
-    desc: &StateDescriptor,
-    value: Option<&Value>,
-    raw: Option<&[u8]>,
-    style: &ValueStyle,
-) -> EntryRow {
+/// The row of one (key, state). `raw` is the shown entry's bytes (debug suffix).
+fn entry_row(desc: &StateDesc, slot: &Slot, raw: Option<&[u8]>, style: &ValueStyle) -> EntryRow {
+    let value = slot.value.as_ref();
     let collection = |prefix: &str, fallback: &str, unit: &str, items: Option<usize>| {
         let type_label = if desc.value_type.starts_with(prefix) {
             desc.value_type.as_str()
@@ -1104,9 +1882,7 @@ fn entry_row(
             fallback
         };
         let summary = match (value, items) {
-            (None, _) if style.debug => {
-                format!("empty (no data, {} raw entries)", desc.entry_count)
-            }
+            (None, _) if style.debug => "empty (no data)".to_string(),
             (None, _) | (Some(_), Some(0)) => "empty".to_string(),
             (Some(_), Some(n)) => format!("{} {}", n, unit),
             // Not a map/list: a marker saying why.
@@ -1125,7 +1901,10 @@ fn entry_row(
             "Map<",
             "MAP",
             "entries",
-            value.and_then(Value::as_object).map(|m| m.len()),
+            // A map the reader cut at its entry limit has `total` entries all the same.
+            value
+                .and_then(Value::as_object)
+                .map(|m| m.len().max(slot.total)),
         ),
         "LIST" => collection(
             "List<",
@@ -1162,24 +1941,42 @@ fn entry_row(
 /// The rows under an expanded (key, state): a MAP's entries, a LIST's elements, a structure's
 /// fields or elements — all read off the decoded `value`.
 fn child_rows(
-    desc: &StateDescriptor,
+    desc: &StateDesc,
     value: &Value,
+    slot: &Slot,
     path: &str,
     style: &ValueStyle,
     out: &mut Vec<ChildRow>,
 ) {
     const INDENT: &str = "        ";
     match (desc.state_type.as_str(), value) {
-        ("MAP", Value::Object(map)) => {
+        ("MAP", Value::Object(_)) => {
+            // A window of the entries, in on-disk order, between pager rows.
             let (_, val_type) = split_map_types(&desc.value_type);
-            for (k, v) in map.iter().take(MAP_DISPLAY_LIMIT) {
+            let (start, window) = slot.map_window();
+            let end = (start + MAP_DISPLAY_LIMIT).min(slot.total);
+            let of = slot.total.to_string();
+            let pager = |arrow: char, kind: NodeKind| ChildRow {
+                label: pager_label(INDENT, arrow, start, end, &of),
+                path: path.to_string(),
+                kind,
+                item: None,
+            };
+            if start > 0 {
+                out.push(pager('↑', NodeKind::PagerUp));
+            }
+            for (j, e) in window.iter().enumerate() {
+                let k = map_key_of(e, start + j);
                 out.push(ChildRow {
-                    label: format!("{}{} : {}", INDENT, k, style.show(v, &val_type)),
+                    label: format!("{}{} : {}", INDENT, k, style.show(&e.value, &val_type)),
                     path: format!("{}[{}]", path, k),
                     kind: NodeKind::Data,
+                    item: Some(start + j),
                 });
             }
-            more_row(map.len(), MAP_DISPLAY_LIMIT, INDENT, path, out);
+            if end < slot.total {
+                out.push(pager('↓', NodeKind::PagerDown));
+            }
         }
         ("LIST", Value::Array(items)) => {
             let elem_type = desc
@@ -1192,6 +1989,7 @@ fn child_rows(
                     label: format!("{}[{}] {}", INDENT, i, style.show(v, elem_type)),
                     path: format!("{}[{}]", path, i),
                     kind: NodeKind::Data,
+                    item: None,
                 });
             }
             more_row(items.len(), LIST_DISPLAY_LIMIT, INDENT, path, out);
@@ -1213,6 +2011,7 @@ fn structure_rows(value: &Value, path: &str, indent: usize, out: &mut Vec<ChildR
                 label: format!("{}{}:", pad, name),
                 path: child_path.clone(),
                 kind: NodeKind::Data,
+                item: None,
             });
             structure_rows(v, &child_path, indent + 2, out);
         } else {
@@ -1220,6 +2019,7 @@ fn structure_rows(value: &Value, path: &str, indent: usize, out: &mut Vec<ChildR
                 label: format!("{}{}: {}", pad, name, shown),
                 path: child_path,
                 kind: NodeKind::Data,
+                item: None,
             });
         }
     };
@@ -1246,6 +2046,7 @@ fn more_row(total: usize, limit: usize, indent: &str, path: &str, out: &mut Vec<
             label: format!("{}… +{} more", indent, total - limit),
             path: path.to_string(),
             kind: NodeKind::Marker,
+            item: None,
         });
     }
 }
@@ -1276,21 +2077,12 @@ fn shorten_operator_type(identifier: &str) -> String {
         .to_string()
 }
 
-fn format_key_preview(key: &[u8]) -> String {
-    match std::str::from_utf8(key) {
-        Ok(s) if s.chars().count() <= 120 => s.to_string(),
-        Ok(s) => {
-            let truncated: String = s.chars().take(117).collect();
-            format!("{}…", truncated)
-        }
-        Err(_) => {
-            let hex = hex_preview(key, 24);
-            if key.len() > 24 {
-                format!("{}…", hex)
-            } else {
-                hex
-            }
-        }
+fn format_key_preview(label: &str) -> String {
+    if label.chars().count() <= 120 {
+        label.to_string()
+    } else {
+        let truncated: String = label.chars().take(117).collect();
+        format!("{}…", truncated)
     }
 }
 

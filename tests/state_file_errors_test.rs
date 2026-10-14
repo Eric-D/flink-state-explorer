@@ -1,6 +1,6 @@
-//! A missing, truncated or unreadable state file is never silent (issue #16): the index records
-//! it per operator — and still loads the other subtasks — the TUI shows it, a partial index is
-//! never cached, and the headless paths fail naming the file. Fixture-free: synthetic file-backed
+//! A missing, truncated or unreadable state file is never silent (issue #16): the reader reports
+//! it per operator — and still reads the other subtasks — the TUI shows it, counts that met it
+//! are never cached, and the headless paths fail naming the file. Fixture-free: synthetic file-backed
 //! savepoints (`tests/common/synth.rs`) with two subtasks, one of whose files is then damaged.
 
 mod common;
@@ -9,12 +9,12 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use common::keyed::Keyed;
 use common::synth::{self, Item, KeyedOperator, Kind, Ser, Spec, Storage, Val};
 use flink_explorer::export_state::{export_state_ndjson, find_state, list_states};
-use flink_explorer::index::builder::build_index;
-use flink_explorer::index::cache::{IndexCache, CACHE_FILE_NAME};
+use flink_explorer::operators::{KeyedInfo, OperatorSummary};
 use flink_explorer::parser;
-use flink_explorer::tui::app::load_index;
+use flink_explorer::tui::app::{App, AppOptions};
 use flink_explorer::tui::tree::TreeView;
 use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
@@ -54,9 +54,9 @@ fn keys_of_subtask(subtask: i32) -> BTreeSet<String> {
         .collect()
 }
 
-fn index(dir: &Path) -> IndexCache {
-    let sp = parser::parse_metadata(&dir.join("_metadata")).expect("synthetic _metadata parses");
-    build_index(&sp, 0, 0, dir)
+/// The first operator: its summary and its keyed state, read whole through the reader.
+fn index(dir: &Path) -> (OperatorSummary, Option<Keyed>) {
+    common::keyed::operators(dir).remove(0)
 }
 
 fn truncate_to_half(path: &Path) -> (u64, u64) {
@@ -67,11 +67,15 @@ fn truncate_to_half(path: &Path) -> (u64, u64) {
 }
 
 /// The rendered tree in its default view (`hide_empty` on), one screen line per node.
-fn tree_screen(index: &IndexCache) -> String {
-    let mut tv = TreeView::new(index);
+fn tree_screen(dir: &Path) -> String {
+    let mut tv = TreeView::open(dir).unwrap();
     let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
     term.draw(|f| tv.render(f, Block::default(), Rect::new(0, 0, 160, 20)))
         .unwrap();
+    buffer_text(&term)
+}
+
+fn buffer_text(term: &Terminal<TestBackend>) -> String {
     let buf = term.backend().buffer();
     let mut s = String::new();
     for y in 0..buf.area.height {
@@ -83,26 +87,33 @@ fn tree_screen(index: &IndexCache) -> String {
     s
 }
 
-/// Assert the index lost exactly `bad`'s subtask, said so naming `bad`, and kept the other one.
-fn assert_partial_index(index: &IndexCache, bad: &Path, good_subtask: i32, expect: &str) {
-    let op = &index.operators[0];
-    assert_eq!(op.load_errors.len(), 1, "{:?}", op.load_errors);
-    let err = &op.load_errors[0];
+/// Assert the reader lost exactly `bad`'s subtask, said so naming `bad`, and kept the other one.
+fn assert_partial_index(
+    index: &(OperatorSummary, Option<Keyed>),
+    bad: &Path,
+    good_subtask: i32,
+    expect: &str,
+) {
+    let (op, ks) = index;
+    let ks = ks.as_ref().expect("the readable subtask is still read");
+    assert_eq!(ks.errors.len(), 1, "{:?}", ks.errors);
+    let err = &ks.errors[0];
     assert!(err.contains(&bad.display().to_string()), "{}", err);
     assert!(err.contains(expect), "{}", err);
-    assert!(index.has_load_errors());
 
-    let ks = op
-        .keyed_state
-        .as_ref()
-        .expect("the readable subtask still loads");
-    let keys: BTreeSet<String> = ks.partitions.iter().map(|p| p.key.clone()).collect();
+    let keys: BTreeSet<String> = ks.keys.iter().map(|p| p.key.clone()).collect();
     let expected = keys_of_subtask(good_subtask);
     assert!(!expected.is_empty());
     assert_eq!(keys, expected);
-    assert_eq!(ks.total_keys, expected.len());
+    assert_eq!(ks.keys.len(), expected.len());
 
-    let info = op.info_lines();
+    let info = op.info_lines(Some(&KeyedInfo {
+        key_type: ks.key_type.clone(),
+        state_names: ks.state_names().iter().map(|s| s.to_string()).collect(),
+        keys: ks.keys.len().to_string(),
+        errors: ks.errors.clone(),
+        malformed: ks.malformed.clone(),
+    }));
     let (_, line) = info
         .iter()
         .find(|(k, _)| k == "Load errors")
@@ -168,14 +179,14 @@ fn an_operator_whose_files_are_all_missing_stays_in_the_tree() {
     for f in &files {
         std::fs::remove_file(f).unwrap();
     }
-    let idx = index(&dir);
-    let op = &idx.operators[0];
-    assert!(op.keyed_state.is_none());
-    assert_eq!(op.load_errors.len(), 2);
+    let (op, ks) = index(&dir);
+    let ks = ks.expect("its unreadable files are reported");
+    assert!(ks.states.is_empty() && ks.keys.is_empty());
+    assert_eq!(ks.errors.len(), 2, "{:?}", ks.errors);
 
     // hide_empty is on by default: an operator with no keys would be hidden, and its error with
     // it, if load errors did not keep it visible.
-    let screen = tree_screen(&idx);
+    let screen = tree_screen(&dir);
     let line = screen
         .lines()
         .find(|l| l.contains(&op.display_name))
@@ -187,15 +198,49 @@ fn an_operator_whose_files_are_all_missing_stays_in_the_tree() {
 fn the_tree_label_flags_a_partial_operator() {
     let (dir, files) = savepoint("label");
     std::fs::remove_file(&files[1]).unwrap();
-    let idx = index(&dir);
-    let screen = tree_screen(&idx);
+    let (op, _) = index(&dir);
+    // Counted in the background: the keys of the readable subtask, a lower bound since the other
+    // one could not be read.
+    let mut app = App::open(
+        dir.to_path_buf(),
+        AppOptions {
+            count_keys: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .unwrap();
+    app.wait_for_count();
+    let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
+    term.draw(|f| app.draw(f)).unwrap();
+    let screen = buffer_text(&term);
     let line = screen
         .lines()
-        .find(|l| l.contains(&idx.operators[0].display_name))
+        .find(|l| l.contains(&op.display_name))
         .expect("operator line");
     let keys = keys_of_subtask(0).len();
-    assert!(line.contains(&format!("{} keys", keys)), "{:?}", line);
+    assert!(line.contains(&format!("≥ {} keys", keys)), "{:?}", line);
     assert!(line.contains("⚠ 1 state file(s) not read"), "{:?}", line);
+
+    // Paged to the end, the missing keys are said to be missing where they would be.
+    let tree = app.tree();
+    tree.jump_first();
+    tree.expand();
+    let mut term = Terminal::new(TestBackend::new(200, 300)).unwrap();
+    for _ in 0..10 {
+        term.draw(|f| tree.render(f, Block::default(), f.area()))
+            .unwrap();
+        tree.page_down();
+    }
+    term.draw(|f| tree.render(f, Block::default(), f.area()))
+        .unwrap();
+    let screen = buffer_text(&term);
+    assert!(screen.contains(&format!("/ {}", keys)), "{}", screen);
+    assert!(
+        screen.contains("could not be read: their keys are missing"),
+        "{}",
+        screen
+    );
 }
 
 #[test]
@@ -338,18 +383,29 @@ fn the_cli_exits_non_zero_naming_the_file() {
     assert!(export.stdout.is_empty());
 }
 
+/// Counts that met an unreadable file are a lower bound: they are not cached (they would be
+/// served again after the file was repaired). Once it is back, the complete counts are cached —
+/// under the cache directory, never in the savepoint's.
 #[test]
-fn no_cache_is_written_after_a_partial_build() {
+fn no_counts_are_cached_after_a_partial_count() {
     let (dir, files) = savepoint("cache-partial");
+    let cache = synth::temp_dir("cache-partial-cache");
+    let options = || AppOptions {
+        cache_dir: Some(cache.to_path_buf()),
+        count_keys: true,
+        count_step_bytes: 0,
+        search_step_bytes: 0,
+    };
     std::fs::remove_file(&files[1]).unwrap();
-    let idx = load_index(&dir, false, &mut |_| {}).unwrap();
-    assert!(idx.has_load_errors());
-    assert!(
-        !dir.join(CACHE_FILE_NAME).exists(),
-        "a partial index was cached"
+    let mut app = App::open(dir.to_path_buf(), options(), |_| {}).unwrap();
+    app.wait_for_count();
+    drop(app);
+    assert_eq!(
+        std::fs::read_dir(&*cache).unwrap().count(),
+        0,
+        "partial counts were cached"
     );
 
-    // Once the file is back, the next load builds the full index (and caches it).
     synth::write_savepoint(
         &{
             let mut spec = Spec::new(Storage::Files);
@@ -358,37 +414,21 @@ fn no_cache_is_written_after_a_partial_build() {
         },
         &dir,
     );
-    let idx = load_index(&dir, false, &mut |_| {}).unwrap();
-    assert!(!idx.has_load_errors());
+    let before: BTreeSet<_> = std::fs::read_dir(&*dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    let mut app = App::open(dir.to_path_buf(), options(), |_| {}).unwrap();
+    app.wait_for_count();
+    let counts = flink_explorer::tui::counts::load(&cache, &dir).expect("complete counts cached");
+    assert_eq!(counts.values().copied().collect::<Vec<_>>(), [KEYS]);
+    let after: BTreeSet<_> = std::fs::read_dir(&*dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
     assert_eq!(
-        idx.operators[0].keyed_state.as_ref().unwrap().total_keys,
-        KEYS
-    );
-    assert!(dir.join(CACHE_FILE_NAME).exists());
-}
-
-#[test]
-fn no_cache_neither_reads_nor_writes_the_cache() {
-    let (dir, files) = savepoint("cache-flag");
-    load_index(&dir, true, &mut |_| {}).unwrap();
-    assert!(
-        !dir.join(CACHE_FILE_NAME).exists(),
-        "--no-cache wrote a cache"
-    );
-
-    // Without the flag the complete index is cached ...
-    load_index(&dir, false, &mut |_| {}).unwrap();
-    let cached = std::fs::read(dir.join(CACHE_FILE_NAME)).expect("cache written");
-
-    // ... and with it, that cache is not read: a file removed since shows up as an error, which
-    // the cached index (built while the file was there) would not have.
-    std::fs::remove_file(&files[0]).unwrap();
-    let idx = load_index(&dir, true, &mut |_| {}).unwrap();
-    assert!(idx.has_load_errors(), "--no-cache read the cache");
-    assert_eq!(
-        std::fs::read(dir.join(CACHE_FILE_NAME)).unwrap(),
-        cached,
-        "--no-cache rewrote the cache"
+        before, after,
+        "a file was written into the savepoint directory"
     );
 }
 
@@ -455,10 +495,10 @@ fn an_absolute_file_handle_is_read_through_its_file_scheme() {
     spec.operators.push(synth::sample_operator(50));
     let dir = synth::temp_dir("absolute");
     synth::write_savepoint(&spec, &dir);
-    let index = index(&dir);
-    let op = &index.operators[0];
-    assert!(op.load_errors.is_empty(), "{:?}", op.load_errors);
-    assert_eq!(op.keyed_state.as_ref().unwrap().total_keys, 50);
+    let (_, ks) = index(&dir);
+    let ks = ks.unwrap();
+    assert!(ks.errors.is_empty(), "{:?}", ks.errors);
+    assert_eq!(ks.keys.len(), 50);
     let sp = parser::parse_metadata(&dir.join("_metadata")).unwrap();
     let mut out = Vec::new();
     let stats = export_state_ndjson(&sp, &dir, None, "counter", None, &mut out).unwrap();
@@ -497,8 +537,8 @@ fn a_cut_file_is_caught_by_its_key_group_offsets_even_without_a_state_size() {
     std::fs::write(&meta_path, &meta).unwrap();
     truncate_to_half(&files[1]);
 
-    let idx = index(&dir);
-    let errs = &idx.operators[0].load_errors;
+    let (_, ks) = index(&dir);
+    let errs = &ks.unwrap().errors;
     assert!(
         errs.iter()
             .any(|e| e.contains(files[1].to_str().unwrap()) && e.contains("truncated: key-group")),

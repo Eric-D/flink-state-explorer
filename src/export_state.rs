@@ -1,9 +1,9 @@
 //! Streaming export of a **single** keyed state, with a memory footprint bounded by the largest
 //! key-group rather than by the size of the savepoint.
 //!
-//! This path deliberately bypasses [`crate::index`]: the index cache holds every key and every
-//! raw value in memory (and serialises all of it to disk), which is fine for browsing a savepoint
-//! in the TUI but not for a state measured in gigabytes. Here we instead:
+//! This path is separate from [`crate::reader`] (which the TUI browses with, a page of keys at a
+//! time, every state of each key): exporting one state of a savepoint measured in gigabytes
+//! needs none of the other states' bytes decoded. Here we instead:
 //!
 //! 1. read only the **header** of each subtask's keyed stream (it ends where the first key-group
 //!    begins) to resolve the state's id, type, value serializer and POJO layout;
@@ -406,7 +406,7 @@ pub fn export_state_rows<S: RowSink + ?Sized>(
                     }
                     // A MAP state stores **one key-group entry per map entry**, with the user map
                     // key in the namespace and the value wrapped by NullableSerializer — it is
-                    // not the blob `index::builder` assembles per key. So a map exports exploded,
+                    // not one blob per key. So a map exports exploded,
                     // one row per entry, which is also what keeps rows bounded when a single key
                     // holds millions of entries.
                     let (map_key, value) = decode_entry_value(
