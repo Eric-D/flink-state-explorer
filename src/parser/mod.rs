@@ -1,5 +1,6 @@
 pub mod java_deser;
 pub mod kafka;
+pub mod key_group;
 pub mod keyed_state;
 pub mod metadata;
 pub mod operator_state;

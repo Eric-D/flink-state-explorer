@@ -18,4 +18,4 @@ Thumbs.db
 tests/fixtures/savepoint-*
 .claude/
 *.proto
-config/
+config//target-*/

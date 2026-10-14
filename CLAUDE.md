@@ -165,6 +165,97 @@ plausible half key set.
   truncates a previous one. Operator-state files go through the same checks (`read_whole_stream`):
   a missing or truncated one gives an `[error: <path>: …]` element, never a placeholder.
 
+## StateReader: random access by key-group (`src/reader`)
+
+`reader::StateReader` is the lazy core the web UI (#22/#23) and the TUI migration (#24) build on.
+`StateReader::open(dir)` parses `_metadata` and nothing else; `new(&savepoint, dir)` borrows one
+already parsed. The first call on an operator opens and checks each subtask's keyed stream (#16's
+`state_file::open`) and resolves its **header** once (`SubtaskHeader`; state ids are per subtask),
+one file at a time. Blocks are then read positionally (`read_exact_at` on Unix, `seek_read` on
+Windows, `reader/source.rs`) through a `FilePool` of at most `DEFAULT_OPEN_FILES` (64,
+`with_open_files`) handles, least recently used closed first — never reopened per key-group.
+Inline `ByteStreamStateHandle` bytes are borrowed from `_metadata`, never copied. Then every call
+reads whole key-group blocks located by `KeyGroupsStateHandle.offsets`, nothing more:
+
+- `operators() -> Vec<OperatorInfo>` (metadata only), `operator_index(op)` (hex id or unique
+  prefix; every call takes `op` as that string), `states(op) -> KeyedStates` (key type; name, type,
+  value type, value class, subtask count per state; `errors` naming unreadable files and
+  unsupported handles);
+- `key_page(op, &cursor, limit) -> KeyPage { keys, next, stats, malformed, unreadable }`
+  (`limit` 0 is taken as 1): each `KeyRecord` has the key, absolute key-group, subtask, its own
+  `position`, its entries (`StateEntry`: state, types — `Arc<str>`, shared, not cloned per entry —
+  `map_key`, raw namespace, raw value, decoded `value`) and `truncated`. MAP states are one entry
+  per map entry (`decode_map_entry`), everything else goes through `decode_state_value`
+  (`reader::decode_entry_value`, shared with the export). **Records are bounded**: at most
+  `DEFAULT_ENTRY_LIMIT` (1000, `with_entry_limit`) entries per state per key; a state cut there is
+  listed in `truncated` (`Truncated { state, total, returned }`), and
+  `entries(op, &position, state, offset, limit) -> EntryPage { entries, total, next, .. }` pages
+  through all of a key's entries of one state;
+- `get(op, key_text) -> Lookup::{Found{record, stats, malformed}, Absent{key_group, subtask},
+  NeedsScan{reason}}`: `parser::key_group::JavaKey` parses the text for String/Long/Int/Short/
+  Byte/Char/Boolean/Float/Double/BigInteger/Date/LocalDate/Tuple keys, computes Java's
+  `hashCode()` (Date/LocalDate verified against JDK 21 output) and Flink's key-group, serializes
+  the key and renders it through `decode_key` (so it is compared exactly as the parser renders
+  keys), and reads that one block. An empty key-group (offset 0) answers `Absent` with zero I/O.
+  POJO/Kryo/opaque/Timestamp keys answer `NeedsScan`, and so does a tuple key whose class (read
+  from `TupleSerializerSnapshot`, `extract_key_tuple_classes`) is not Flink's own
+  `org.apache.flink.api.java.tuple.TupleN` — a user subclass may override `hashCode()`;
+- `scan(op, &cursor, byte_budget, &mut |key| bool) -> ScanPage { matches, next, .., unreadable }`:
+  whole blocks until their stored size reaches the budget (at least one block per call), at most
+  `DEFAULT_SCAN_MATCH_LIMIT` (1000, `with_scan_match_limit`) matches per call (it stops mid-block,
+  `next` at the following key).
+
+**Errors** are `reader::ReaderError` (`Display`, `std::error::Error`, `From<ReaderError> for
+String` so `?` into `String` still works): `Metadata`, `UnknownOperator`/`NoKeyedState`/`NotFound`
+(404), `AmbiguousOperator`/`BadCursor` (400), `Unreadable{subtask, first_key_group,
+last_key_group, what, error}`/`Malformed{..}` (500). `Cursor::from_str` still errs with a `String`.
+
+**String keys are rendered injectively** (`parser::value::key_string`, used by `decode_key` for a
+`String` key or tuple field): a Java string may hold a lone surrogate, which used to become U+FFFD
+and merge distinct keys (and make `get` hash the wrong text). Such a string, or one containing a
+literal `\u`, renders escaped — lone surrogate `\uXXXX`, backslash `\\` — and every other string as
+itself; escaped texts always contain `\u` and plain ones never do. `parse_key_string` inverts it
+(`JavaKey::Utf16` holds the units). Values keep their rendering (U+FFFD). `CACHE_FORMAT` 8.
+
+**Order and cursor.** Ascending absolute key-group (= subtask order), and inside a block the order
+in which each key first appears on disk. `Cursor { subtask, key_group, ordinal }`, string form
+`subtask.keygroup.ordinal` (`1.64.17`), `Cursor::START` = `0.0.0`; a cursor whose key-group belongs
+to another subtask is refused. Paging skips empty key-groups using the offsets alone, so `next` is
+`None` as soon as no non-empty key-group remains.
+
+**Never stuck, never silent.** What cannot be read is reported in the page and **skipped**: a
+subtask whose file is missing/short/unreadable, whose header does not parse, or whose keyed handle
+is not a key-groups one (incremental RocksDB, changelog: an `unsupported keyed handle …`
+`FailedSubtask`, never silently skipped) is one `Unreadable` covering its key-groups from where the
+page reached it; a block that cannot be read or inflated is one `Unreadable` for that key-group.
+`next` moves past them and the keys already gathered are kept — a page used to return `Err` at the
+same cursor forever. `get` for a key owned by such a unit is `Err(Unreadable)`, never `Absent`. A
+malformed block (`BlockDefect`) keeps the keys read before the defect and is listed in
+`malformed`; `get` that finds the key there says so in `Found.malformed` (the key may have more
+entries past the defect), and one that misses there is `Err(Malformed)`.
+
+**Memory and speed.** One block in flight + an LRU cache of **parsed, grouped** blocks bounded by
+approximate weight (`DEFAULT_CACHE_BYTES` 8 MiB, `with_cache_bytes`; a scan does not fill it) +
+the page asked for. A block heavier than the whole cache is still kept, alone, so paging through
+it does not re-read and re-parse it per page (the cache then holds just that block). Compressed
+key-groups are inflated per block. Every result carries `ReadStats` (blocks, cache hits,
+`bytes_read` from storage, `block_bytes`, `max_block_bytes`). `StateReader<'static>` is
+`Send + Sync`. `export_state_rows` / `list_states` are clients of the same `OpContext` /
+`block_range` / `read_block` / `decode_entry_value` (uncached contexts; the export keeps its own
+handle per stream and drops each subtask's stream once exported, so it holds one file at a time).
+
+**Measured** on `savepoint-big` (211 MB, 1M keys, 2 files, release): paging all 1M keys with all
+their states, 10 000 per page, 3.0 s with the test's own checks, 210.9 MB read (each block once),
+peak RSS 38 MB; 50-key pages 0.15 ms each (each key-group read and parsed once for its ~150
+pages; it was 9.5 ms when every page re-parsed its block); a cold `get` reads one 1.65 MB
+key-group in ~12 ms (`tests/state_reader_big_test.rs`). `--export-state` is unchanged: same bytes,
+same time, ~5 MB.
+
+**Limits.** A key's position is only stable for an unchanged savepoint; a key that has several
+windows has one entry per window (namespace bytes kept raw); `get` cannot locate POJO keys (their
+`hashCode()` is user code) — scan for them. MAP *keys* inside values still render lone surrogates
+as U+FFFD.
+
 ## TUI: key cap, text, terminal
 
 - **Key cap.** The index (`src/index/builder.rs`) stores at most `MAX_STORED_PARTITIONS` (100 000)
@@ -457,10 +548,12 @@ source** (branch `release-1.20`, https://github.com/apache/flink) rather than gu
   `tests/synth_savepoint_test.rs`, `tests/operator_state_test.rs`, `tests/key_types_test.rs` and
   `tests/keyed_block_test.rs` are the fixture-free home for file-backed / multi-subtask /
   compressed, operator-state, key-type and block-level cases, `tests/tui_*_test.rs` for the TUI
-  over ratatui's `TestBackend`), so the fixture-dependent ones
+  over ratatui's `TestBackend`, `tests/state_reader_test.rs` and `tests/key_group_test.rs` for the
+  reader and the key-group assignment), so the fixture-dependent ones
   (`gitlab_savepoint_test`, `decode_e2e_test`, `coverage_audit`, `export_state_stream_test`,
   `key_group_assignment_test`, `compressed_savepoint_test`, `export_parquet_test`,
-  `tui_gitlab_parity_test`) only ever run locally.
+  `tui_gitlab_parity_test`, `state_reader_fixture_test`, `state_reader_big_test`) only ever run
+  locally.
 - `tests/tui_parity_test.rs` (CI) — every (key, state) of a synthetic savepoint (`Map<String,String>`
   with a null value and a comma, `Map<String,Long>`, `Map<Enum,Boolean>`, `List<Long>` with 0x2c
   bytes in the values, `List<String>`, `byte[]`, `int[]`, `Byte`, `Tuple2`, `Char`, `Long`,
@@ -510,8 +603,27 @@ source** (branch `release-1.20`, https://github.com/apache/flink) rather than gu
   1M elements index in well under a second (release; 200k in debug) and time grows linearly.
   Locally it also checks synth's operator streams byte for byte against both real fixtures.
 - `tests/key_group_assignment_test.rs` — the reported key-group is the one Flink assigned
-  (ported `MathUtils.murmurHash` + `KeyGroupRangeAssignment`), and every streamed row falls inside
-  its subtask's range. POJO keys are range-checked only: their `hashCode()` is user code.
+  (`parser::key_group`: `MathUtils.murmurHash` + `KeyGroupRangeAssignment`), and every streamed row
+  falls inside its subtask's range. POJO keys are range-checked only: their `hashCode()` is user
+  code.
+- `tests/key_group_test.rs` (CI) — `parser::key_group` against `hashCode()`s and key-groups printed
+  by Java itself, and against synth's independent port on every key type (incl. NaN, ±∞, lone
+  surrogates, 128-bit BigIntegers), with `JavaKey` serializing to synth's exact bytes.
+- `tests/state_reader_test.rs` (CI) — `StateReader` on synth savepoints (inline, compressed,
+  relative and absolute files; 3 and 4 subtasks; maxParallelism 128 and 4096; per-subtask state
+  ids): paging visits every key once and equals `export_state_rows` row for row; `get` finds
+  every key reading exactly its block's stored bytes; absent keys in empty key-groups cost 0
+  bytes; 1-byte-budget scans resume without duplicates or misses; cursors round-trip; every
+  hashable key type (Date/LocalDate included); NeedsScan (also for a user tuple class); a deleted
+  file, a block that does not inflate and an incremental keyed handle are each reported once in
+  the pages, which go on past them, and are an `Err(Unreadable)` for `get`; `Found` in a
+  malformed block carries `malformed`; a key with 5 000 MAP entries is bounded at the entry limit
+  and continued by `entries`; lone-surrogate String keys stay distinct and round-trip through
+  `get` (alone and in a tuple); `limit` 0; the open-file bound; concurrent `get`s.
+- `tests/state_reader_fixture_test.rs` — the same parity on `savepoint-gitlab` and
+  `savepoint-compressed` (real Flink key-group assignment: 675 keys found by `get`, 5 POJO keys
+  by scan). `tests/state_reader_big_test.rs` — `savepoint-big` if present (skipped otherwise):
+  every key reachable, bounded RSS, timings with `--release -- --nocapture`.
 - `tests/export_state_stream_test.rs` — streaming export: strict parity with the full JSON export
   for every non-MAP state, exploded parity for MAP states, the `v6`/compression header, the
   bounded peak block, and no key-group of a real fixture (plain or compressed) reported malformed

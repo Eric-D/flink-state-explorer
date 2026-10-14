@@ -1375,6 +1375,50 @@ fn extract_key_serializer_type(data: &[u8]) -> String {
     base
 }
 
+/// The tuple classes of a `Tuple` key serializer, outermost first and nested tuple fields
+/// included; empty for any other key serializer (or one that does not parse).
+///
+/// `TupleSerializerSnapshot` (flink-core `java/typeutils/runtime/TupleSerializerSnapshot.java`,
+/// release-1.20) is a `CompositeTypeSerializerSnapshot`: after its class name and snapshot version
+/// come `MAGIC_NUMBER` (911108) and the outer snapshot version (`CompositeTypeSerializerSnapshot
+/// .writeSnapshot`), then its outer snapshot, `writeUTF(tupleClass.getName())` (:78-81). The class
+/// matters: Flink's `TupleN` hash their fields, but a user subclass may override `hashCode()`.
+pub(crate) fn extract_key_tuple_classes(data: &[u8]) -> Vec<String> {
+    const SNAPSHOT: &[u8] = b"org.apache.flink.api.java.typeutils.runtime.TupleSerializerSnapshot";
+    const POS: usize = 5;
+    if data.len() < POS + 8 {
+        return Vec::new();
+    }
+    let mut r = crate::parser::java_deser::JavaReader::new(&data[POS..]);
+    if crate::parser::pojo::read_serializer_snapshot_type(&mut r).is_none() {
+        return Vec::new();
+    }
+    let region = &data[POS..POS + r.position() as usize];
+    let mut needle = (SNAPSHOT.len() as u16).to_be_bytes().to_vec();
+    needle.extend_from_slice(SNAPSHOT);
+    let mut classes = Vec::new();
+    let mut at = 0;
+    while let Some(found) = region[at..]
+        .windows(needle.len())
+        .position(|w| w == needle.as_slice())
+    {
+        let after = at + found + needle.len();
+        let mut r = crate::parser::java_deser::JavaReader::new(&region[after..]);
+        let parsed = (|| {
+            let _snapshot_version = r.read_int().ok()?;
+            (r.read_int().ok()? == 911_108).then_some(())?;
+            let _outer_version = r.read_int().ok()?;
+            r.read_utf().ok()
+        })();
+        match parsed {
+            Some(class) => classes.push(class),
+            None => return Vec::new(),
+        }
+        at = after;
+    }
+    classes
+}
+
 /// The serializer a snapshot class belongs to, by exact name: the last `$`-segment of the class's
 /// simple name without its `Snapshot` suffix — `…base.IntSerializer$IntSerializerSnapshot` →
 /// `IntSerializer`, `…base.MapSerializerSnapshot` → `MapSerializer`,

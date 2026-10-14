@@ -34,7 +34,9 @@ use crate::error::IndexError;
 ///    read as `Int`.
 /// 8: operator-state elements keep their bytes again ([`ValueRef::Inline`]), for the TUI's hex
 ///    view; only an element that could not be read is [`ValueRef::Decoded`].
-pub const CACHE_FORMAT: u32 = 8;
+/// 9: a `String` key holding a lone surrogate (or a literal `\u`) renders escaped
+///    (`parser::value::key_string`) instead of with U+FFFD, so such keys no longer merge.
+pub const CACHE_FORMAT: u32 = 9;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IndexCache {

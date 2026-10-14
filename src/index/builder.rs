@@ -340,7 +340,7 @@ fn operator_stream_bytes<'a>(
 ) -> Result<Cow<'a, [u8]>, String> {
     match delegate {
         StreamStateHandle::ByteStream(bs) => Ok(Cow::Borrowed(&bs.data)),
-        other => crate::export_state::read_whole_stream(other, savepoint_dir).map(Cow::Owned),
+        other => crate::reader::read_whole_stream(other, savepoint_dir).map(Cow::Owned),
     }
 }
 
