@@ -14,7 +14,8 @@ use flink_explorer::parser::key_group::{
     java_string_hash, key_group_for_hash, subtask_for_key_group,
 };
 use flink_explorer::parser::state_handle::{StateHandle, StreamStateHandle};
-use flink_explorer::reader::{Cursor, KeyRecord, Lookup, ReadStats, StateReader};
+use flink_explorer::reader::{Cursor, KeyRecord, Lookup, ReadStats, ReaderError, StateReader};
+use std::sync::Arc;
 
 const LAYOUTS: [(Storage, bool); 5] = [
     (Storage::Inline, false),
@@ -168,7 +169,7 @@ fn rows_of(keys: &[KeyRecord]) -> Vec<Row> {
         for e in &k.entries {
             let ns = (e.map_key.is_none() && e.namespace.len() > 1).then(|| hex(&e.namespace));
             rows.push((
-                e.state.clone(),
+                e.state.to_string(),
                 k.key.clone(),
                 e.map_key.clone(),
                 e.value.to_string(),
@@ -291,7 +292,7 @@ fn get_finds_every_key_reading_one_block() {
             let (keys, _) = page_all(&r, &id, usize::MAX);
             for k in &keys {
                 match r.get(&id, &k.key).unwrap() {
-                    Lookup::Found { record, stats } => {
+                    Lookup::Found { record, stats, .. } => {
                         assert_eq!(&record, k);
                         assert_eq!(stats.blocks, 1);
                         assert_eq!(stats.cache_hits, 0);
@@ -475,7 +476,7 @@ fn a_cursor_of_another_subtask_is_refused() {
         ordinal: 0,
     };
     let e = r.key_page(&op.id_hex(), &bad, 10).unwrap_err();
-    assert!(e.contains("held by subtask 0"), "{}", e);
+    assert!(e.to_string().contains("held by subtask 0"), "{}", e);
 }
 
 /// Each key type with a known `hashCode()` is found by its rendered text, on keys written with
@@ -629,7 +630,12 @@ fn an_unreadable_file_is_an_error_naming_it_never_an_absent_key() {
         let got = r.get(&id, &text);
         if (lost_kgs.0..=lost_kgs.1).contains(&kg) {
             let e = got.unwrap_err();
-            assert!(e.contains(&lost_name), "{}", e);
+            assert!(e.to_string().contains(&lost_name), "{}", e);
+            assert!(
+                matches!(&e, ReaderError::Unreadable { subtask: 1, .. }),
+                "{:?}",
+                e
+            );
             seen_lost = true;
         } else if (kept_kgs.0..=kept_kgs.1).contains(&kg) {
             assert!(matches!(got.unwrap(), Lookup::Found { .. }));
@@ -637,21 +643,575 @@ fn an_unreadable_file_is_an_error_naming_it_never_an_absent_key() {
     }
     assert!(seen_lost);
 
-    // Paging stops before the broken subtask, then reports it.
+    // Paging reports the broken subtask once, in the page that reaches it, and goes on past it
+    // to subtask 2, keeping every key it read.
+    let expected: BTreeSet<String> = expected_keys(&op)
+        .into_iter()
+        .filter(|k| {
+            let kg = key_group_for_hash(java_string_hash(k), 128);
+            !(lost_kgs.0..=lost_kgs.1).contains(&kg)
+        })
+        .collect();
     let mut cursor = Cursor::START;
-    let err = loop {
-        match r.key_page(&id, &cursor, 50) {
-            Ok(page) => {
-                assert!(page.keys.iter().all(|k| k.subtask == 0));
-                cursor = page
-                    .next
-                    .expect("the broken subtask is reported, not skipped");
-            }
-            Err(e) => break e,
+    let mut keys = BTreeSet::new();
+    let mut unreadable = Vec::new();
+    for _ in 0..1000 {
+        let page = r.key_page(&id, &cursor, 50).unwrap();
+        assert!(page.keys.len() <= 50);
+        keys.extend(page.keys.iter().map(|k| k.key.clone()));
+        unreadable.extend(page.unreadable);
+        match page.next {
+            Some(n) => cursor = n,
+            None => break,
         }
+    }
+    assert_eq!(keys, expected);
+    assert_eq!(unreadable.len(), 1, "{:?}", unreadable);
+    let u = &unreadable[0];
+    assert_eq!(u.subtask, 1);
+    assert_eq!(
+        (u.first_key_group as i32, u.last_key_group as i32),
+        lost_kgs
+    );
+    assert!(u.error.contains(&lost_name), "{}", u.error);
+
+    // So does a scan, whatever its budget.
+    for budget in [1, u64::MAX] {
+        let mut cursor = Cursor::START;
+        let mut found = BTreeSet::new();
+        let mut unreadable = Vec::new();
+        loop {
+            let page = r.scan(&id, &cursor, budget, &mut |_| true).unwrap();
+            found.extend(page.matches.iter().map(|k| k.key.clone()));
+            unreadable.extend(page.unreadable);
+            match page.next {
+                Some(n) => cursor = n,
+                None => break,
+            }
+        }
+        assert_eq!(found, expected);
+        assert_eq!(unreadable.len(), 1);
+    }
+}
+
+/// A block that cannot be inflated is one unreadable key-group: the page reports it and moves on
+/// to the next key-group, and `get` of a key it holds is an error, never `Absent`.
+#[test]
+fn paging_moves_past_a_block_that_does_not_inflate() {
+    let op = three_subtasks(300);
+    let dir = synth::temp_dir("reader-bad-snappy");
+    let written = synth::write_savepoint(
+        &spec_with(std::slice::from_ref(&op), Storage::Files, true),
+        &dir,
+    );
+    let r0 = reader(&dir);
+    let id = op.id_hex();
+    let (all, _) = page_all(&r0, &id, usize::MAX);
+    drop(r0);
+    // Corrupt the first non-empty key-group of subtask 0: overwrite its Snappy stream identifier.
+    let parsed = parser::parse_metadata(&dir.join("_metadata")).unwrap();
+    let StateHandle::KeyGroups(kg) = &parsed.operators[0].subtask_states[0].managed_keyed_state
+    else {
+        panic!("key-groups handle")
     };
-    assert!(err.contains(&lost_name), "{}", err);
-    assert_eq!(cursor.subtask, 1);
+    let (rel, off) = kg
+        .offsets
+        .iter()
+        .enumerate()
+        .find(|(_, &o)| o > 0)
+        .map(|(i, &o)| (i, o))
+        .unwrap();
+    let bad_kg = kg.start_key_group as u16 + rel as u16;
+    let path = &written.state_files.iter().find(|f| f.1 == 0).unwrap().2;
+    let mut bytes = std::fs::read(path).unwrap();
+    for b in &mut bytes[off as usize..off as usize + 4] {
+        *b = 0xEE;
+    }
+    std::fs::write(path, &bytes).unwrap();
+
+    let r = reader(&dir);
+    let expected: BTreeSet<String> = all
+        .iter()
+        .filter(|k| k.key_group != bad_kg)
+        .map(|k| k.key.clone())
+        .collect();
+    let mut cursor = Cursor::START;
+    let mut keys = BTreeSet::new();
+    let mut unreadable = Vec::new();
+    loop {
+        let page = r.key_page(&id, &cursor, 7).unwrap();
+        keys.extend(page.keys.iter().map(|k| k.key.clone()));
+        unreadable.extend(page.unreadable);
+        match page.next {
+            Some(n) => cursor = n,
+            None => break,
+        }
+    }
+    assert_eq!(keys, expected);
+    assert_eq!(unreadable.len(), 1, "{:?}", unreadable);
+    assert_eq!(
+        (unreadable[0].first_key_group, unreadable[0].last_key_group),
+        (bad_kg, bad_kg)
+    );
+    assert!(unreadable[0].error.contains("snappy"), "{:?}", unreadable);
+
+    let lost = all.iter().find(|k| k.key_group == bad_kg).unwrap();
+    match r.get(&id, &lost.key) {
+        Err(ReaderError::Unreadable {
+            first_key_group, ..
+        }) => assert_eq!(first_key_group, bad_kg),
+        other => panic!("{:?}", other),
+    }
+}
+
+/// A key found in a block whose end is malformed is `Found`, with the defect reported, and a key
+/// that would come after the defect is an error rather than `Absent`.
+#[test]
+fn a_key_found_in_a_malformed_block_says_so() {
+    let mut op = KeyedOperator::new(0x51, 1, 128, Ser::String)
+        .state("v", Kind::Value(Ser::Long))
+        .state("m", Kind::Map(Ser::Int, Ser::Long));
+    // Many keys that share one key-group, so the block holds several of them.
+    let target = key_group_for_hash(java_string_hash("k0"), 128);
+    let names: Vec<String> = (0..20_000)
+        .map(|i| format!("k{}", i))
+        .filter(|k| key_group_for_hash(java_string_hash(k), 128) == target)
+        .take(6)
+        .collect();
+    for (i, k) in names.iter().enumerate() {
+        op.items.push(Item::Value {
+            state: 0,
+            key: Val::str(k),
+            value: Val::Long(i as i64),
+        });
+        op.items.push(Item::MapEntry {
+            state: 1,
+            key: Val::str(k),
+            map_key: Val::Int(i as i32),
+            value: Some(Val::Long(1)),
+        });
+    }
+    let mut spec = spec_with(std::slice::from_ref(&op), Storage::Files, false);
+    spec.run_order = RunOrder::Ascending;
+    let dir = synth::temp_dir("reader-malformed");
+    let written = synth::write_savepoint(&spec, &dir);
+    // Cut the stream inside the last run: the VALUE run (state 0) is whole, the MAP run is not.
+    let path = &written.state_files[0].2;
+    let bytes = std::fs::read(path).unwrap();
+    let parsed = parser::parse_metadata(&dir.join("_metadata")).unwrap();
+    let StateHandle::KeyGroups(kg) = &parsed.operators[0].subtask_states[0].managed_keyed_state
+    else {
+        panic!("key-groups handle")
+    };
+    let start = kg.offsets[target as usize] as usize;
+    // Truncate the block's last 12 bytes (the end mark and part of the last map entry), but keep
+    // the file as long as the handle says, by zero-padding: the block itself is malformed.
+    let end = bytes.len();
+    let mut cut = bytes.clone();
+    for b in &mut cut[end - 12..] {
+        *b = 0;
+    }
+    assert!(start < end - 12);
+    std::fs::write(path, &cut).unwrap();
+
+    let r = reader(&dir);
+    let id = op.id_hex();
+    let mut found_malformed = 0;
+    for k in &names {
+        match r.get(&id, k) {
+            Ok(Lookup::Found {
+                record, malformed, ..
+            }) => {
+                assert!(record.entries.iter().any(|e| &*e.state == "v"));
+                if !malformed.is_empty() {
+                    found_malformed += 1;
+                }
+            }
+            Err(ReaderError::Malformed { key, .. }) => assert_eq!(&key, k),
+            other => panic!("{}: {:?}", k, other),
+        }
+    }
+    // Every key has its VALUE entry before the defect, so all are found, and all say so.
+    assert_eq!(found_malformed, names.len());
+}
+
+#[test]
+fn a_zero_limit_page_still_moves() {
+    let op = three_subtasks(40);
+    let dir = write(
+        &spec_with(std::slice::from_ref(&op), Storage::Inline, false),
+        "reader-zero",
+    );
+    let r = reader(&dir);
+    let id = op.id_hex();
+    let mut cursor = Cursor::START;
+    let mut keys = BTreeSet::new();
+    for _ in 0..1000 {
+        let page = r.key_page(&id, &cursor, 0).unwrap();
+        assert_eq!(page.keys.len(), 1);
+        assert!(keys.insert(page.keys[0].key.clone()));
+        match page.next {
+            Some(n) => cursor = n,
+            None => break,
+        }
+    }
+    assert_eq!(keys, expected_keys(&op));
+}
+
+/// A key with far more MAP entries than the entry limit: its record is bounded and says how many
+/// there are, and `entries` pages through the rest, agreeing with an unbounded reader.
+#[test]
+fn a_key_with_many_map_entries_is_bounded_and_continued() {
+    let mut op = KeyedOperator::new(0x52, 2, 128, Ser::String)
+        .state("count", Kind::Value(Ser::Long))
+        .state("big", Kind::Map(Ser::Int, Ser::Long));
+    for i in 0..5_000 {
+        op.items.push(Item::MapEntry {
+            state: 1,
+            key: Val::str("hot"),
+            map_key: Val::Int(i),
+            value: Some(Val::Long(i as i64 * 3)),
+        });
+    }
+    for k in ["hot", "cold"] {
+        op.items.push(Item::Value {
+            state: 0,
+            key: Val::str(k),
+            value: Val::Long(7),
+        });
+    }
+    for layout in [(Storage::Inline, false), (Storage::Files, true)] {
+        let dir = write(
+            &spec_with(std::slice::from_ref(&op), layout.0, layout.1),
+            "reader-many",
+        );
+        let id = op.id_hex();
+        let r = reader(&dir).with_entry_limit(100);
+        let Lookup::Found { record, .. } = r.get(&id, "hot").unwrap() else {
+            panic!("hot is there")
+        };
+        assert_eq!(record.entries.len(), 101, "100 map entries + the value");
+        assert!(record.is_truncated());
+        assert_eq!(record.truncated.len(), 1);
+        assert_eq!(&*record.truncated[0].state, "big");
+        assert_eq!(
+            (record.truncated[0].total, record.truncated[0].returned),
+            (5_000, 100)
+        );
+        // Paging hands out the same bounded record.
+        let (paged, _) = page_all(&r, &id, 1);
+        let hot = paged.iter().find(|k| k.key == "hot").unwrap();
+        assert_eq!(hot, &record);
+        assert!(!paged
+            .iter()
+            .find(|k| k.key == "cold")
+            .unwrap()
+            .is_truncated());
+
+        // The continuation, page by page, equals the unbounded record's entries.
+        let full = reader(&dir).with_entry_limit(usize::MAX);
+        let Lookup::Found { record: all, .. } = full.get(&id, "hot").unwrap() else {
+            panic!()
+        };
+        assert!(!all.is_truncated());
+        let want: Vec<_> = all.entries.iter().filter(|e| &*e.state == "big").collect();
+        assert_eq!(want.len(), 5_000);
+        let mut got = Vec::new();
+        let mut offset = Some(0);
+        while let Some(o) = offset {
+            let page = r.entries(&id, &record.position, "big", o, 777).unwrap();
+            assert_eq!(page.total, 5_000);
+            assert_eq!(page.key, "hot");
+            assert!(page.entries.len() <= 777);
+            got.extend(page.entries);
+            offset = page.next;
+        }
+        assert_eq!(got.iter().collect::<Vec<_>>(), want);
+        // The labels are shared, not copied per entry.
+        assert!(Arc::ptr_eq(&got[0].state, &got[4_999].state));
+        // Other states and positions.
+        let v = r.entries(&id, &record.position, "count", 0, 10).unwrap();
+        assert_eq!((v.total, v.entries.len(), v.next), (1, 1, None));
+        assert!(matches!(
+            r.entries(&id, &record.position, "nope", 0, 10),
+            Err(ReaderError::NotFound { .. })
+        ));
+        let mut past = record.position;
+        past.ordinal += 1_000;
+        assert!(matches!(
+            r.entries(&id, &past, "big", 0, 10),
+            Err(ReaderError::NotFound { .. })
+        ));
+
+        // A scan's matches are capped too.
+        let r = reader(&dir).with_scan_match_limit(1);
+        let page = r
+            .scan(&id, &Cursor::START, u64::MAX, &mut |_| true)
+            .unwrap();
+        assert_eq!(page.matches.len(), 1);
+        let rest = r
+            .scan(&id, &page.next.unwrap(), u64::MAX, &mut |_| true)
+            .unwrap();
+        assert_eq!(rest.matches.len(), 1);
+        assert_ne!(rest.matches[0].key, page.matches[0].key);
+    }
+}
+
+/// String keys holding lone surrogates (valid Java strings, impossible Rust ones) stay distinct
+/// and round-trip through `get`, alone and inside a tuple; a literal `\u` too.
+#[test]
+fn lone_surrogate_string_keys_round_trip_through_get() {
+    let raw_keys: Vec<Vec<u16>> = vec![
+        vec![0x78, 0xD800],                  // "x" + lone high surrogate
+        vec![0x78, 0xDC00],                  // "x" + lone low surrogate
+        vec![0x78, 0xFFFD],                  // "x" + U+FFFD itself
+        "x\\uD800".encode_utf16().collect(), // a literal backslash-u
+        "x\\\\uD800".encode_utf16().collect(),
+        vec![0xD83D, 0xDE00], // a real pair (an emoji)
+        "plain".encode_utf16().collect(),
+    ];
+    let mut op = KeyedOperator::new(0x53, 2, 128, Ser::String).state("v", Kind::Value(Ser::Long));
+    let mut tuple_op = KeyedOperator::new(0x54, 1, 128, Ser::Tuple(&[Ser::String, Ser::Long]))
+        .state("v", Kind::Value(Ser::Long));
+    for (i, units) in raw_keys.iter().enumerate() {
+        op.items.push(Item::Value {
+            state: 0,
+            key: Val::Utf16(units.clone()),
+            value: Val::Long(i as i64),
+        });
+        tuple_op.items.push(Item::Value {
+            state: 0,
+            key: Val::Tuple(vec![Val::Utf16(units.clone()), Val::Long(1)]),
+            value: Val::Long(i as i64),
+        });
+    }
+    let dir = write(
+        &spec_with(&[op.clone(), tuple_op.clone()], Storage::Inline, false),
+        "reader-surrogates",
+    );
+    let r = reader(&dir);
+    for o in [&op, &tuple_op] {
+        let id = o.id_hex();
+        let (keys, _) = page_all(&r, &id, usize::MAX);
+        assert_eq!(keys.len(), raw_keys.len(), "distinct keys stay distinct");
+        let rendered: BTreeSet<&str> = keys.iter().map(|k| k.key.as_str()).collect();
+        assert_eq!(rendered.len(), raw_keys.len());
+        for k in &keys {
+            match r.get(&id, &k.key).unwrap() {
+                Lookup::Found { record, .. } => assert_eq!(record.key, k.key),
+                other => panic!("{:?}: {:?}", k.key, other),
+            }
+        }
+    }
+    let (keys, _) = page_all(&r, &op.id_hex(), usize::MAX);
+    let rendered: BTreeSet<&str> = keys.iter().map(|k| k.key.as_str()).collect();
+    for want in [
+        "x\\uD800",
+        "x\\uDC00",
+        "x\u{FFFD}",
+        "x\\\\uD800",
+        "x\\\\\\\\uD800",
+        "\u{1F600}",
+        "plain",
+    ] {
+        assert!(rendered.contains(want), "{:?} not in {:?}", want, rendered);
+    }
+}
+
+/// An incremental (or changelog) keyed handle is reported as unreadable, never as a subtask
+/// without state.
+#[test]
+fn an_incremental_keyed_handle_is_reported() {
+    use flink_explorer::parser::state_handle::IncrementalRemoteKeyedStateHandle;
+    let op = three_subtasks(300);
+    let dir = write(
+        &spec_with(std::slice::from_ref(&op), Storage::Inline, false),
+        "reader-incremental",
+    );
+    let mut savepoint = parser::parse_metadata(&dir.join("_metadata")).unwrap();
+    let st = &mut savepoint.operators[0].subtask_states[1];
+    let StateHandle::KeyGroups(kg) = &st.managed_keyed_state else {
+        panic!("key-groups handle")
+    };
+    let (start, num) = (kg.start_key_group, kg.num_key_groups);
+    st.managed_keyed_state =
+        StateHandle::IncrementalRemoteKeyed(IncrementalRemoteKeyedStateHandle {
+            start_key_group: start,
+            num_key_groups: num,
+            checkpoint_id: 1,
+            backend_id: "backend".to_string(),
+            checkpointed_size: 0,
+            meta_state_handle: StreamStateHandle::Null,
+            shared_state: Vec::new(),
+            private_state: Vec::new(),
+        });
+    let r = StateReader::from_savepoint(savepoint, &dir);
+    let id = op.id_hex();
+    assert_eq!(r.operators()[0].keyed_subtasks, 3);
+    let states = r.states(&id).unwrap();
+    assert_eq!(states.errors.len(), 1);
+    assert!(
+        states.errors[0].contains("unsupported keyed handle"),
+        "{:?}",
+        states.errors
+    );
+    let (lost_kgs, mut seen) = (synth::range_for_subtask(128, 3, 1), false);
+    for i in 0..300 {
+        let text = format!("key-{:07}", i);
+        let kg = key_group_for_hash(java_string_hash(&text), 128);
+        if (lost_kgs.0..=lost_kgs.1).contains(&kg) {
+            match r.get(&id, &text) {
+                Err(ReaderError::Unreadable {
+                    subtask: 1, error, ..
+                }) => {
+                    assert!(
+                        error.contains("IncrementalRemoteKeyedStateHandle"),
+                        "{}",
+                        error
+                    );
+                    seen = true;
+                }
+                other => panic!("{:?}", other),
+            }
+        }
+    }
+    assert!(seen);
+    let mut cursor = Cursor::START;
+    let mut unreadable = Vec::new();
+    loop {
+        let page = r.key_page(&id, &cursor, 64).unwrap();
+        unreadable.extend(page.unreadable);
+        match page.next {
+            Some(n) => cursor = n,
+            None => break,
+        }
+    }
+    assert_eq!(unreadable.len(), 1);
+    assert_eq!(
+        (
+            unreadable[0].first_key_group as i32,
+            unreadable[0].last_key_group as i32
+        ),
+        lost_kgs
+    );
+}
+
+/// A user subclass of a Flink tuple may override `hashCode()`: its keys need a scan.
+#[test]
+fn a_tuple_key_of_a_user_class_needs_a_scan() {
+    let mut op = KeyedOperator::new(0x55, 1, 128, Ser::Tuple(&[Ser::String, Ser::Long]))
+        .state("v", Kind::Value(Ser::Long));
+    op.items.push(Item::Value {
+        state: 0,
+        key: Val::Tuple(vec![Val::str("a"), Val::Long(1)]),
+        value: Val::Long(1),
+    });
+    let dir = write(
+        &spec_with(std::slice::from_ref(&op), Storage::Inline, false),
+        "reader-tuple-class",
+    );
+    let text = r#"["a",1]"#;
+    assert!(matches!(
+        reader(&dir).get(&op.id_hex(), text).unwrap(),
+        Lookup::Found { .. }
+    ));
+    // Same length, so every offset stays valid.
+    let flink = b"org.apache.flink.api.java.tuple.Tuple2";
+    let user = b"com.example.myjob.keys.CustomerTuple2";
+    let user = &[&user[..], b"x"].concat();
+    assert_eq!(flink.len(), user.len());
+    let meta = dir.join("_metadata");
+    let mut bytes = std::fs::read(&meta).unwrap();
+    let at = bytes
+        .windows(flink.len())
+        .position(|w| w == flink)
+        .expect("the tuple class is in the header");
+    bytes[at..at + flink.len()].copy_from_slice(user);
+    std::fs::write(&meta, &bytes).unwrap();
+    match reader(&dir).get(&op.id_hex(), text).unwrap() {
+        Lookup::NeedsScan { reason } => assert!(reason.contains("CustomerTuple2x"), "{}", reason),
+        other => panic!("{:?}", other),
+    }
+}
+
+/// Date and LocalDate keys are located by their `hashCode()`.
+#[test]
+fn date_keys_are_found_by_get() {
+    let millis = [
+        0i64,
+        1,
+        -1,
+        1_700_000_000_123,
+        -62_135_596_800_000,
+        253_402_300_799_999,
+    ];
+    let mut op = KeyedOperator::new(0x56, 2, 128, Ser::Date).state("v", Kind::Value(Ser::Long));
+    for (i, m) in millis.iter().enumerate() {
+        op.items.push(Item::Value {
+            state: 0,
+            key: Val::Date(*m),
+            value: Val::Long(i as i64),
+        });
+    }
+    let dates = [(2024, 2, 29), (1970, 1, 1), (-5, 12, 31), (12345, 6, 7)];
+    let mut ld =
+        KeyedOperator::new(0x57, 2, 128, Ser::LocalDate).state("v", Kind::Value(Ser::Long));
+    for (i, (y, m, d)) in dates.iter().enumerate() {
+        ld.items.push(Item::Value {
+            state: 0,
+            key: Val::LocalDate(*y, *m, *d),
+            value: Val::Long(i as i64),
+        });
+    }
+    let dir = write(
+        &spec_with(&[op.clone(), ld.clone()], Storage::Files, true),
+        "reader-dates",
+    );
+    let r = reader(&dir);
+    for o in [&op, &ld] {
+        let id = o.id_hex();
+        let (keys, _) = page_all(&r, &id, usize::MAX);
+        assert_eq!(keys.len(), o.items.len());
+        for k in &keys {
+            match r.get(&id, &k.key).unwrap() {
+                Lookup::Found { record, stats, .. } => {
+                    assert_eq!(record.key, k.key);
+                    assert_eq!(stats.blocks, 1);
+                }
+                other => panic!("{:?}: {:?}", k.key, other),
+            }
+        }
+    }
+    // Epoch millis work too; a date that does not render back is refused, not normalised.
+    assert!(matches!(
+        r.get(&op.id_hex(), "1700000000123").unwrap(),
+        Lookup::Found { .. }
+    ));
+    assert!(matches!(
+        r.get(&op.id_hex(), "2020-02-30T00:00:00Z").unwrap(),
+        Lookup::NeedsScan { .. }
+    ));
+    assert!(matches!(
+        r.get(&ld.id_hex(), "2024-2-29").unwrap(),
+        Lookup::NeedsScan { .. }
+    ));
+}
+
+/// The reader holds at most its open-file limit, whatever the parallelism.
+#[test]
+fn open_files_are_bounded() {
+    let mut op = synth::sample_operator(400);
+    op.parallelism = 8;
+    let dir = write(
+        &spec_with(std::slice::from_ref(&op), Storage::Files, false),
+        "reader-fds",
+    );
+    let r = reader(&dir).with_open_files(3);
+    let id = op.id_hex();
+    let (keys, _) = page_all(&r, &id, 10);
+    assert_eq!(keys.len(), expected_keys(&op).len());
+    assert!(r.open_files() <= 3, "{}", r.open_files());
+    assert!(r.open_files() > 0);
 }
 
 #[test]

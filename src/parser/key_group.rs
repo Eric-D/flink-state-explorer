@@ -65,8 +65,30 @@ pub fn subtask_for_key_group(max_parallelism: i32, parallelism: i32, key_group: 
 
 /// `String.hashCode`: `31 * h + c` over the UTF-16 code units.
 pub fn java_string_hash(s: &str) -> i32 {
-    s.encode_utf16()
+    java_utf16_hash(s.encode_utf16())
+}
+
+/// `String.hashCode` of a string given as its UTF-16 code units (lone surrogates included).
+pub fn java_utf16_hash(units: impl IntoIterator<Item = u16>) -> i32 {
+    units
+        .into_iter()
         .fold(0i32, |h, c| h.wrapping_mul(31).wrapping_add(c as i32))
+}
+
+/// `java.util.Date.hashCode`: `(int) ht ^ (int) (ht >> 32)` of `getTime()` (JDK 21
+/// `java/util/Date.java`), the same low 32 bits as `Long.hashCode`. `java.sql.Date` inherits it.
+pub fn java_date_hash(millis: i64) -> i32 {
+    (millis as i32) ^ ((millis >> 32) as i32)
+}
+
+/// `java.time.LocalDate.hashCode` (JDK 21 `java/time/LocalDate.java`):
+/// `(year & 0xFFFFF800) ^ ((year << 11) + (month << 6) + day)`.
+pub fn java_local_date_hash(year: i32, month: i32, day: i32) -> i32 {
+    (year & 0xFFFF_F800u32 as i32)
+        ^ (year
+            .wrapping_shl(11)
+            .wrapping_add(month.wrapping_shl(6))
+            .wrapping_add(day))
 }
 
 /// `Long.hashCode`: `(int) (value ^ (value >>> 32))`.
@@ -140,6 +162,9 @@ pub fn java_big_integer_hash(negative: bool, magnitude: &[u32]) -> i32 {
 #[derive(Debug, Clone, PartialEq)]
 pub enum JavaKey {
     String(String),
+    /// A `String` holding a lone surrogate, as its UTF-16 code units (no Rust string can hold
+    /// it); rendered escaped by [`crate::parser::value::key_string`].
+    Utf16(Vec<u16>),
     Long(i64),
     Int(i32),
     Short(i16),
@@ -155,6 +180,14 @@ pub enum JavaKey {
         magnitude: Vec<u32>,
     },
     Tuple(Vec<JavaKey>),
+    /// A `java.util.Date` / `java.sql.Date` (`DateSerializer` / `SqlDateSerializer`): epoch millis.
+    Date(i64),
+    /// A `java.time.LocalDate` (`LocalDateSerializer`).
+    LocalDate {
+        year: i32,
+        month: u8,
+        day: u8,
+    },
 }
 
 impl JavaKey {
@@ -165,11 +198,39 @@ impl JavaKey {
     /// `NaN`, `inf`); for `Float`/`Double`, also the `0x` + hex of the serialized bytes that a
     /// non-finite value renders as; for `Char`, one character or a `\uXXXX` escape; for a tuple,
     /// a JSON array of its fields. `Err` explains why the text is not such a key, or why the type
-    /// has no known `hashCode()` (POJO, Kryo, dates, …).
+    /// has no known `hashCode()` (POJO, Kryo, `Timestamp`, …); `Date` takes its rendering or epoch
+    /// milliseconds, `LocalDate` its rendering, a `String` key rendered escaped is unescaped.
     pub fn parse(key_type: &str, text: &str) -> Result<JavaKey, String> {
         let bad = || format!("{:?} is not a {} key", text, key_type);
         Ok(match key_type {
-            "String" => JavaKey::String(text.to_string()),
+            "String" => {
+                let units = crate::parser::value::parse_key_string(text).ok_or_else(|| {
+                    format!(
+                        "{:?} is not a String key: in a key rendered escaped, \\u must start a \
+                         lone-surrogate escape \\uXXXX and a literal backslash is \\\\",
+                        text
+                    )
+                })?;
+                match String::from_utf16(&units) {
+                    Ok(s) => JavaKey::String(s),
+                    Err(_) => JavaKey::Utf16(units),
+                }
+            }
+            "Date" => JavaKey::Date(match text.trim().parse::<i64>() {
+                Ok(millis) => millis,
+                Err(_) => parse_iso_millis(text).ok_or_else(|| {
+                    format!(
+                        "{:?} is not a Date key: give it as rendered \
+                         (YYYY-MM-DDTHH:MM:SS[.mmm]Z, UTC) or as epoch milliseconds",
+                        text
+                    )
+                })?,
+            }),
+            "LocalDate" => {
+                let (year, month, day) = parse_local_date(text)
+                    .ok_or_else(|| format!("{:?} is not a LocalDate key (YYYY-MM-DD)", text))?;
+                JavaKey::LocalDate { year, month, day }
+            }
             "Long" => JavaKey::Long(text.trim().parse().map_err(|_| bad())?),
             "Int" => JavaKey::Int(text.trim().parse().map_err(|_| bad())?),
             "Short" => JavaKey::Short(text.trim().parse().map_err(|_| bad())?),
@@ -249,6 +310,11 @@ impl JavaKey {
     pub fn hash_code(&self) -> i32 {
         match self {
             JavaKey::String(s) => java_string_hash(s),
+            JavaKey::Utf16(units) => java_utf16_hash(units.iter().copied()),
+            JavaKey::Date(millis) => java_date_hash(*millis),
+            JavaKey::LocalDate { year, month, day } => {
+                java_local_date_hash(*year, *month as i32, *day as i32)
+            }
             JavaKey::Long(v) => java_long_hash(*v),
             JavaKey::Int(v) => *v,
             // Short.hashCode / Byte.hashCode / Character.hashCode: `(int) value`.
@@ -279,6 +345,15 @@ impl JavaKey {
     pub fn serialize(&self, out: &mut Vec<u8>) {
         match self {
             JavaKey::String(s) => write_string_value(out, s),
+            JavaKey::Utf16(units) => write_utf16_value(out, units),
+            // DateSerializer.serialize: `writeLong(record.getTime())`.
+            JavaKey::Date(millis) => out.extend_from_slice(&millis.to_be_bytes()),
+            // LocalDateSerializer.serialize: `writeInt(year)`, `writeByte(month)`, `writeByte(day)`.
+            JavaKey::LocalDate { year, month, day } => {
+                out.extend_from_slice(&year.to_be_bytes());
+                out.push(*month);
+                out.push(*day);
+            }
             JavaKey::Long(v) => out.extend_from_slice(&v.to_be_bytes()),
             JavaKey::Int(v) => out.extend_from_slice(&v.to_be_bytes()),
             JavaKey::Short(v) => out.extend_from_slice(&v.to_be_bytes()),
@@ -400,10 +475,69 @@ fn big_integer_to_byte_array(negative: bool, magnitude: &[u32]) -> Vec<u8> {
 /// `StringValue.writeString`: var-length `charCount + 1`, then each UTF-16 unit var-length.
 fn write_string_value(out: &mut Vec<u8>, s: &str) {
     let units: Vec<u16> = s.encode_utf16().collect();
+    write_utf16_value(out, &units);
+}
+
+fn write_utf16_value(out: &mut Vec<u8>, units: &[u16]) {
     write_var(out, units.len() as u32 + 1);
-    for u in units {
+    for &u in units {
         write_var(out, u as u32);
     }
+}
+
+/// Days since 1970-01-01 of a proleptic Gregorian date (H. Hinnant's `days_from_civil`, the
+/// inverse of the conversion in [`crate::parser::pojo::millis_to_iso`]).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// `YYYY-MM-DD`, the year possibly negative or longer than 4 digits: split from the right.
+fn split_date(text: &str) -> Option<(&str, &str, &str)> {
+    let mut parts = text.rsplitn(3, '-');
+    let d = parts.next()?;
+    let m = parts.next()?;
+    let y = parts.next()?;
+    Some((y, m, d))
+}
+
+/// The epoch millis of a Date key as `millis_to_iso` renders it. Only an exact rendering is
+/// accepted (it is re-rendered and compared), so `2020-02-30T…` is refused rather than read as
+/// another day.
+fn parse_iso_millis(text: &str) -> Option<i64> {
+    let text = text.trim();
+    let (date, time) = text.strip_suffix('Z')?.split_once('T')?;
+    let (y, m, d) = split_date(date)?;
+    let (hms, ms) = match time.split_once('.') {
+        Some((hms, ms)) => (hms, ms.parse::<i64>().ok()?),
+        None => (time, 0),
+    };
+    let mut hms = hms.split(':');
+    let (h, mi, s) = (hms.next()?, hms.next()?, hms.next()?);
+    let num = |t: &str| t.parse::<i64>().ok().filter(|v| v.abs() < 1 << 40);
+    let days = days_from_civil(num(y)?, num(m)?, num(d)?);
+    let secs = days
+        .checked_mul(86_400)?
+        .checked_add(num(h)? * 3600 + num(mi)? * 60 + num(s)?)?;
+    let millis = secs.checked_mul(1000)?.checked_add(ms)?;
+    (crate::parser::pojo::millis_to_iso(millis) == text).then_some(millis)
+}
+
+/// A LocalDate key as `decode_field` renders it (`{:04}-{:02}-{:02}`), exactly.
+fn parse_local_date(text: &str) -> Option<(i32, u8, u8)> {
+    let text = text.trim();
+    let (y, m, d) = split_date(text)?;
+    let (y, m, d) = (
+        y.parse::<i32>().ok()?,
+        m.parse::<u8>().ok()?,
+        d.parse::<u8>().ok()?,
+    );
+    (format!("{:04}-{:02}-{:02}", y, m, d) == text).then_some((y, m, d))
 }
 
 fn write_var(out: &mut Vec<u8>, mut v: u32) {
@@ -444,6 +578,54 @@ mod tests {
         assert_eq!(java_big_integer_hash(true, &[5]), -5);
         assert_eq!(java_big_integer_hash(false, &[1, 0]), 31);
         assert_eq!(java_big_integer_hash(false, &[]), 0);
+    }
+
+    // Printed by Java 21: `new java.util.Date(m).hashCode()`, `LocalDate.of(y, m, d).hashCode()`,
+    // `("x" + (char) 0xD800).hashCode()`.
+    #[test]
+    fn date_and_lone_surrogate_hashes_match_java() {
+        for (millis, h) in [
+            (0i64, 0),
+            (1, 1),
+            (-1, 0),
+            (1_700_000_000_123, -807_048_720),
+            (-62_135_596_800_000, 304_934_780),
+            (253_402_300_799_999, -769_704_568),
+            (i64::MAX, i32::MIN),
+        ] {
+            assert_eq!(java_date_hash(millis), h, "{}", millis);
+            assert_eq!(JavaKey::Date(millis).hash_code(), h);
+        }
+        for ((y, m, d), h) in [
+            ((2024, 2, 29), 4_145_309),
+            ((1970, 1, 1), 4_034_625),
+            ((-5, 12, 31), 8_991),
+            ((12345, 6, 7), 25_295_239),
+            ((-999_999_999, 1, 1), -304_793_535),
+            ((999_999_999, 12, 31), -304_794_849),
+        ] {
+            assert_eq!(java_local_date_hash(y, m, d), h, "{}-{}-{}", y, m, d);
+        }
+        assert_eq!(java_utf16_hash([0x78, 0xD800]), 59_016);
+        let k = JavaKey::parse("String", "x\\uD800").unwrap();
+        assert_eq!(k, JavaKey::Utf16(vec![0x78, 0xD800]));
+        assert_eq!(k.hash_code(), 59_016);
+        assert_eq!(k.canonical_text("String").unwrap(), "x\\uD800");
+        // A literal backslash-u renders escaped, and parses back to itself.
+        let lit = JavaKey::String("x\\uD800".to_string());
+        assert_eq!(lit.canonical_text("String").unwrap(), "x\\\\uD800");
+        assert_eq!(JavaKey::parse("String", "x\\\\uD800").unwrap(), lit);
+        assert!(JavaKey::parse("String", "x\\uZZZZ").is_err());
+        let d = JavaKey::parse("Date", "2023-11-14T22:13:20.123Z").unwrap();
+        assert_eq!(d, JavaKey::Date(1_700_000_000_123));
+        assert_eq!(
+            d.canonical_text("Date").unwrap(),
+            "2023-11-14T22:13:20.123Z"
+        );
+        assert!(JavaKey::parse("Date", "2023-11-14").is_err());
+        let ld = JavaKey::parse("LocalDate", "-005-12-31").unwrap();
+        assert_eq!(ld.hash_code(), 8_991);
+        assert_eq!(ld.canonical_text("LocalDate").unwrap(), "-005-12-31");
     }
 
     #[test]

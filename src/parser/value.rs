@@ -715,10 +715,88 @@ pub fn decode_key(
     if !key_renders_injectively(key_type) {
         return None;
     }
-    let v = decode_field(&mut r, key_type, None, None).ok()?;
+    let v = decode_key_field(&mut r, key_type).ok()?;
     let used = r.position() as usize;
     let text = render_key(&v).unwrap_or_else(|| opaque_key(&bytes[..used]));
     Some((text, used))
+}
+
+/// One field of a key: a `String` rendered losslessly ([`key_string`]), a `Tuple` field by field,
+/// anything else through `decode_field`, like a value.
+fn decode_key_field(r: &mut JavaReader<&[u8]>, key_type: &str) -> Decoded {
+    if key_type == "String" {
+        return match r.read_nullable_string_units() {
+            Ok(Some(units)) => Ok(Value::String(key_string(&units))),
+            Ok(None) => Ok(Value::Null),
+            Err(_) => Err(undecodable("String")),
+        };
+    }
+    if let Some(inner) = key_type
+        .strip_prefix("Tuple<")
+        .and_then(|s| s.strip_suffix('>'))
+    {
+        let mut items = Vec::new();
+        for field in split_top_level(inner) {
+            items.push(decode_key_field(r, field.trim())?);
+        }
+        return Ok(Value::Array(items));
+    }
+    decode_field(r, key_type, None, None)
+}
+
+/// A `String` key's UTF-16 units as text, **injectively**: a Java string may hold a lone
+/// surrogate, which no Rust string can, and U+FFFD would merge distinct keys. A string with no
+/// lone surrogate and no literal `\u` renders as itself (every real-world key); any other renders
+/// escaped — each lone surrogate as `\uXXXX` (uppercase hex, as a `Char` key's lone surrogate
+/// renders) and each literal backslash as `\\`. Escaped texts always contain `\u` and plain ones
+/// never do, so the two forms cannot collide. [`parse_key_string`] inverts it.
+pub fn key_string(units: &[u16]) -> String {
+    let decoded: Vec<Result<char, u16>> = char::decode_utf16(units.iter().copied())
+        .map(|c| c.map_err(|e| e.unpaired_surrogate()))
+        .collect();
+    let lone = decoded.iter().any(|c| c.is_err());
+    let plain: String = decoded.iter().filter_map(|c| c.ok()).collect();
+    if !lone && !plain.contains("\\u") {
+        return plain;
+    }
+    let mut out = String::with_capacity(units.len() + 8);
+    for c in decoded {
+        match c {
+            Ok('\\') => out.push_str("\\\\"),
+            Ok(c) => out.push(c),
+            Err(unit) => out.push_str(&format!("\\u{:04X}", unit)),
+        }
+    }
+    out
+}
+
+/// The UTF-16 units of a `String` key rendered by [`key_string`]; `None` for a text containing
+/// `\u` that is not a well-formed escaped rendering.
+pub fn parse_key_string(text: &str) -> Option<Vec<u16>> {
+    if !text.contains("\\u") {
+        return Some(text.encode_utf16().collect());
+    }
+    let mut units = Vec::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            let mut buf = [0u16; 2];
+            units.extend_from_slice(c.encode_utf16(&mut buf));
+            continue;
+        }
+        match chars.next()? {
+            '\\' => units.push(b'\\' as u16),
+            'u' => {
+                let hex: String = chars.by_ref().take(4).collect();
+                if hex.len() != 4 || !hex.chars().all(|h| h.is_ascii_hexdigit()) {
+                    return None;
+                }
+                units.push(u16::from_str_radix(&hex, 16).ok()?);
+            }
+            _ => return None,
+        }
+    }
+    Some(units)
 }
 
 /// The display form of a key that could not be decoded: `0x` + the hex of its serialized bytes.

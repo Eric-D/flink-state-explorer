@@ -7,16 +7,24 @@
 //! two subtasks may number them differently. After that every operation reads whole key-group
 //! blocks, located by `KeyGroupsStateHandle.offsets`, and nothing else:
 //!
-//! - [`StateReader::key_page`] pages through the keys, each with all its states' values;
+//! - [`StateReader::key_page`] pages through the keys, each with its states' values (at most
+//!   [`StateReader::with_entry_limit`] entries per state, the rest through
+//!   [`StateReader::entries`]);
 //! - [`StateReader::get`] finds one key by computing Flink's key-group for it
 //!   ([`crate::parser::key_group`]) and reading that block alone — an empty key-group answers
 //!   without any I/O;
 //! - [`StateReader::scan`] tests a predicate on rendered keys under a byte budget, for search.
 //!
 //! Memory is bounded by the blocks in flight plus a small byte-bounded cache of recently read
-//! blocks (so paging inside one key-group does not re-read it), never by the savepoint's size.
-//! Values are decoded through [`crate::parser::value`] only — the single decoder — and MAP
-//! entries through [`crate::parser::value::decode_map_entry`].
+//! blocks, parsed and grouped by key (so paging inside one key-group neither re-reads nor
+//! re-parses it), never by the savepoint's size. Values are decoded through
+//! [`crate::parser::value`] only — the single decoder — and MAP entries through
+//! [`crate::parser::value::decode_map_entry`].
+//!
+//! Nothing that cannot be read is ever taken for "no state": a subtask whose file cannot be read,
+//! whose header does not parse or whose keyed handle is not a canonical one (incremental,
+//! changelog) is reported — as [`Unreadable`] in a page, which then moves on past it, or as a
+//! [`ReaderError::Unreadable`] from [`StateReader::get`] for a key it owns.
 //!
 //! The streaming export ([`crate::export_state`]) is a client of the same pieces
 //! ([`OpContext`], [`SubtaskStream::block_range`], [`SubtaskStream::read_block`],
@@ -41,10 +49,10 @@ use serde_json::Value;
 
 use crate::parser::key_group::{key_group_for_hash, subtask_for_key_group, JavaKey};
 use crate::parser::keyed_state::{
-    count_states_in_header, extract_entry_layouts, extract_state_metadata,
-    extract_value_pojo_classes, extract_value_serializer_types, key_group_block,
-    parse_key_group_block, read_keyed_stream_header, BlockDefect, EntryLayout, KeyGroupParse,
-    KeyedEntry,
+    count_states_in_header, extract_entry_layouts, extract_key_tuple_classes,
+    extract_state_metadata, extract_value_pojo_classes, extract_value_serializer_types,
+    key_group_block, parse_key_group_block, read_keyed_stream_header, BlockDefect, EntryLayout,
+    KeyGroupParse, KeyedEntry,
 };
 use crate::parser::metadata::{Operator, Savepoint};
 use crate::parser::pojo::{extract_pojo_infos, PojoInfo};
@@ -52,15 +60,99 @@ use crate::parser::state_handle::{KeyGroupsStateHandle, StateHandle, StreamState
 use crate::proto::ProtoContext;
 
 pub(crate) use source::read_whole_stream;
-use source::{inline_bytes, source_for, Source};
+use source::{inline_bytes, source_for, FilePool, Source};
 
-/// Default size of the block cache: a few key-groups of a large savepoint (~1.6 MB each on a
-/// 211 MB / 128 key-group one).
+/// Default size of the block cache, in bytes of parsed blocks: a few key-groups of a large
+/// savepoint (~1.6 MB each on a 211 MB / 128 key-group one, a little more once parsed).
 pub const DEFAULT_CACHE_BYTES: usize = 8 << 20;
+
+/// Default most entries of one state returned with one key ([`StateReader::with_entry_limit`]).
+pub const DEFAULT_ENTRY_LIMIT: usize = 1000;
+
+/// Default most matches one [`StateReader::scan`] call returns
+/// ([`StateReader::with_scan_match_limit`]).
+pub const DEFAULT_SCAN_MATCH_LIMIT: usize = 1000;
+
+/// Default most state files a reader holds open at once ([`StateReader::with_open_files`]).
+pub const DEFAULT_OPEN_FILES: usize = 64;
 
 /// Lowercase hex of an OperatorID, as `_metadata` stores it.
 pub fn hex_id(id: &[u8; 16]) -> String {
     id.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+// --- errors -------------------------------------------------------------------------------------
+
+/// Why a [`StateReader`] call failed. `Display` gives the message; the variant says whose fault it
+/// is (the comments suggest the HTTP status a server would answer).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReaderError {
+    /// `_metadata` could not be read or parsed (500).
+    Metadata { path: String, error: String },
+    /// No operator id is, or starts with, `op` (404).
+    UnknownOperator { op: String },
+    /// `op` is a prefix of several operator ids (400).
+    AmbiguousOperator { op: String, candidates: Vec<String> },
+    /// The operator has no keyed state (404).
+    NoKeyedState { op: String },
+    /// A cursor that does not fit the operator (400).
+    BadCursor { cursor: String, reason: String },
+    /// Nothing at that position, or no such state (404).
+    NotFound { what: String },
+    /// A state stream that cannot be read: missing, short or unreadable file, header that does
+    /// not parse, unsupported keyed handle, block that does not inflate (500). `what` is the file,
+    /// or `subtask N (inline)`; `error` names it too.
+    Unreadable {
+        subtask: i32,
+        first_key_group: u16,
+        last_key_group: u16,
+        what: String,
+        error: String,
+    },
+    /// [`StateReader::get`]: the key's block is malformed before the key was found, so the key
+    /// may be in the part that could not be read (500).
+    Malformed {
+        subtask: i32,
+        key_group: u16,
+        what: String,
+        defect: String,
+        key: String,
+    },
+}
+
+impl std::fmt::Display for ReaderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReaderError::Metadata { path, error } => write!(f, "{}: {}", path, error),
+            ReaderError::UnknownOperator { op } => write!(f, "no operator matches {:?}", op),
+            ReaderError::AmbiguousOperator { op, candidates } => write!(
+                f,
+                "operator prefix {:?} is ambiguous: {}",
+                op,
+                candidates.join(", ")
+            ),
+            ReaderError::NoKeyedState { op } => write!(f, "operator {} has no keyed state", op),
+            ReaderError::BadCursor { reason, .. } => write!(f, "{}", reason),
+            ReaderError::NotFound { what } => write!(f, "{}", what),
+            ReaderError::Unreadable { error, .. } => write!(f, "{}", error),
+            ReaderError::Malformed {
+                what, defect, key, ..
+            } => write!(
+                f,
+                "{}: {}; key {:?} may be in the part that could not be read",
+                what, defect, key
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReaderError {}
+
+/// So that `?` keeps working in code returning `Result<_, String>`.
+impl From<ReaderError> for String {
+    fn from(e: ReaderError) -> String {
+        e.to_string()
+    }
 }
 
 // --- public types -------------------------------------------------------------------------------
@@ -74,7 +166,7 @@ pub struct OperatorInfo {
     pub name: String,
     pub parallelism: i32,
     pub max_parallelism: i32,
-    /// Subtasks holding a keyed-state handle; 0 = no keyed state.
+    /// Subtasks holding a keyed-state handle (of any kind, readable or not); 0 = no keyed state.
     pub keyed_subtasks: usize,
 }
 
@@ -99,8 +191,8 @@ pub struct KeyedStates {
     pub key_type: String,
     /// In order of first registration, over the subtasks in order.
     pub states: Vec<StateInfo>,
-    /// One message per state file that could not be opened or whose header could not be read,
-    /// naming the file. Non-empty means `states` may be incomplete.
+    /// One message per state file that could not be opened, whose header could not be read or
+    /// whose keyed handle is not supported, naming it. Non-empty means `states` may be incomplete.
     pub errors: Vec<String>,
 }
 
@@ -147,11 +239,13 @@ impl std::str::FromStr for Cursor {
 }
 
 /// One stored entry of one key: a state's value, or one entry of a MAP state, or one timer.
+///
+/// The labels are shared (`Arc<str>`), not copied per entry.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StateEntry {
-    pub state: String,
-    pub state_type: String,
-    pub value_type: String,
+    pub state: Arc<str>,
+    pub state_type: Arc<str>,
+    pub value_type: Arc<str>,
     /// MAP states: the decoded map key (each map entry is its own `StateEntry`).
     pub map_key: Option<String>,
     /// Raw namespace bytes: `VoidNamespace` (1 byte, `0x00`) for most states, a `TimeWindow` for
@@ -163,7 +257,17 @@ pub struct StateEntry {
     pub value: Value,
 }
 
-/// A key with every entry it has in its key-group, across all states.
+/// A state of a key that holds more entries than a record carries: `returned` of `total` are in
+/// [`KeyRecord::entries`] (the first ones, in on-disk order), the others through
+/// [`StateReader::entries`] from offset `returned`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Truncated {
+    pub state: Arc<str>,
+    pub total: usize,
+    pub returned: usize,
+}
+
+/// A key with its entries in its key-group, across all states.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KeyRecord {
     /// The key as [`crate::parser::value::decode_key`] renders it.
@@ -171,10 +275,20 @@ pub struct KeyRecord {
     /// Absolute key-group.
     pub key_group: u16,
     pub subtask: i32,
-    /// Where this key is: a [`StateReader::key_page`] from here starts with it.
+    /// Where this key is: a [`StateReader::key_page`] from here starts with it, and
+    /// [`StateReader::entries`] takes it.
     pub position: Cursor,
-    /// In on-disk order.
+    /// In on-disk order; at most the reader's entry limit per state.
     pub entries: Vec<StateEntry>,
+    /// The states cut at the entry limit; empty = `entries` is complete.
+    pub truncated: Vec<Truncated>,
+}
+
+impl KeyRecord {
+    /// Whether some state's entries were cut at the entry limit.
+    pub fn is_truncated(&self) -> bool {
+        !self.truncated.is_empty()
+    }
 }
 
 /// What a call read.
@@ -192,6 +306,34 @@ pub struct ReadStats {
     pub max_block_bytes: usize,
 }
 
+/// Key-groups a page could not read at all, reported in the page rather than failing it: a
+/// subtask whose file is missing or unreadable, whose header does not parse or whose keyed handle
+/// is unsupported (the whole range from where the page reached it), or one block that does not
+/// inflate or cannot be read. The page goes on past them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unreadable {
+    pub subtask: i32,
+    /// Inclusive absolute key-group range.
+    pub first_key_group: u16,
+    pub last_key_group: u16,
+    /// The file, or `subtask N (inline)`.
+    pub what: String,
+    /// The message, naming the file.
+    pub error: String,
+}
+
+impl Unreadable {
+    fn into_error(self) -> ReaderError {
+        ReaderError::Unreadable {
+            subtask: self.subtask,
+            first_key_group: self.first_key_group,
+            last_key_group: self.last_key_group,
+            what: self.what,
+            error: self.error,
+        }
+    }
+}
+
 /// A page of keys.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KeyPage {
@@ -202,16 +344,21 @@ pub struct KeyPage {
     /// Key-groups that could not be read to their end mark, as `subtask N, key-group K: defect`:
     /// the keys read before the defect are in the page, the rest of that key-group is not.
     pub malformed: Vec<String>,
+    /// Key-groups that could not be read at all, which the page skipped (each reported by the
+    /// one page that reaches it).
+    pub unreadable: Vec<Unreadable>,
 }
 
 /// The result of a [`StateReader::scan`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScanPage {
+    /// At most the reader's scan match limit.
     pub matches: Vec<KeyRecord>,
     /// Where to resume; `None` when the whole operator has been scanned.
     pub next: Option<Cursor>,
     pub stats: ReadStats,
     pub malformed: Vec<String>,
+    pub unreadable: Vec<Unreadable>,
 }
 
 /// The answer of [`StateReader::get`].
@@ -220,6 +367,9 @@ pub enum Lookup {
     Found {
         record: KeyRecord,
         stats: ReadStats,
+        /// Non-empty when the key's block is malformed: `record` holds the entries read before
+        /// the defect, and the key may have more in the part that could not be read.
+        malformed: Vec<String>,
     },
     /// The key is not in the savepoint: its key-group is empty (no I/O at all), or its block does
     /// not hold it.
@@ -228,11 +378,26 @@ pub enum Lookup {
         subtask: i32,
         stats: ReadStats,
     },
-    /// The key-group cannot be computed from the text (a POJO or opaque key type, or text that
-    /// does not parse as the key type): use [`StateReader::scan`].
-    NeedsScan {
-        reason: String,
-    },
+    /// The key-group cannot be computed from the text (a POJO or opaque key type, a tuple class
+    /// that is not Flink's own, or text that does not parse as the key type): use
+    /// [`StateReader::scan`].
+    NeedsScan { reason: String },
+}
+
+/// Entries of one state of one key, from [`StateReader::entries`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntryPage {
+    pub key: String,
+    pub state: Arc<str>,
+    /// From `offset`, in on-disk order.
+    pub entries: Vec<StateEntry>,
+    pub offset: usize,
+    /// How many entries of that state the key has.
+    pub total: usize,
+    /// The offset of the next page, `None` when this one reaches `total`.
+    pub next: Option<usize>,
+    pub stats: ReadStats,
+    pub malformed: Vec<String>,
 }
 
 // --- per-subtask header -------------------------------------------------------------------------
@@ -248,6 +413,8 @@ pub(crate) struct ResolvedState {
     /// For MAP states: the `Map<K,V>` key and value serializer types.
     pub map_key_type: String,
     pub map_value_type: String,
+    /// `name`, `state_type`, `value_type`, shared by every [`StateEntry`] of the state.
+    labels: [Arc<str>; 3],
 }
 
 /// Everything one subtask's header says, resolved once.
@@ -256,6 +423,8 @@ pub(crate) struct SubtaskHeader {
     pub compressed: bool,
     pub key_type: String,
     pub key_pojo: Option<PojoInfo>,
+    /// The tuple classes of a `Tuple` key, outermost first.
+    pub key_tuple_classes: Vec<String>,
     /// By stateId.
     pub states: Vec<ResolvedState>,
     pub state_types: Vec<String>,
@@ -300,6 +469,11 @@ impl SubtaskHeader {
                     (String::new(), String::new())
                 };
                 ResolvedState {
+                    labels: [
+                        Arc::from(meta.name.as_str()),
+                        Arc::from(meta.state_type.as_str()),
+                        Arc::from(value_type.as_str()),
+                    ],
                     name: meta.name.clone(),
                     state_type: meta.state_type.clone(),
                     value_type,
@@ -319,11 +493,17 @@ impl SubtaskHeader {
         } else {
             None
         };
+        let key_tuple_classes = if key_type.starts_with("Tuple<") {
+            extract_key_tuple_classes(header)
+        } else {
+            Vec::new()
+        };
         SubtaskHeader {
             compressed: read_keyed_stream_header(header)
                 .is_some_and(|h| h.using_key_group_compression),
             key_type,
             key_pojo,
+            key_tuple_classes,
             states,
             state_types: metas.iter().map(|m| m.state_type.clone()).collect(),
             layouts: extract_entry_layouts(header, header.len()),
@@ -353,6 +533,34 @@ impl SubtaskHeader {
             layouts: &self.layouts,
             only_state,
         }
+    }
+
+    /// Why a `Tuple` key's `hashCode()` is not known, if it is not: Flink's `TupleN` hash their
+    /// fields (`Tuple2.java:173-177`), but a user subclass of one may override `hashCode()`.
+    fn tuple_key_unhashable(&self) -> Option<String> {
+        if !self.key_type.starts_with("Tuple<") {
+            return None;
+        }
+        let tuples = self.key_type.matches("Tuple<").count();
+        if self.key_tuple_classes.len() != tuples {
+            return Some(
+                "the key's tuple classes could not be read from its serializer snapshot, so its \
+                 hashCode() is not known"
+                    .to_string(),
+            );
+        }
+        self.key_tuple_classes
+            .iter()
+            .find(|c| {
+                !c.strip_prefix("org.apache.flink.api.java.tuple.Tuple")
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            })
+            .map(|c| {
+                format!(
+                    "the key class {} is not one of Flink's TupleN: it may override hashCode()",
+                    c
+                )
+            })
     }
 }
 
@@ -417,12 +625,14 @@ pub(crate) struct SubtaskStream {
     pub header: Result<SubtaskHeader, String>,
 }
 
-/// A subtask whose keyed stream could not be opened.
+/// A subtask whose keyed stream could not be opened, or whose keyed handle is not supported.
 #[derive(Debug)]
 pub(crate) struct FailedSubtask {
     pub subtask_index: i32,
     pub start_key_group: i32,
     pub num_key_groups: i32,
+    /// The file, `subtask N (inline)`, or `subtask N (<handle kind>)`.
+    pub what: String,
     pub error: String,
 }
 
@@ -459,6 +669,45 @@ fn keyed_handle(op: &Operator, state_pos: usize) -> Option<&KeyGroupsStateHandle
     }
 }
 
+/// A keyed handle this reader does not read, by kind and key-group range.
+fn unsupported_keyed_handle(h: &StateHandle) -> Option<(&'static str, i32, i32)> {
+    Some(match h {
+        StateHandle::IncrementalRemoteKeyed(x) => (
+            "IncrementalRemoteKeyedStateHandle (incremental RocksDB)",
+            x.start_key_group,
+            x.num_key_groups,
+        ),
+        StateHandle::Changelog(x) => (
+            "ChangelogStateBackendHandle (changelog)",
+            x.start_key_group,
+            x.num_key_groups,
+        ),
+        StateHandle::ChangelogByteIncrement(x) => (
+            "InMemoryChangelogStateHandle (changelog)",
+            x.start_key_group,
+            x.num_key_groups,
+        ),
+        StateHandle::ChangelogFileIncrement(x) => (
+            "ChangelogStateHandleStreamImpl (changelog)",
+            x.start_key_group,
+            x.num_key_groups,
+        ),
+        StateHandle::Null | StateHandle::KeyGroups(_) | StateHandle::OperatorStream(_) => {
+            return None
+        }
+    })
+}
+
+/// Where a delegate's bytes are, for messages.
+fn describe_delegate(delegate: &StreamStateHandle, dir: &Path, subtask: i32) -> String {
+    match delegate {
+        StreamStateHandle::Relative(rel) => dir.join(&rel.relative_path).display().to_string(),
+        StreamStateHandle::File(f) => f.file_path.clone(),
+        StreamStateHandle::Segment(s) => s.file_path.clone(),
+        _ => format!("subtask {} (inline)", subtask),
+    }
+}
+
 /// Byte length of the header: it runs from offset 0 to the first key-group.
 fn header_len(offsets: &[i64], stream_len: u64) -> u64 {
     offsets
@@ -473,23 +722,41 @@ fn header_len(offsets: &[i64], stream_len: u64) -> u64 {
 
 impl OpContext {
     /// Open every keyed stream of operator `op_index`, in subtask order, and resolve each header.
-    /// A stream that cannot be opened becomes a [`FailedSubtask`] whose message names its file: a
-    /// caller must never take a broken file for a subtask without state.
+    /// A stream that cannot be opened becomes a [`FailedSubtask`] whose message names its file,
+    /// and so does a keyed handle that is not a canonical key-groups one (incremental,
+    /// changelog): a caller must never take either for a subtask without state.
     pub(crate) fn open(savepoint: &Savepoint, op_index: usize, savepoint_dir: &Path) -> OpContext {
         let op = &savepoint.operators[op_index];
         let mut streams = Vec::new();
         let mut failed = Vec::new();
         for (state_pos, st) in op.subtask_states.iter().enumerate() {
-            let StateHandle::KeyGroups(kg) = &st.managed_keyed_state else {
-                continue;
+            let kg = match &st.managed_keyed_state {
+                StateHandle::KeyGroups(kg) => kg,
+                other => {
+                    if let Some((kind, start, num)) = unsupported_keyed_handle(other) {
+                        failed.push(FailedSubtask {
+                            subtask_index: st.subtask_index,
+                            start_key_group: start,
+                            num_key_groups: num,
+                            what: format!("subtask {} ({})", st.subtask_index, kind),
+                            error: format!(
+                                "subtask {}: unsupported keyed handle {}: only canonical \
+                                 savepoints (key-groups handles) are read",
+                                st.subtask_index, kind
+                            ),
+                        });
+                    }
+                    continue;
+                }
             };
+            let delegate = effective_delegate(kg);
             let fail = |error: String| FailedSubtask {
                 subtask_index: st.subtask_index,
                 start_key_group: kg.start_key_group,
                 num_key_groups: kg.num_key_groups,
+                what: describe_delegate(delegate, savepoint_dir, st.subtask_index),
                 error,
             };
-            let delegate = effective_delegate(kg);
             let mut src = match source_for(delegate, savepoint_dir) {
                 Ok(Some(src)) => src,
                 Ok(None) => continue,
@@ -582,23 +849,51 @@ impl OpContext {
         })
     }
 
-    /// The first non-empty key-group at or after `from` (and the ordinal to start at in it).
+    /// Why `unit` cannot be read at all, if it cannot: its stream failed to open, or its header.
+    fn unit_error(&self, unit: Unit) -> Option<(&str, &str)> {
+        match unit {
+            Unit::Failed(i) => Some((&self.failed[i].what, &self.failed[i].error)),
+            Unit::Stream(i) => {
+                let s = &self.streams[i];
+                s.header
+                    .as_ref()
+                    .err()
+                    .map(|e| (s.what.as_str(), e.as_str()))
+            }
+        }
+    }
+
+    /// `unit`, unreadable from key-group `from` to its end.
+    fn unreadable(&self, unit: Unit, from: i32) -> Unreadable {
+        let (start, end) = self.unit_range(unit);
+        let (what, error) = self.unit_error(unit).unwrap_or(("", ""));
+        Unreadable {
+            subtask: self.unit_subtask(unit),
+            first_key_group: start.max(from) as u16,
+            last_key_group: end as u16,
+            what: what.to_string(),
+            error: error.to_string(),
+        }
+    }
+
+    /// The first non-empty key-group at or after `from` (and the ordinal to start at in it), or
+    /// the first unit that cannot be read.
     fn seek(&self, from: i32, ordinal: u32) -> Position {
         for &unit in &self.units {
             let (start, end) = self.unit_range(unit);
             if end < from {
                 continue;
             }
-            match unit {
-                // Whether it holds keys is unknown: it must be reported, not skipped.
-                Unit::Failed(i) => return Position::Failed(i),
-                Unit::Stream(i) => {
-                    let s = &self.streams[i];
-                    for kg in start.max(from)..=end {
-                        if s.block_range((kg - start) as usize).is_some() {
-                            let ordinal = if kg == from { ordinal } else { 0 };
-                            return Position::Block(i, kg, ordinal);
-                        }
+            // Whether it holds keys is unknown: it must be reported, not skipped.
+            if self.unit_error(unit).is_some() {
+                return Position::Unreadable(unit, start.max(from));
+            }
+            if let Unit::Stream(i) = unit {
+                let s = &self.streams[i];
+                for kg in start.max(from)..=end {
+                    if s.block_range((kg - start) as usize).is_some() {
+                        let ordinal = if kg == from { ordinal } else { 0 };
+                        return Position::Block(i, kg, ordinal);
                     }
                 }
             }
@@ -606,19 +901,39 @@ impl OpContext {
         Position::End
     }
 
+    /// Where `pos` is, as a cursor.
+    fn cursor_of(&self, pos: &Position) -> Option<Cursor> {
+        match *pos {
+            Position::Block(si, kg, ordinal) => Some(Cursor {
+                subtask: self.streams[si].subtask_index,
+                key_group: kg as u16,
+                ordinal,
+            }),
+            Position::Unreadable(unit, from) => Some(Cursor {
+                subtask: self.unit_subtask(unit),
+                key_group: from as u16,
+                ordinal: 0,
+            }),
+            Position::End => None,
+        }
+    }
+
+    /// The first readable header.
+    fn first_header(&self) -> Option<&SubtaskHeader> {
+        self.streams.iter().find_map(|s| s.header.as_ref().ok())
+    }
+
     /// The key type, from the first readable header.
     fn key_type(&self) -> Option<&str> {
-        self.streams
-            .iter()
-            .find_map(|s| s.header.as_ref().ok())
-            .map(|h| h.key_type.as_str())
+        self.first_header().map(|h| h.key_type.as_str())
     }
 }
 
 enum Position {
     /// Stream index, absolute key-group, ordinal.
     Block(usize, i32, u32),
-    Failed(usize),
+    /// A unit that cannot be read, from this absolute key-group on.
+    Unreadable(Unit, i32),
     End,
 }
 
@@ -659,20 +974,41 @@ impl SubtaskStream {
     }
 }
 
-// --- block cache --------------------------------------------------------------------------------
+// --- parsed block cache -------------------------------------------------------------------------
 
+/// `(operator index, subtask state position, absolute key-group)`.
 type BlockKey = (usize, usize, i32);
 
-/// Inflated blocks, least recently used evicted first, bounded in bytes.
+/// A key's raw entries in one block, before decoding.
+struct RawKey {
+    key: String,
+    /// `KeyedEntry.key` is left empty: it is `key`.
+    entries: Vec<KeyedEntry>,
+}
+
+/// A block parsed and grouped by key, in order of first appearance.
+struct GroupedBlock {
+    keys: Vec<RawKey>,
+    /// `subtask N, key-group K: defect` when the block could not be read to its end mark.
+    defect: Option<String>,
+    /// The inflated block's size.
+    inflated_len: usize,
+    /// What it costs in the cache, approximately.
+    weight: usize,
+}
+
+/// Parsed blocks, least recently used evicted first, bounded in (approximate) bytes. A block
+/// larger than the whole capacity is still kept, alone, so that paging through it does not
+/// re-read and re-parse it per page: the cache then holds at most that one block.
 struct BlockCache {
     capacity: usize,
     used: usize,
     tick: u64,
-    blocks: HashMap<BlockKey, (Arc<[u8]>, u64)>,
+    blocks: HashMap<BlockKey, (Arc<GroupedBlock>, u64)>,
 }
 
 impl BlockCache {
-    fn get(&mut self, key: &BlockKey) -> Option<Arc<[u8]>> {
+    fn get(&mut self, key: &BlockKey) -> Option<Arc<GroupedBlock>> {
         self.tick += 1;
         let tick = self.tick;
         self.blocks.get_mut(key).map(|(b, t)| {
@@ -681,11 +1017,14 @@ impl BlockCache {
         })
     }
 
-    fn insert(&mut self, key: BlockKey, block: Arc<[u8]>) {
-        if block.len() > self.capacity {
+    fn insert(&mut self, key: BlockKey, block: Arc<GroupedBlock>) {
+        if self.capacity == 0 {
             return;
         }
-        while self.used + block.len() > self.capacity {
+        if let Some((old, _)) = self.blocks.remove(&key) {
+            self.used -= old.weight;
+        }
+        while !self.blocks.is_empty() && self.used + block.weight > self.capacity {
             let Some(oldest) = self
                 .blocks
                 .iter()
@@ -695,37 +1034,13 @@ impl BlockCache {
                 break;
             };
             if let Some((b, _)) = self.blocks.remove(&oldest) {
-                self.used -= b.len();
+                self.used -= b.weight;
             }
         }
         self.tick += 1;
-        self.used += block.len();
-        if let Some((old, _)) = self.blocks.insert(key, (block, self.tick)) {
-            self.used -= old.len();
-        }
+        self.used += block.weight;
+        self.blocks.insert(key, (block, self.tick));
     }
-}
-
-/// A block's inflated bytes.
-enum Block<'s> {
-    Borrowed(&'s [u8]),
-    Shared(Arc<[u8]>),
-}
-
-impl std::ops::Deref for Block<'_> {
-    type Target = [u8];
-    fn deref(&self) -> &[u8] {
-        match self {
-            Block::Borrowed(b) => b,
-            Block::Shared(b) => b,
-        }
-    }
-}
-
-/// A key's raw entries in one block, before decoding.
-struct RawKey {
-    key: String,
-    entries: Vec<KeyedEntry>,
 }
 
 /// Parse a whole block and group its entries by key, in order of first appearance.
@@ -734,47 +1049,63 @@ fn group_block(
     key_group: u16,
     header: &SubtaskHeader,
     kg_prefix: usize,
-) -> (Vec<RawKey>, Option<BlockDefect>) {
+) -> (Vec<RawKey>, Option<BlockDefect>, usize) {
     let mut keys: Vec<RawKey> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
+    let mut weight = block.len();
     let parsed = parse_key_group_block(
         block,
         key_group,
         &header.parse_ctx(kg_prefix, None),
-        &mut |entry| match index.get(&entry.key) {
-            Some(&i) => keys[i].entries.push(entry),
-            None => {
-                index.insert(entry.key.clone(), keys.len());
-                keys.push(RawKey {
-                    key: entry.key.clone(),
-                    entries: vec![entry],
-                });
+        &mut |mut entry| {
+            weight += std::mem::size_of::<KeyedEntry>() + entry.namespace.len() + entry.value.len();
+            match index.get(&entry.key) {
+                Some(&i) => {
+                    entry.key = String::new();
+                    keys[i].entries.push(entry);
+                }
+                None => {
+                    let key = std::mem::take(&mut entry.key);
+                    weight += std::mem::size_of::<RawKey>() + 2 * key.len();
+                    index.insert(key.clone(), keys.len());
+                    keys.push(RawKey {
+                        key,
+                        entries: vec![entry],
+                    });
+                }
             }
         },
     );
-    (keys, parsed.err())
+    (keys, parsed.err(), weight)
 }
 
 // --- the reader ---------------------------------------------------------------------------------
 
 /// Random access to a savepoint's keyed state. See the [module documentation](self).
 ///
-/// `Sync`: operators are opened once behind a [`OnceLock`], files are read positionally, and the
-/// block cache sits behind a mutex, so one reader can serve concurrent requests.
+/// `Sync`: operators are opened once behind a [`OnceLock`], files are read positionally through a
+/// shared pool, and the block cache sits behind a mutex, so one reader can serve concurrent
+/// requests.
 pub struct StateReader<'a> {
     savepoint: Cow<'a, Savepoint>,
     dir: PathBuf,
     proto: Option<Arc<ProtoContext>>,
     contexts: Vec<OnceLock<OpContext>>,
     cache: Mutex<BlockCache>,
+    files: FilePool,
+    entry_limit: usize,
+    scan_match_limit: usize,
 }
 
 impl StateReader<'static> {
     /// Parse `<dir>/_metadata` and read from `dir`.
-    pub fn open(dir: &Path) -> Result<StateReader<'static>, String> {
+    pub fn open(dir: &Path) -> Result<StateReader<'static>, ReaderError> {
         let path = dir.join("_metadata");
-        let savepoint = crate::parser::parse_metadata(&path)
-            .map_err(|e| format!("{}: {}", path.display(), e))?;
+        let savepoint =
+            crate::parser::parse_metadata(&path).map_err(|e| ReaderError::Metadata {
+                path: path.display().to_string(),
+                error: e.to_string(),
+            })?;
         Ok(Self::build(Cow::Owned(savepoint), dir))
     }
 
@@ -805,6 +1136,9 @@ impl<'a> StateReader<'a> {
                 tick: 0,
                 blocks: HashMap::new(),
             }),
+            files: FilePool::new(DEFAULT_OPEN_FILES),
+            entry_limit: DEFAULT_ENTRY_LIMIT,
+            scan_match_limit: DEFAULT_SCAN_MATCH_LIMIT,
         }
     }
 
@@ -814,12 +1148,37 @@ impl<'a> StateReader<'a> {
         self
     }
 
-    /// Bound the block cache to `bytes` (0 disables it).
+    /// Bound the block cache to about `bytes` of parsed blocks (0 disables it). One block larger
+    /// than that is still kept alone.
     pub fn with_cache_bytes(self, bytes: usize) -> Self {
         if let Ok(mut c) = self.cache.lock() {
             c.capacity = bytes;
         }
         self
+    }
+
+    /// Return at most `n` entries of one state with one key (0 is taken as 1); the rest are
+    /// counted in [`KeyRecord::truncated`] and read with [`StateReader::entries`].
+    pub fn with_entry_limit(mut self, n: usize) -> Self {
+        self.entry_limit = n.max(1);
+        self
+    }
+
+    /// Return at most `n` matches per [`StateReader::scan`] call (0 is taken as 1).
+    pub fn with_scan_match_limit(mut self, n: usize) -> Self {
+        self.scan_match_limit = n.max(1);
+        self
+    }
+
+    /// Hold at most `n` state files open at once (0 is taken as 1).
+    pub fn with_open_files(mut self, n: usize) -> Self {
+        self.files.set_capacity(n);
+        self
+    }
+
+    /// State files currently held open.
+    pub fn open_files(&self) -> usize {
+        self.files.len()
     }
 
     pub fn savepoint(&self) -> &Savepoint {
@@ -847,14 +1206,17 @@ impl<'a> StateReader<'a> {
                 keyed_subtasks: op
                     .subtask_states
                     .iter()
-                    .filter(|s| matches!(s.managed_keyed_state, StateHandle::KeyGroups(_)))
+                    .filter(|s| {
+                        matches!(s.managed_keyed_state, StateHandle::KeyGroups(_))
+                            || unsupported_keyed_handle(&s.managed_keyed_state).is_some()
+                    })
                     .count(),
             })
             .collect()
     }
 
     /// The index of the operator whose hex id is `op`, or starts with it (unambiguously).
-    pub fn operator_index(&self, op: &str) -> Result<usize, String> {
+    pub fn operator_index(&self, op: &str) -> Result<usize, ReaderError> {
         let ids: Vec<String> = self
             .savepoint
             .operators
@@ -867,15 +1229,11 @@ impl<'a> StateReader<'a> {
         let matching: Vec<usize> = (0..ids.len()).filter(|&i| ids[i].starts_with(op)).collect();
         match matching.as_slice() {
             [i] => Ok(*i),
-            [] => Err(format!("no operator matches {:?}", op)),
-            many => Err(format!(
-                "operator prefix {:?} is ambiguous: {}",
-                op,
-                many.iter()
-                    .map(|&i| ids[i].as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )),
+            [] => Err(ReaderError::UnknownOperator { op: op.to_string() }),
+            many => Err(ReaderError::AmbiguousOperator {
+                op: op.to_string(),
+                candidates: many.iter().map(|&i| ids[i].clone()).collect(),
+            }),
         }
     }
 
@@ -886,7 +1244,7 @@ impl<'a> StateReader<'a> {
     }
 
     /// The keyed states of `op`, from its subtasks' headers.
-    pub fn states(&self, op: &str) -> Result<KeyedStates, String> {
+    pub fn states(&self, op: &str) -> Result<KeyedStates, ReaderError> {
         let ctx = self.context(self.operator_index(op)?);
         let mut out = KeyedStates {
             key_type: ctx.key_type().unwrap_or_default().to_string(),
@@ -918,28 +1276,33 @@ impl<'a> StateReader<'a> {
     }
 
     /// A cursor must name the subtask that holds its key-group.
-    fn check_cursor(&self, ctx: &OpContext, cursor: &Cursor) -> Result<(), String> {
+    fn check_cursor(&self, ctx: &OpContext, cursor: &Cursor) -> Result<(), ReaderError> {
         match ctx.unit_of(cursor.key_group as i32) {
-            Some(u) if ctx.unit_subtask(u) != cursor.subtask => Err(format!(
-                "cursor {} does not fit operator {}: key-group {} is held by subtask {}",
-                cursor,
-                hex_id(&self.savepoint.operators[ctx.op_index].id),
-                cursor.key_group,
-                ctx.unit_subtask(u)
-            )),
+            Some(u) if ctx.unit_subtask(u) != cursor.subtask => Err(ReaderError::BadCursor {
+                cursor: cursor.to_string(),
+                reason: format!(
+                    "cursor {} does not fit operator {}: key-group {} is held by subtask {}",
+                    cursor,
+                    hex_id(&self.savepoint.operators[ctx.op_index].id),
+                    cursor.key_group,
+                    ctx.unit_subtask(u)
+                ),
+            }),
             _ => Ok(()),
         }
     }
 
-    /// Load the inflated block of absolute key-group `kg` of stream `si`.
-    fn load_block(
+    /// The parsed block of absolute key-group `kg` of stream `si` (`None`: the key-group is
+    /// empty, and nothing was read), from the cache or read, inflated and parsed (and cached if
+    /// `keep`). `Err`: the block cannot be read or inflated, or the stream's header is unreadable.
+    fn grouped(
         &self,
         ctx: &OpContext,
         si: usize,
         kg: i32,
         keep: bool,
         stats: &mut ReadStats,
-    ) -> Result<Option<Block<'_>>, String> {
+    ) -> Result<Option<Arc<GroupedBlock>>, String> {
         let s = &ctx.streams[si];
         let Some(range) = s.block_range((kg - s.start_key_group) as usize) else {
             return Ok(None);
@@ -951,111 +1314,121 @@ impl<'a> StateReader<'a> {
         let key = (ctx.op_index, s.state_pos, kg);
         if let Some(b) = self.cache.lock().ok().and_then(|mut c| c.get(&key)) {
             stats.cache_hits += 1;
-            stats.max_block_bytes = stats.max_block_bytes.max(b.len());
-            return Ok(Some(Block::Shared(b)));
+            stats.max_block_bytes = stats.max_block_bytes.max(b.inflated_len);
+            return Ok(Some(b));
         }
         stats.bytes_read += stored;
-        if !header.compressed {
-            if let Source::Inline { .. } = s.src {
-                // Borrowed from `_metadata`: nothing to copy, nothing to cache.
-                let inline = keyed_handle(&self.savepoint.operators[ctx.op_index], s.state_pos)
-                    .map(|h| inline_bytes(effective_delegate(h)))
-                    .unwrap_or(&[]);
-                let block = inline
-                    .get(range.0 as usize..range.1 as usize)
-                    .ok_or_else(|| format!("{}: key-group {} is out of bounds", s.what, kg))?;
-                stats.max_block_bytes = stats.max_block_bytes.max(block.len());
-                return Ok(Some(Block::Borrowed(block)));
-            }
-        }
+        let inline = keyed_handle(&self.savepoint.operators[ctx.op_index], s.state_pos)
+            .map(|h| inline_bytes(effective_delegate(h)))
+            .unwrap_or(&[]);
         let mut raw = Vec::new();
-        let bytes = s.read_block(&self.savepoint, ctx.op_index, range, &mut raw)?;
-        let block = if header.compressed {
-            let mut inflated = Vec::new();
-            key_group_block(bytes, true, &mut inflated)
-                .map_err(|e| format!("{}: key-group {}: snappy decode: {}", s.what, kg, e))?;
-            Block::Shared(inflated.into())
-        } else {
-            Block::Shared(raw.into())
-        };
+        let mut inflated = Vec::new();
+        let bytes = s
+            .src
+            .read_pooled(&self.files, inline, range.0, range.1, &mut raw)?;
+        let block = key_group_block(bytes, header.compressed, &mut inflated)
+            .map_err(|e| format!("{}: key-group {}: snappy decode: {}", s.what, kg, e))?;
         stats.max_block_bytes = stats.max_block_bytes.max(block.len());
+        let max_p = self.savepoint.operators[ctx.op_index].max_parallelism;
+        let (keys, defect, weight) = group_block(block, kg as u16, header, kg_prefix_len(max_p));
+        let grouped = Arc::new(GroupedBlock {
+            keys,
+            defect: defect.map(|d| format!("subtask {}, key-group {}: {}", s.subtask_index, kg, d)),
+            inflated_len: block.len(),
+            weight,
+        });
         if keep {
-            if let (Block::Shared(b), Ok(mut c)) = (&block, self.cache.lock()) {
-                c.insert(key, b.clone());
+            if let Ok(mut c) = self.cache.lock() {
+                c.insert(key, grouped.clone());
             }
         }
-        Ok(Some(block))
+        Ok(Some(grouped))
     }
 
-    /// Read and group the block of `kg` in stream `si`.
-    fn block_keys(
-        &self,
-        ctx: &OpContext,
-        si: usize,
-        kg: i32,
-        keep: bool,
-        stats: &mut ReadStats,
-        malformed: &mut Vec<String>,
-    ) -> Result<Vec<RawKey>, String> {
-        let Some(block) = self.load_block(ctx, si, kg, keep, stats)? else {
-            return Ok(Vec::new());
-        };
-        let s = &ctx.streams[si];
-        let header = s.header.as_ref().map_err(String::clone)?;
-        let max_p = self.savepoint.operators[ctx.op_index].max_parallelism;
-        let (keys, defect) = group_block(&block, kg as u16, header, kg_prefix_len(max_p));
-        if let Some(d) = defect {
-            malformed.push(format!(
-                "subtask {}, key-group {}: {}",
-                s.subtask_index, kg, d
-            ));
+    /// A block that could not be read, as a page reports it.
+    fn unreadable_block(s: &SubtaskStream, kg: i32, error: String) -> Unreadable {
+        Unreadable {
+            subtask: s.subtask_index,
+            first_key_group: kg as u16,
+            last_key_group: kg as u16,
+            what: s.what.clone(),
+            error,
         }
-        Ok(keys)
     }
 
-    /// Decode a key's entries.
-    fn record(&self, s: &SubtaskStream, kg: i32, ordinal: u32, raw: RawKey) -> KeyRecord {
-        let header = s.header.as_ref().ok();
-        let entries = raw
-            .entries
-            .into_iter()
-            .enumerate()
-            .map(|(i, e)| {
-                let state = header.and_then(|h| h.states.get(e.state_id as usize));
-                match state {
-                    Some(st) => {
-                        let (map_key, value) = decode_entry_value(
-                            st,
-                            &e.namespace,
-                            &e.value,
-                            self.proto.as_deref(),
-                            i,
-                        );
-                        StateEntry {
-                            state: st.name.clone(),
-                            state_type: st.state_type.clone(),
-                            value_type: st.value_type.clone(),
-                            map_key,
-                            namespace: e.namespace,
-                            raw: e.value,
-                            value,
-                        }
-                    }
-                    // A stateId the header counts but whose metadata was not recognised.
-                    None => StateEntry {
-                        state: format!("#{}", e.state_id),
-                        state_type: "?".to_string(),
-                        value_type: "?".to_string(),
-                        map_key: None,
-                        namespace: e.namespace,
-                        raw: e.value,
-                        value: crate::parser::value::undecodable("?"),
-                    },
+    /// Decode one raw entry; `i` is its index among the key's entries.
+    fn entry(&self, header: &SubtaskHeader, i: usize, e: &KeyedEntry) -> StateEntry {
+        match header.states.get(e.state_id as usize) {
+            Some(st) => {
+                let (map_key, value) =
+                    decode_entry_value(st, &e.namespace, &e.value, self.proto.as_deref(), i);
+                StateEntry {
+                    state: st.labels[0].clone(),
+                    state_type: st.labels[1].clone(),
+                    value_type: st.labels[2].clone(),
+                    map_key,
+                    namespace: e.namespace.clone(),
+                    raw: e.value.clone(),
+                    value,
                 }
+            }
+            // A stateId the header counts but whose metadata was not recognised.
+            None => StateEntry {
+                state: Arc::from(format!("#{}", e.state_id)),
+                state_type: Arc::from("?"),
+                value_type: Arc::from("?"),
+                map_key: None,
+                namespace: e.namespace.clone(),
+                raw: e.value.clone(),
+                value: crate::parser::value::undecodable("?"),
+            },
+        }
+    }
+
+    /// The label of state `state_id` in `header`.
+    fn state_label(header: &SubtaskHeader, state_id: u16) -> Arc<str> {
+        match header.states.get(state_id as usize) {
+            Some(st) => st.labels[0].clone(),
+            None => Arc::from(format!("#{}", state_id)),
+        }
+    }
+
+    /// Decode a key's entries, at most the entry limit per state.
+    fn record(
+        &self,
+        s: &SubtaskStream,
+        header: &SubtaskHeader,
+        kg: i32,
+        ordinal: u32,
+        raw: &RawKey,
+    ) -> KeyRecord {
+        // (stateId, entries seen), in order of first appearance: a key has a few states.
+        let mut counts: Vec<(u16, usize)> = Vec::new();
+        let mut entries = Vec::new();
+        for (i, e) in raw.entries.iter().enumerate() {
+            let seen = match counts.iter_mut().find(|(id, _)| *id == e.state_id) {
+                Some((_, n)) => n,
+                None => {
+                    counts.push((e.state_id, 0));
+                    &mut counts.last_mut().expect("pushed").1
+                }
+            };
+            *seen += 1;
+            if *seen <= self.entry_limit {
+                entries.push(self.entry(header, i, e));
+            }
+        }
+        let truncated = counts
+            .into_iter()
+            .filter(|&(_, n)| n > self.entry_limit)
+            .map(|(id, total)| Truncated {
+                state: Self::state_label(header, id),
+                total,
+                returned: self.entry_limit,
             })
             .collect();
         KeyRecord {
-            key: raw.key,
+            key: raw.key.clone(),
             key_group: kg as u16,
             subtask: s.subtask_index,
             position: Cursor {
@@ -1064,15 +1437,25 @@ impl<'a> StateReader<'a> {
                 ordinal,
             },
             entries,
+            truncated,
         }
     }
 
-    /// Up to `limit` keys from `cursor` on (see the [module documentation](self) for the order),
-    /// each with all its entries, and the cursor of the next page.
+    /// Up to `limit` keys from `cursor` on (see the [module documentation](self) for the order;
+    /// a `limit` of 0 is taken as 1), each with its entries (at most the entry limit per state),
+    /// and the cursor of the next page.
     ///
-    /// A subtask whose file could not be read is an `Err` naming it once the page reaches it (a
-    /// page already holding keys stops before it instead, its `next` pointing there).
-    pub fn key_page(&self, op: &str, cursor: &Cursor, limit: usize) -> Result<KeyPage, String> {
+    /// Key-groups that cannot be read — a subtask whose file is missing or unreadable, whose
+    /// header does not parse or whose keyed handle is unsupported, a block that cannot be read or
+    /// inflated — are listed in [`KeyPage::unreadable`] and skipped: the page goes on past them
+    /// and keeps every key read.
+    pub fn key_page(
+        &self,
+        op: &str,
+        cursor: &Cursor,
+        limit: usize,
+    ) -> Result<KeyPage, ReaderError> {
+        let limit = limit.max(1);
         let ctx = self.context(self.operator_index(op)?);
         self.check_cursor(ctx, cursor)?;
         let mut page = KeyPage {
@@ -1080,45 +1463,40 @@ impl<'a> StateReader<'a> {
             next: None,
             stats: ReadStats::default(),
             malformed: Vec::new(),
+            unreadable: Vec::new(),
         };
         let mut pos = ctx.seek(cursor.key_group as i32, cursor.ordinal);
         loop {
+            if page.keys.len() >= limit {
+                page.next = ctx.cursor_of(&pos);
+                return Ok(page);
+            }
             match pos {
                 Position::End => return Ok(page),
-                Position::Failed(i) => {
-                    let f = &ctx.failed[i];
-                    if page.keys.is_empty() {
-                        return Err(f.error.clone());
-                    }
-                    page.next = Some(Cursor {
-                        subtask: f.subtask_index,
-                        key_group: f.start_key_group as u16,
-                        ordinal: 0,
-                    });
-                    return Ok(page);
+                Position::Unreadable(unit, from) => {
+                    page.unreadable.push(ctx.unreadable(unit, from));
+                    pos = ctx.seek(ctx.unit_range(unit).1 + 1, 0);
                 }
                 Position::Block(si, kg, ordinal) => {
                     let s = &ctx.streams[si];
-                    if page.keys.len() >= limit {
-                        page.next = Some(Cursor {
-                            subtask: s.subtask_index,
-                            key_group: kg as u16,
-                            ordinal,
-                        });
-                        return Ok(page);
-                    }
-                    let keys =
-                        self.block_keys(ctx, si, kg, true, &mut page.stats, &mut page.malformed)?;
-                    for (ord, raw) in keys.into_iter().enumerate().skip(ordinal as usize) {
-                        if page.keys.len() >= limit {
-                            page.next = Some(Cursor {
-                                subtask: s.subtask_index,
-                                key_group: kg as u16,
-                                ordinal: ord as u32,
-                            });
-                            return Ok(page);
+                    match self.grouped(ctx, si, kg, true, &mut page.stats) {
+                        Err(e) => page.unreadable.push(Self::unreadable_block(s, kg, e)),
+                        Ok(None) => {}
+                        Ok(Some(block)) => {
+                            let header = s.header.as_ref().expect("grouped checked it");
+                            page.malformed.extend(block.defect.iter().cloned());
+                            for (ord, raw) in block.keys.iter().enumerate().skip(ordinal as usize) {
+                                if page.keys.len() >= limit {
+                                    page.next = Some(Cursor {
+                                        subtask: s.subtask_index,
+                                        key_group: kg as u16,
+                                        ordinal: ord as u32,
+                                    });
+                                    return Ok(page);
+                                }
+                                page.keys.push(self.record(s, header, kg, ord as u32, raw));
+                            }
                         }
-                        page.keys.push(self.record(s, kg, ord as u32, raw));
                     }
                     pos = ctx.seek(kg + 1, 0);
                 }
@@ -1130,26 +1508,27 @@ impl<'a> StateReader<'a> {
     /// read that block alone.
     ///
     /// Works for `String`, `Long`, `Int`, `Short`, `Byte`, `Char`, `Boolean`, `Float`, `Double`,
-    /// `BigInteger` and `Tuple` keys of those ([`JavaKey::parse`] says which texts are accepted);
-    /// other key types answer [`Lookup::NeedsScan`]. An empty key-group answers
-    /// [`Lookup::Absent`] without any I/O. `Err` when the owning subtask's file could not be read,
-    /// or when its block is malformed before the key was found.
-    pub fn get(&self, op: &str, key_text: &str) -> Result<Lookup, String> {
+    /// `BigInteger`, `Date`, `LocalDate` and Flink `TupleN` keys of those ([`JavaKey::parse`] says
+    /// which texts are accepted); other key types answer [`Lookup::NeedsScan`]. An empty key-group
+    /// answers [`Lookup::Absent`] without any I/O. [`ReaderError::Unreadable`] when the owning
+    /// subtask or block cannot be read, [`ReaderError::Malformed`] when its block is malformed
+    /// before the key was found; a key found in a malformed block is `Found` with `malformed` set.
+    pub fn get(&self, op: &str, key_text: &str) -> Result<Lookup, ReaderError> {
         let op_index = self.operator_index(op)?;
         let ctx = self.context(op_index);
         let operator = &self.savepoint.operators[op_index];
-        let Some(key_type) = ctx.key_type() else {
-            return match ctx.failed.first() {
-                Some(f) => Err(f.error.clone()),
-                None => match ctx.streams.iter().find_map(|s| s.header.as_ref().err()) {
-                    Some(e) => Err(e.clone()),
-                    None => Err(format!(
-                        "operator {} has no keyed state",
-                        hex_id(&operator.id)
-                    )),
+        let Some(first) = ctx.first_header() else {
+            return Err(match ctx.units.first() {
+                Some(&u) => ctx.unreadable(u, 0).into_error(),
+                None => ReaderError::NoKeyedState {
+                    op: hex_id(&operator.id),
                 },
-            };
+            });
         };
+        let key_type = first.key_type.as_str();
+        if let Some(reason) = first.tuple_key_unhashable() {
+            return Ok(Lookup::NeedsScan { reason });
+        }
         let key = match JavaKey::parse(key_type, key_text) {
             Ok(k) => k,
             Err(reason) => return Ok(Lookup::NeedsScan { reason }),
@@ -1166,46 +1545,142 @@ impl<'a> StateReader<'a> {
             subtask,
             stats,
         };
-        let si = match ctx.unit_of(kg) {
+        let unit = match ctx.unit_of(kg) {
             None => {
                 return Ok(absent(
                     subtask_for_key_group(operator.max_parallelism, operator.parallelism, kg),
                     stats,
                 ))
             }
-            Some(Unit::Failed(i)) => return Err(ctx.failed[i].error.clone()),
-            Some(Unit::Stream(i)) => i,
+            Some(u) => u,
+        };
+        if ctx.unit_error(unit).is_some() {
+            let mut u = ctx.unreadable(unit, kg);
+            u.first_key_group = kg as u16;
+            u.last_key_group = kg as u16;
+            return Err(u.into_error());
+        }
+        let Unit::Stream(si) = unit else {
+            unreachable!("a failed unit has an error");
         };
         let s = &ctx.streams[si];
-        let mut malformed = Vec::new();
-        let keys = self.block_keys(ctx, si, kg, true, &mut stats, &mut malformed)?;
-        match keys
-            .into_iter()
-            .enumerate()
-            .find(|(_, k)| k.key == canonical)
-        {
-            Some((ord, raw)) => Ok(Lookup::Found {
-                record: self.record(s, kg, ord as u32, raw),
+        let block = match self.grouped(ctx, si, kg, true, &mut stats) {
+            Ok(Some(b)) => b,
+            Ok(None) => return Ok(absent(s.subtask_index, stats)),
+            Err(e) => return Err(Self::unreadable_block(s, kg, e).into_error()),
+        };
+        let header = s.header.as_ref().expect("grouped checked it");
+        match block.keys.iter().position(|k| k.key == canonical) {
+            Some(ord) => Ok(Lookup::Found {
+                record: self.record(s, header, kg, ord as u32, &block.keys[ord]),
                 stats,
+                malformed: block.defect.iter().cloned().collect(),
             }),
-            None if !malformed.is_empty() => Err(format!(
-                "{}: {}; key {:?} may be in the part that could not be read",
-                s.what, malformed[0], key_text
-            )),
-            None => Ok(absent(s.subtask_index, stats)),
+            None => match &block.defect {
+                Some(d) => Err(ReaderError::Malformed {
+                    subtask: s.subtask_index,
+                    key_group: kg as u16,
+                    what: s.what.clone(),
+                    defect: d.clone(),
+                    key: key_text.to_string(),
+                }),
+                None => Ok(absent(s.subtask_index, stats)),
+            },
         }
     }
 
+    /// Entries `offset..offset + limit` (a `limit` of 0 is taken as 1) of state `state` of the
+    /// key at `position` (a [`KeyRecord::position`]), in on-disk order: the continuation of a
+    /// record cut at the entry limit ([`KeyRecord::truncated`]), or any state's entries paged.
+    pub fn entries(
+        &self,
+        op: &str,
+        position: &Cursor,
+        state: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<EntryPage, ReaderError> {
+        let limit = limit.max(1);
+        let ctx = self.context(self.operator_index(op)?);
+        self.check_cursor(ctx, position)?;
+        let kg = position.key_group as i32;
+        let not_found = || ReaderError::NotFound {
+            what: format!("no key at {}", position),
+        };
+        let unit = ctx.unit_of(kg).ok_or_else(not_found)?;
+        if ctx.unit_error(unit).is_some() {
+            return Err(ctx.unreadable(unit, kg).into_error());
+        }
+        let Unit::Stream(si) = unit else {
+            unreachable!("a failed unit has an error");
+        };
+        let s = &ctx.streams[si];
+        let mut stats = ReadStats::default();
+        let block = match self.grouped(ctx, si, kg, true, &mut stats) {
+            Ok(Some(b)) => b,
+            Ok(None) => return Err(not_found()),
+            Err(e) => return Err(Self::unreadable_block(s, kg, e).into_error()),
+        };
+        let raw = block
+            .keys
+            .get(position.ordinal as usize)
+            .ok_or_else(not_found)?;
+        let header = s.header.as_ref().expect("grouped checked it");
+        let mut page = EntryPage {
+            key: raw.key.clone(),
+            state: Arc::from(state),
+            entries: Vec::new(),
+            offset,
+            total: 0,
+            next: None,
+            stats: ReadStats::default(),
+            malformed: block.defect.iter().cloned().collect(),
+        };
+        match header.state_id(state) {
+            Some(id) => {
+                page.state = Self::state_label(header, id);
+                for (i, e) in raw.entries.iter().enumerate() {
+                    if e.state_id != id {
+                        continue;
+                    }
+                    if page.total >= offset && page.total < offset.saturating_add(limit) {
+                        page.entries.push(self.entry(header, i, e));
+                    }
+                    page.total += 1;
+                }
+            }
+            // Registered by another subtask only: this key has no entries of it.
+            None if ctx
+                .streams
+                .iter()
+                .any(|o| o.header.as_ref().is_ok_and(|h| h.state_id(state).is_some())) => {}
+            None => {
+                return Err(ReaderError::NotFound {
+                    what: format!(
+                        "operator {} has no keyed state {:?}",
+                        hex_id(&self.savepoint.operators[ctx.op_index].id),
+                        state
+                    ),
+                })
+            }
+        }
+        let end = offset.saturating_add(page.entries.len());
+        page.next = (end < page.total).then_some(end);
+        page.stats = stats;
+        Ok(page)
+    }
+
     /// Test `matches` on every key's rendered text from `cursor` on, reading blocks until their
-    /// stored size reaches `byte_budget` (at least one block per call, so a scan always moves).
-    /// Returns the matching keys with all their entries, and where to resume.
+    /// stored size reaches `byte_budget` (at least one block per call, so a scan always moves), or
+    /// until the scan match limit is reached. Returns the matching keys with their entries, and
+    /// where to resume. Unreadable key-groups are listed in [`ScanPage::unreadable`] and skipped.
     pub fn scan(
         &self,
         op: &str,
         cursor: &Cursor,
         byte_budget: u64,
         matches: &mut dyn FnMut(&str) -> bool,
-    ) -> Result<ScanPage, String> {
+    ) -> Result<ScanPage, ReaderError> {
         let ctx = self.context(self.operator_index(op)?);
         self.check_cursor(ctx, cursor)?;
         let mut page = ScanPage {
@@ -1213,40 +1688,48 @@ impl<'a> StateReader<'a> {
             next: None,
             stats: ReadStats::default(),
             malformed: Vec::new(),
+            unreadable: Vec::new(),
         };
         let mut pos = ctx.seek(cursor.key_group as i32, cursor.ordinal);
         let mut visited = 0usize;
         loop {
+            if !matches!(pos, Position::End)
+                && ((visited > 0 && page.stats.block_bytes >= byte_budget)
+                    || page.matches.len() >= self.scan_match_limit)
+            {
+                page.next = ctx.cursor_of(&pos);
+                return Ok(page);
+            }
             match pos {
                 Position::End => return Ok(page),
-                Position::Failed(i) => {
-                    let f = &ctx.failed[i];
-                    if visited == 0 {
-                        return Err(f.error.clone());
-                    }
-                    page.next = Some(Cursor {
-                        subtask: f.subtask_index,
-                        key_group: f.start_key_group as u16,
-                        ordinal: 0,
-                    });
-                    return Ok(page);
+                Position::Unreadable(unit, from) => {
+                    page.unreadable.push(ctx.unreadable(unit, from));
+                    visited += 1;
+                    pos = ctx.seek(ctx.unit_range(unit).1 + 1, 0);
                 }
                 Position::Block(si, kg, ordinal) => {
                     let s = &ctx.streams[si];
-                    if visited > 0 && page.stats.block_bytes >= byte_budget {
-                        page.next = Some(Cursor {
-                            subtask: s.subtask_index,
-                            key_group: kg as u16,
-                            ordinal,
-                        });
-                        return Ok(page);
-                    }
                     // A scan walks past blocks once: it does not fill the cache.
-                    let keys =
-                        self.block_keys(ctx, si, kg, false, &mut page.stats, &mut page.malformed)?;
-                    for (ord, raw) in keys.into_iter().enumerate().skip(ordinal as usize) {
-                        if matches(&raw.key) {
-                            page.matches.push(self.record(s, kg, ord as u32, raw));
+                    match self.grouped(ctx, si, kg, false, &mut page.stats) {
+                        Err(e) => page.unreadable.push(Self::unreadable_block(s, kg, e)),
+                        Ok(None) => {}
+                        Ok(Some(block)) => {
+                            let header = s.header.as_ref().expect("grouped checked it");
+                            page.malformed.extend(block.defect.iter().cloned());
+                            for (ord, raw) in block.keys.iter().enumerate().skip(ordinal as usize) {
+                                if page.matches.len() >= self.scan_match_limit {
+                                    page.next = Some(Cursor {
+                                        subtask: s.subtask_index,
+                                        key_group: kg as u16,
+                                        ordinal: ord as u32,
+                                    });
+                                    return Ok(page);
+                                }
+                                if matches(&raw.key) {
+                                    page.matches
+                                        .push(self.record(s, header, kg, ord as u32, raw));
+                                }
+                            }
                         }
                     }
                     visited += 1;
