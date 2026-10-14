@@ -96,6 +96,17 @@ impl<R: Read> JavaReader<R> {
     /// surrogate units, one after the other: the units are collected and decoded together. An
     /// unpaired surrogate, which Java strings may hold but Rust strings cannot, becomes U+FFFD.
     pub fn read_nullable_string_value(&mut self) -> Result<Option<String>, ParseError> {
+        Ok(self.read_nullable_string_units()?.map(|units| {
+            char::decode_utf16(units)
+                .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
+                .collect()
+        }))
+    }
+
+    /// The UTF-16 code units of a Flink `StringValue` string, exactly as written (lone surrogates
+    /// included), `None` being a null string. See
+    /// [`read_nullable_string_value`](Self::read_nullable_string_value) for the layout.
+    pub fn read_nullable_string_units(&mut self) -> Result<Option<Vec<u16>>, ParseError> {
         let len_plus_one = self.read_vint()?;
         if len_plus_one == 0 {
             return Ok(None);
@@ -107,11 +118,7 @@ impl<R: Read> JavaReader<R> {
             // `readString` stores `(char) c`, i.e. the low 16 bits.
             units.push(self.read_vint()? as u16);
         }
-        Ok(Some(
-            char::decode_utf16(units)
-                .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
-                .collect(),
-        ))
+        Ok(Some(units))
     }
 
     /// [`read_nullable_string_value`](Self::read_nullable_string_value) for the places where Flink

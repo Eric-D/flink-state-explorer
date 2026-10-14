@@ -3,14 +3,16 @@
 //! A file-backed stream is opened and checked against the length its handle records
 //! ([`crate::state_file::open`]) when its operator is opened, which also reads its header; the
 //! handle is then [closed](Source::close), so opening an operator of any parallelism holds one
-//! file at a time. The first key-group read opens it again and keeps it: from then on it is read
-//! with positional reads (`pread` on Unix, `seek_read` on Windows), so concurrent readers share
-//! one handle and nothing is reopened per key-group. An inline stream (`ByteStreamStateHandle`) is
+//! file at a time. Key-group reads then go through positional reads (`pread` on Unix,
+//! `seek_read` on Windows), so concurrent readers share one handle: the export keeps its own
+//! handle per stream ([`Source::read`]), a `StateReader` takes handles from a [`FilePool`] of at
+//! most a few dozen open files, least recently used closed first ([`Source::read_pooled`]), so a
+//! handle is reopened only after it has been evicted, never per key-group. An inline stream (`ByteStreamStateHandle`) is
 //! never copied: its bytes stay in the parsed `_metadata` and are borrowed from there.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::parser::state_handle::StreamStateHandle;
 
@@ -80,11 +82,96 @@ impl Source {
         }
     }
 
+    /// [`read`](Self::read), but a file region is read through a handle of `pool` rather than
+    /// one this source keeps: what [`crate::reader::StateReader`] uses, so that the number of
+    /// files it holds open is bounded whatever the parallelism.
+    pub(crate) fn read_pooled<'s>(
+        &self,
+        pool: &FilePool,
+        inline: &'s [u8],
+        start: u64,
+        end: u64,
+        buf: &'s mut Vec<u8>,
+    ) -> Result<&'s [u8], String> {
+        let Source::File { path, base, .. } = self else {
+            return self.read(inline, start, end, buf);
+        };
+        let end = end.min(self.len());
+        if end <= start {
+            return Ok(&[]);
+        }
+        let file = pool.get(path)?;
+        buf.clear();
+        buf.resize((end - start) as usize, 0);
+        read_exact_at(&file, buf, base + start)
+            .map_err(|e| format!("read {}: {}", path.display(), e))?;
+        Ok(buf.as_slice())
+    }
+
     /// Close the file until the next read needs it.
     pub(crate) fn close(&mut self) {
         if let Source::File { file, .. } = self {
             file.take();
         }
+    }
+}
+
+/// An open file: its path, its handle, its last use.
+type OpenFile = (PathBuf, Arc<File>, u64);
+
+/// Open files shared by every stream of a reader, at most `capacity` of them, the least recently
+/// used closed first. A handle in use by a read stays valid after its eviction (it is an `Arc`).
+#[derive(Debug)]
+pub(crate) struct FilePool {
+    capacity: usize,
+    /// `(path, handle, last use)`; a handful of entries, searched linearly.
+    open: Mutex<(u64, Vec<OpenFile>)>,
+}
+
+impl FilePool {
+    pub(crate) fn new(capacity: usize) -> FilePool {
+        FilePool {
+            capacity: capacity.max(1),
+            open: Mutex::new((0, Vec::new())),
+        }
+    }
+
+    pub(crate) fn set_capacity(&mut self, capacity: usize) {
+        self.capacity = capacity.max(1);
+    }
+
+    /// Files currently open.
+    pub(crate) fn len(&self) -> usize {
+        self.open.lock().map(|g| g.1.len()).unwrap_or(0)
+    }
+
+    fn get(&self, path: &Path) -> Result<Arc<File>, String> {
+        if let Ok(mut guard) = self.open.lock() {
+            let (tick, open) = &mut *guard;
+            *tick += 1;
+            if let Some(entry) = open.iter_mut().find(|(p, _, _)| p == path) {
+                entry.2 = *tick;
+                return Ok(entry.1.clone());
+            }
+        }
+        // Opened outside the lock: two threads may both open it, and one handle is kept.
+        let file = Arc::new(File::open(path).map_err(|e| crate::state_file::io_error(path, &e))?);
+        if let Ok(mut guard) = self.open.lock() {
+            let (tick, open) = &mut *guard;
+            *tick += 1;
+            if let Some(entry) = open.iter_mut().find(|(p, _, _)| p == path) {
+                entry.2 = *tick;
+                return Ok(entry.1.clone());
+            }
+            while open.len() >= self.capacity {
+                let oldest = (0..open.len())
+                    .min_by_key(|&i| open[i].2)
+                    .expect("non-empty");
+                open.swap_remove(oldest);
+            }
+            open.push((path.to_path_buf(), file.clone(), *tick));
+        }
+        Ok(file)
     }
 }
 

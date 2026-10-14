@@ -57,7 +57,7 @@ fn rows_of(keys: &[KeyRecord]) -> Vec<Row> {
             let ns = (e.map_key.is_none() && e.namespace.len() > 1)
                 .then(|| e.namespace.iter().map(|b| format!("{:02x}", b)).collect());
             rows.push((
-                e.state.clone(),
+                e.state.to_string(),
                 k.key.clone(),
                 map_key(e.map_key.as_deref()),
                 e.value.to_string(),
@@ -115,7 +115,7 @@ fn check(dir: &str) {
         // without a known hashCode().
         for k in &keys {
             match r.get(&op.id, &k.key).unwrap() {
-                Lookup::Found { record, stats } => {
+                Lookup::Found { record, stats, .. } => {
                     assert_eq!(&record, k);
                     assert_eq!(stats.blocks, 1);
                     found += 1;
