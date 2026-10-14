@@ -242,7 +242,7 @@ markers (`read_field_value_pub` → `Result`). In a typed Parquet scalar column 
 
 ### Decoded correctly
 Scalars, `char`/`Character` (`Char` → a one-character string) and `char[]` (an array of them; a
-lone surrogate becomes U+FFFD), strings with characters outside the BMP (`StringValue` writes
+lone surrogate is shown as its Java escape, e.g. `\uD83D`, so distinct chars stay distinct), strings with characters outside the BMP (`StringValue` writes
 UTF-16 units, so surrogate pairs are decoded together), date/time (`Date`/`Timestamp`/`Instant`;
 note: Flink serializes `java.time.LocalDate`/
 `LocalTime`/`LocalDateTime` POJO fields with **Kryo**, so they show as `[Kryo]` — the dedicated

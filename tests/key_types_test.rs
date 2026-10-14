@@ -54,7 +54,7 @@ fn operator(key_ser: Ser, keys: &[Val], max_parallelism: i32) -> KeyedOperator {
     op
 }
 
-fn write(op: &KeyedOperator, tag: &str) -> std::path::PathBuf {
+fn write(op: &KeyedOperator, tag: &str) -> synth::TempDir {
     let mut spec = Spec::new(Storage::Files);
     spec.operators.push(op.clone());
     let dir = synth::temp_dir(tag);

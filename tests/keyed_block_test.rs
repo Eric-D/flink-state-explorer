@@ -150,6 +150,7 @@ fn compressed_key_group_decodes_like_an_uncompressed_one() {
                 kg_prefix_len: 1,
                 key_pojo: None,
                 state_types: &["VALUE".to_string()],
+                layouts: &[],
                 only_state: Some(0),
             },
             &mut |e| out.push(e),
@@ -209,6 +210,7 @@ fn a_state_filter_skips_other_states_entries() {
         kg_prefix_len: 1,
         key_pojo: None,
         state_types: &types,
+        layouts: &[],
         only_state,
     };
     parse_key_group_block(&block, 0, &ctx(Some(1)), &mut |e| only_one.push(e)).unwrap();

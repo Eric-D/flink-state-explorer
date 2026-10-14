@@ -701,9 +701,11 @@ fn namespace_width(snapshot_class: &str) -> Option<usize> {
 /// so a block ends with `writeUTF(class) + writeInt(version)`
 /// (`TypeSerializerSnapshot.writeVersionedSnapshot`, TypeSerializerSnapshot.java:214-219).
 pub fn extract_entry_layouts(data: &[u8], header_end: usize) -> Vec<EntryLayout> {
+    // The header only (#17): the extractors must not scan key-group bytes.
     let header_end = header_end.min(data.len());
+    let data = &data[..header_end];
     let metas = extract_state_metadata(data);
-    let value_types = extract_value_serializer_types(data);
+    let value_types = extract_value_serializer_types(data, &metas);
 
     let starts: Vec<Option<usize>> = metas
         .iter()
@@ -1146,11 +1148,22 @@ pub fn parse_key_group_block(
         let (key, namespace, timer_value) = if !wanted {
             (String::new(), Vec::new(), None)
         } else if is_timer {
-            let (k, ts) = read_timer_key(&data[key_start..key_end], kg_prefix_len, key_type);
+            let (k, ts) = read_timer_key(
+                &data[key_start..key_end],
+                kg_prefix_len,
+                key_type,
+                key_pojo,
+                layouts.get(state_id as usize),
+            );
             (k, Vec::new(), Some(ts))
         } else {
-            let (k, ns) =
-                read_key_from_bytes(&data[key_start..key_end], kg_prefix_len, key_type, key_pojo);
+            let (k, ns) = read_key_from_bytes(
+                &data[key_start..key_end],
+                kg_prefix_len,
+                key_type,
+                key_pojo,
+                layouts.get(state_id as usize),
+            );
             (k, ns, None)
         };
         pos = key_end;
