@@ -195,6 +195,9 @@ read access to the savepoint** for as long as the server runs. The table:
 | One key: every state's decoded value as a tree, raw bytes in hex | `/op/<id>/key?at=<cursor>` | `/api/op/<id>/key?at=…` |
 | Exact lookup by key text | `/op/<id>/lookup?key=<text>` | `/api/op/<id>/lookup?key=…` |
 | The rest of a big key: one state's entries, paged | `/op/<id>/entries?at=<cursor>&state=<state>&offset=N` | `/api/op/<id>/entries?…` |
+| Search keys (glob, substring, exact), optionally in a key-group range | `/op/<id>/search?q=…&mode=glob\|substring\|exact&from=…&to=…` | `/api/op/<id>/search?…` |
+| Exact key and entry counts per state (background pass) | `/op/<id>/count` (`?cancel=1`, `?restart=1`) | `/api/op/<id>/count` |
+| Download one state, NDJSON or Parquet | `/op/<id>/download?state=<state>&format=ndjson\|parquet` | — |
 
 The `/api/` rows have exactly the shape of an `--export-state` NDJSON line (`operator`, `subtask`,
 `state`, `state_type`, `key`, `key_group`, `value`, and `map_key` / `namespace_hex`); a page's
@@ -250,9 +253,45 @@ ssh -L 8080:127.0.0.1:8080 user@flink-host \
 
 The local port may differ (`ssh -L 9000:127.0.0.1:8080` → open `http://127.0.0.1:9000/?token=…`).
 
+**Search.** The operator page and the keys pages have a search box: **glob** (`*` any run of
+characters, `?` one, case ignored — the TUI filter's syntax), **substring** (case ignored, `*` and
+`?` literal) or **exact** (the key itself), tested on every key as it is rendered, optionally
+within a key-group range (`from`/`to`, inclusive). Each request reads about 4 MB of key-groups
+(`budget`, 1 byte to 64 MB) and returns at most 100 matches (`limit`, up to 1000), with the
+cursor to resume from and its progress (key-groups and bytes done, from `_metadata`); in a
+browser the page keeps going by itself and appends matches as they come, with a **Stop** button,
+up to 10 000 matches on the page. Without JavaScript, "Next page of results" does the same one
+request at a time. Queries are at most 256 characters. A key the exact lookup cannot locate
+(POJO, Kryo, opaque keys) gets a one-click exact scan instead.
+
+**Counts.** "Count keys and entries" (`/op/<id>/count`) starts a background pass over the
+operator — one job per operator, kept for as long as the server runs, cancellable
+(`?cancel=1`, shown as *cancelling* until the pass has stopped; `?restart=1` counts again). At
+most two counts run at once; a third is refused with a message until one ends. Until it is done,
+the pages show `≥ N (counting… x %)`; then each state's exact number of keys and of entries
+(entries = rows of its download: one per value, per MAP entry, per timer). If some key-groups
+could not be read, the numbers stay lower bounds: `≥ N (incomplete: k key-group(s) unreadable)`.
+
+**Downloads.** Each keyed state of the operator page has an NDJSON link (and Parquet, in a build
+with `--features parquet`): the same bytes as `--export-state <state> -o -` (and the same Parquet
+file), streamed as it is read. An NDJSON download holds one key-group in memory; a Parquet one
+also buffers a whole 65 536-row group before writing it (about 17 MB measured on our 1M-key test
+savepoint, more with large values). At most two downloads stream at once (one
+more gets `503`), which bounds that memory, and a download whose client reads nothing for 45 s
+is aborted, freeing its place; a download never takes one of the page-reading slots, so stalled
+downloads cannot hold up the pages. A download that cannot be read at all answers an error (the
+cause goes to the server's log, not to the browser); one that hits a malformed key-group, or
+whose client goes away, is aborted (the browser shows a failed download, never a short file
+passing for a whole one).
+
+**Measured** on a 211 MB savepoint (1M keys, 128 key-groups, release build, local disk): a glob or
+substring search through all of it, 43 requests, 1.6 s; a key-group range of 2, 0.3 s; the count of
+every state, 1.5 s; NDJSON downloads of 155 MB at ~190 MB/s and 412 MB at ~150 MB/s; peak RSS of
+the server through all of it, 35 MB.
+
 **Limits.** Keys come in **on-disk order** (key-group by key-group, then as stored), not sorted.
-Key counts, search by substring and downloads come later (#23). The lookup is exact, on the key
-as it is rendered; it cannot locate POJO/Kryo keys (their `hashCode()` is user code) and says so.
+The lookup is exact, on the key as it is rendered; it cannot locate POJO/Kryo keys (their
+`hashCode()` is user code), and offers a scan instead.
 Operator-state elements are listed (name, mode, element count) but not decoded: use the TUI.
 A build without the UI: `cargo build --release --no-default-features`.
 

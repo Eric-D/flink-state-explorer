@@ -69,46 +69,8 @@ impl AppliedFilter {
     }
 }
 
-/// Simple glob matching: `*` matches any sequence of characters (including empty).
-/// Case-insensitive matching.
-fn glob_match(pattern: &str, text: &str) -> bool {
-    let pattern = pattern.to_lowercase();
-    let text = text.to_lowercase();
-    glob_match_inner(pattern.as_bytes(), text.as_bytes())
-}
-
-fn glob_match_inner(pattern: &[u8], text: &[u8]) -> bool {
-    let mut pi = 0;
-    let mut ti = 0;
-    let mut star_pi = usize::MAX;
-    let mut star_ti = 0;
-
-    while ti < text.len() {
-        if pi < pattern.len() && pattern[pi] == b'*' {
-            // Star: remember position, try matching zero chars first
-            star_pi = pi;
-            star_ti = ti;
-            pi += 1;
-        } else if pi < pattern.len() && (pattern[pi] == b'?' || pattern[pi] == text[ti]) {
-            pi += 1;
-            ti += 1;
-        } else if star_pi != usize::MAX {
-            // Backtrack: try matching one more char with the star
-            pi = star_pi + 1;
-            star_ti += 1;
-            ti = star_ti;
-        } else {
-            return false;
-        }
-    }
-
-    // Consume trailing stars
-    while pi < pattern.len() && pattern[pi] == b'*' {
-        pi += 1;
-    }
-
-    pi == pattern.len()
-}
+/// Case-insensitive glob (`*`, `?`), shared with the web UI's search.
+use crate::glob::glob_match;
 
 impl Default for FilterBar {
     fn default() -> Self {
