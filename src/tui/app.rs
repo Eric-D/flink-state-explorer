@@ -9,7 +9,7 @@ use ratatui::Terminal;
 
 use crate::error::{AppError, ParseError, UiError};
 use crate::index::builder::build_index_with_progress;
-use crate::index::cache::{load_cache, save_cache, CachedOperator, IndexCache};
+use crate::index::cache::{load_cache, may_save_cache, save_cache, CachedOperator, IndexCache};
 use crate::parser;
 use crate::profile::storage::{self as profile_storage, Profile};
 use crate::tui::detail::DetailOverlay;
@@ -56,29 +56,7 @@ impl App {
                 format!("No _metadata file found in {}", savepoint_dir.display()),
             ))));
         }
-        let (metadata_size, metadata_mtime) = get_file_stats(&metadata_path);
-
-        on_step(LoadingStep::LoadingCache);
-        let index = if !no_cache {
-            match load_cache(&savepoint_dir, metadata_size, metadata_mtime) {
-                Ok(cache) => cache,
-                Err(_) => parse_and_build(
-                    &metadata_path,
-                    metadata_size,
-                    metadata_mtime,
-                    &savepoint_dir,
-                    &mut on_step,
-                )?,
-            }
-        } else {
-            parse_and_build(
-                &metadata_path,
-                metadata_size,
-                metadata_mtime,
-                &savepoint_dir,
-                &mut on_step,
-            )?
-        };
+        let index = load_index(&savepoint_dir, no_cache, &mut on_step)?;
 
         on_step(LoadingStep::BuildingTree);
         let mut tree_view = TreeView::new(&index);
@@ -688,6 +666,46 @@ pub fn build_proto_context(profile: &Profile) -> Option<(crate::proto::ProtoCont
     }
 }
 
+/// The index the TUI opens `savepoint_dir` with: the cache when allowed and fresh, else a build
+/// from `_metadata` and the state files, which is then cached if [`may_save_cache`] allows.
+///
+/// `no_cache` means the cache is neither read nor written. A build that could not read some state
+/// file is not cached either: it would be served again after the file was repaired.
+pub fn load_index<F>(
+    savepoint_dir: &Path,
+    no_cache: bool,
+    on_step: &mut F,
+) -> Result<IndexCache, AppError>
+where
+    F: FnMut(LoadingStep),
+{
+    let metadata_path = savepoint_dir.join("_metadata");
+    let (metadata_size, metadata_mtime) = get_file_stats(&metadata_path);
+
+    if !no_cache {
+        on_step(LoadingStep::LoadingCache);
+        match load_cache(savepoint_dir, metadata_size, metadata_mtime) {
+            // Never written with load errors; refuse one anyway rather than show a partial index.
+            Ok(cache) if !cache.has_load_errors() => return Ok(cache),
+            _ => {}
+        }
+    }
+
+    let idx = parse_and_build(
+        &metadata_path,
+        metadata_size,
+        metadata_mtime,
+        savepoint_dir,
+        on_step,
+    )?;
+    if may_save_cache(&idx, no_cache) {
+        if let Err(e) = save_cache(&idx, savepoint_dir) {
+            eprintln!("Warning: could not save index cache: {}", e);
+        }
+    }
+    Ok(idx)
+}
+
 fn parse_and_build<F>(
     metadata_path: &Path,
     metadata_size: u64,
@@ -721,9 +739,6 @@ where
             });
         },
     );
-    if let Err(e) = save_cache(&idx, savepoint_dir) {
-        eprintln!("Warning: could not save index cache: {}", e);
-    }
     Ok(idx)
 }
 
@@ -810,6 +825,18 @@ fn build_summary_entries(index: &IndexCache) -> Vec<String> {
         "  Max parallelism:    {} (configured max: {})",
         max_par, max_max_par
     ));
+    let unread_files: usize = index.operators.iter().map(|o| o.load_errors.len()).sum();
+    if unread_files > 0 {
+        let ops = index
+            .operators
+            .iter()
+            .filter(|o| !o.load_errors.is_empty())
+            .count();
+        lines.push(format!(
+            "  ⚠ Unread files:     {} in {} operator(s): keys are missing (i: details)",
+            unread_files, ops
+        ));
+    }
     lines.push(String::new());
 
     lines.push("--- Keyed State ---".to_string());

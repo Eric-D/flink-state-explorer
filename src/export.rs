@@ -96,6 +96,9 @@ fn build_json(index: &IndexCache, proto_ctx: Option<&ProtoContext>) -> Value {
             json!({
                 "name": op.display_name,
                 "info": Value::Object(info),
+                // Every state file that could not be read (the `info` line shows only the first
+                // few): non-empty means `keys` is partial.
+                "load_errors": op.load_errors,
                 "parallelism": op.parallelism,
                 "operator_states": operator_states,
                 "state_descriptors": descriptors,

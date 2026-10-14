@@ -194,7 +194,10 @@ fn file_backed_savepoint_lists_and_exports_every_state() {
     let dir = write(&spec_with(&op, Storage::Files, false), "files");
 
     let savepoint = parser::parse_metadata(&dir.join("_metadata")).unwrap();
-    let listed: Vec<(String, String)> = list_states(&savepoint, &dir)
+    let listing = list_states(&savepoint, &dir);
+    assert_eq!(listing.errors, Vec::<String>::new());
+    let listed: Vec<(String, String)> = listing
+        .states
         .into_iter()
         .map(|(_, name, ty)| (name, ty))
         .collect();
