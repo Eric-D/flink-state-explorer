@@ -2,6 +2,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Tabs, Wrap};
 
 use crate::tui::hex_view::HexView;
+use crate::tui::tree::RawBytes;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ActivePanel {
@@ -14,6 +15,9 @@ pub struct DetailOverlay {
     key_view: HexView,
     value_view: HexView,
     active_panel: ActivePanel,
+    /// What the two panels hold (shown in their titles with the byte count).
+    key_title: String,
+    value_title: String,
     /// When set, the overlay shows operator info text instead of the key/value hex panels.
     info: Option<Vec<(String, String)>>,
 }
@@ -31,14 +35,20 @@ impl DetailOverlay {
             key_view: HexView::new(Vec::new(), "key"),
             value_view: HexView::new(Vec::new(), "value"),
             active_panel: ActivePanel::Key,
+            key_title: "key".to_string(),
+            value_title: "value".to_string(),
             info: None,
         }
     }
 
-    pub fn open(&mut self, key: Vec<u8>, value: Vec<u8>) {
-        self.key_view = HexView::new(key, "key");
-        self.value_view = HexView::new(value, "value");
-        self.active_panel = ActivePanel::Key;
+    /// Show the bytes behind a tree row: the value panel is selected, since it is the one asked
+    /// for.
+    pub fn open_raw(&mut self, raw: RawBytes) {
+        self.key_view = HexView::new(raw.key, "key");
+        self.value_view = HexView::new(raw.value, "value");
+        self.key_title = raw.key_title;
+        self.value_title = raw.value_title;
+        self.active_panel = ActivePanel::Value;
         self.info = None;
         self.visible = true;
     }
@@ -157,7 +167,11 @@ impl DetailOverlay {
         };
         let key_block = Block::default()
             .borders(Borders::TOP)
-            .title(format!(" key ({} bytes) ", self.key_view.data.len()))
+            .title(format!(
+                " {} ({} bytes) ",
+                self.key_title,
+                self.key_view.data.len()
+            ))
             .style(key_style);
         let key_inner = key_block.inner(chunks[1]);
         frame.render_widget(key_block, chunks[1]);
@@ -172,7 +186,11 @@ impl DetailOverlay {
         };
         let val_block = Block::default()
             .borders(Borders::TOP)
-            .title(format!(" value ({} bytes) ", self.value_view.data.len()))
+            .title(format!(
+                " {} ({} bytes) ",
+                self.value_title,
+                self.value_view.data.len()
+            ))
             .style(val_style);
         let val_inner = val_block.inner(chunks[2]);
         frame.render_widget(val_block, chunks[2]);

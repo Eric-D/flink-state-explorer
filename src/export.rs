@@ -3,7 +3,6 @@ use std::path::Path;
 use serde_json::{json, Map, Value};
 
 use crate::index::cache::{CachedPojoInfo, IndexCache};
-use crate::parser::pojo::{PojoField, PojoInfo};
 use crate::proto::ProtoContext;
 
 /// Export the full savepoint index as JSON following the UI hierarchy.
@@ -73,7 +72,7 @@ fn build_json(index: &IndexCache, proto_ctx: Option<&ProtoContext>) -> Value {
                                 let raw = part.values.get(i).and_then(|v| v.as_ref());
                                 let value = match raw {
                                     Some(bytes) if !bytes.is_empty() => {
-                                        let pi = desc.pojo_info.as_ref().map(to_pojo_info);
+                                        let pi = desc.pojo_info.as_ref().map(CachedPojoInfo::to_pojo_info);
                                         crate::parser::value::decode_state_value(
                                             bytes,
                                             &desc.value_type,
@@ -127,23 +126,6 @@ fn build_json(index: &IndexCache, proto_ctx: Option<&ProtoContext>) -> Value {
         "truncated": truncated,
         "operators": operators
     })
-}
-
-/// Convert a cached POJO descriptor into the parser's `PojoInfo` for decoding.
-fn to_pojo_info(c: &CachedPojoInfo) -> PojoInfo {
-    PojoInfo {
-        class_name: c.class_name.clone(),
-        short_name: c.class_name.rsplit('.').next().unwrap_or("").to_string(),
-        fields: c
-            .fields
-            .iter()
-            .map(|f| PojoField {
-                name: f.name.clone(),
-                type_name: f.type_name.clone(),
-                nested_pojo: f.nested.as_ref().map(|n| Box::new(to_pojo_info(n))),
-            })
-            .collect(),
-    }
 }
 
 fn count_keys(val: &Value) -> usize {

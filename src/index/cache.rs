@@ -32,7 +32,9 @@ use crate::error::IndexError;
 ///    BigInteger, Tuple… keys decoded; undecodable ones as `0x…` hex, namespace split off), so
 ///    keys that used to merge into one partition are now distinct; `BigInteger` values no longer
 ///    read as `Int`.
-pub const CACHE_FORMAT: u32 = 7;
+/// 8: operator-state elements keep their bytes again ([`ValueRef::Inline`]), for the TUI's hex
+///    view; only an element that could not be read is [`ValueRef::Decoded`].
+pub const CACHE_FORMAT: u32 = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IndexCache {
@@ -238,6 +240,30 @@ pub struct CachedPojoInfo {
     pub fields: Vec<CachedPojoField>,
 }
 
+impl CachedPojoInfo {
+    /// The parser's `PojoInfo`, which `parser::value` decodes with.
+    pub fn to_pojo_info(&self) -> crate::parser::pojo::PojoInfo {
+        crate::parser::pojo::PojoInfo {
+            class_name: self.class_name.clone(),
+            short_name: self
+                .class_name
+                .rsplit('.')
+                .next()
+                .unwrap_or(&self.class_name)
+                .to_string(),
+            fields: self
+                .fields
+                .iter()
+                .map(|f| crate::parser::pojo::PojoField {
+                    name: f.name.clone(),
+                    type_name: f.type_name.clone(),
+                    nested_pojo: f.nested.as_ref().map(|n| Box::new(n.to_pojo_info())),
+                })
+                .collect(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CachedPojoField {
     pub name: String,
@@ -275,8 +301,8 @@ pub enum ValueRef {
     File { path: String, offset: u64 },
     /// Value is inline in the metadata (canonical savepoint format).
     Inline { data: Vec<u8> },
-    /// The value was decoded into the entry's `key` label when indexing, and its bytes are not
-    /// kept (operator-state elements: nothing reads them back, and a stream can hold millions).
+    /// The entry's `key` label is all there is, and no bytes are kept: an operator-state element
+    /// that could not be read (its label says why).
     Decoded,
 }
 

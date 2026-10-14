@@ -595,8 +595,8 @@ pub fn deserialize_pojo_to_json_with_pos(
     )
 }
 
-/// Read a single field value from the reader, rendered for display. Public for use in tree
-/// display. `Err` is the rendered partial value of a field that could not be fully decoded: the
+/// Read a single field value from the reader, rendered for display (`parser::value` underneath).
+/// `Err` is the rendered partial value of a field that could not be fully decoded: the
 /// reader position is then unreliable (see [`crate::parser::value::Decoded`]).
 pub fn read_field_value_pub(
     r: &mut JavaReader<&[u8]>,
