@@ -496,7 +496,8 @@ pub fn write_savepoint(spec: &Spec, dir: &Path) -> Written {
                     "Storage::Segments covers operator state only"
                 );
                 let (start, end) = range_for_subtask(op.max_parallelism, op.parallelism, subtask);
-                let (stream, offsets) = keyed_stream(op, start, end, spec.compressed);
+                let (stream, offsets) =
+                    keyed_stream(op, subtask, start, end, spec.compressed, spec.run_order);
                 meta.push(7); // KeyGroupsSavepointStateHandle
                 meta.extend_from_slice(&start.to_be_bytes());
                 meta.extend_from_slice(&(end - start + 1).to_be_bytes());

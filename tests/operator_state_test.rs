@@ -42,7 +42,8 @@ fn op_states(index: &IndexCache) -> OpStates {
 
 /// The same, as the full JSON export writes it (`operators[].operator_states`).
 fn exported_op_states(index: &IndexCache, tag: &str) -> OpStates {
-    let out = synth::temp_dir(tag).join("export.json");
+    let tmp = synth::temp_dir(tag);
+    let out = tmp.join("export.json");
     flink_explorer::export::export_json(index, None, &out).expect("export_json");
     let root: Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
     root["operators"]
@@ -139,7 +140,7 @@ fn expected(big: bool) -> OpStates {
     ]
 }
 
-fn write(storage: Storage, compressed: bool, op: KeyedOperator, tag: &str) -> std::path::PathBuf {
+fn write(storage: Storage, compressed: bool, op: KeyedOperator, tag: &str) -> synth::TempDir {
     let mut spec = Spec::new(storage);
     spec.compressed = compressed;
     spec.operators.push(op);
@@ -222,9 +223,8 @@ fn an_unreadable_stream_is_a_visible_error_not_a_placeholder() {
         .unwrap()
         .clone();
     let bytes = std::fs::read(&truncated).unwrap();
-    // Cut 40 bytes: the 28-byte broadcast map and the union list's last 12 bytes (its three
-    // elements are 5 bytes each). What is before still decodes, the element cut short shows its
-    // remaining bytes, and what starts past the end is an error.
+    // A file shorter than its handle's stateSize lost data: like a keyed state file (#16), it is
+    // reported, not half-decoded.
     std::fs::write(&truncated, &bytes[..bytes.len() - 40]).unwrap();
 
     let got = op_states(&index(&dir));
@@ -242,25 +242,31 @@ fn an_unreadable_stream_is_a_visible_error_not_a_placeholder() {
         ],
         "every state keeps its name and mode"
     );
+    let enoent = std::io::Error::from_raw_os_error(2).to_string();
     // Subtask 1: one entry per state, naming the missing file and why.
     for (name, _, labels) in &got[4..] {
         assert_eq!(labels.len(), 1, "{}: {:?}", name, labels);
         assert!(
             labels[0].starts_with("[error: ")
                 && labels[0].contains(&*missing.to_string_lossy())
-                && labels[0].contains("No such file"),
+                && labels[0].contains(&enoent),
             "{}: {}",
             name,
             labels[0]
         );
     }
-    // Subtask 0: the list decodes; the union list's elements and the broadcast map that now
-    // start past the end are errors.
-    let past_the_end = |l: &String| l.starts_with("[error: offset ") && l.contains("outside the");
-    assert_eq!(got[0].2, expected(false)[0].2);
-    assert!(got[1].2[0].starts_with("[3 bytes]"), "{:?}", got[1].2);
-    assert!(got[1].2[1..].iter().all(past_the_end), "{:?}", got[1].2);
-    assert!(past_the_end(&got[3].2[0]), "{:?}", got[3].2);
+    // Subtask 0: every state that has elements says the file is truncated.
+    for (name, _, labels) in got[..4].iter().filter(|(_, _, l)| !l.is_empty()) {
+        assert_eq!(labels.len(), 1, "{}: {:?}", name, labels);
+        assert!(
+            labels[0].starts_with("[error: ")
+                && labels[0].contains(&*truncated.to_string_lossy())
+                && labels[0].contains("truncated: "),
+            "{}: {}",
+            name,
+            labels[0]
+        );
+    }
     // Never a `name[i]` placeholder or a generic `managed-operator-subtaskN` dump.
     assert!(got
         .iter()
@@ -270,52 +276,31 @@ fn an_unreadable_stream_is_a_visible_error_not_a_placeholder() {
 }
 
 #[test]
-fn element_boundaries_are_found_in_linear_time() {
+fn element_boundaries_are_found_without_a_quadratic_scan() {
     // The end of each element used to be a linear scan over all offsets: O(n²) in the elements
-    // of a stream (in release, 250k took 17 s and 1M 250 s). With a binary search 1M elements
-    // index in ~0.3 s in release, 200k in ~0.2 s in debug: bound both loosely, and check the
-    // growth.
-    let build = |n: usize, tag: &str| -> (std::path::PathBuf, usize) {
-        let elements = (0..n).map(|i| Val::Str(format!("e{:07}", i))).collect();
-        let op = KeyedOperator::new(0x0f, 1, 128, Ser::String)
-            .op_state(0, OpState::list("big-list", Ser::String, elements));
-        (write(Storage::Inline, false, op, tag), n)
-    };
-    let time = |(dir, n): &(std::path::PathBuf, usize)| -> Duration {
-        let savepoint = parser::parse_metadata(&dir.join("_metadata")).unwrap();
-        let t = Instant::now();
-        let idx = build_index(&savepoint, 0, 0, dir);
-        let elapsed = t.elapsed();
-        let s = &idx.operators[0].states[0];
-        assert_eq!(s.entries.len(), *n);
-        assert_eq!(
-            s.entries[*n - 1].key,
-            format!("\"e{:07}\"", n - 1).into_bytes()
-        );
-        elapsed
-    };
-    let n = if cfg!(debug_assertions) {
-        200_000
-    } else {
-        1_000_000
-    };
-    let small = build(n / 4, "op-linear-small");
-    let large = build(n, "op-linear-large");
-    let (t_small, t_large) = (time(&small), time(&large));
-    println!("{} elements: {:?}; {}: {:?}", n / 4, t_small, n, t_large);
-    for (dir, _) in [&small, &large] {
-        std::fs::remove_dir_all(dir).ok();
-    }
-    let bound = Duration::from_secs(if cfg!(debug_assertions) { 10 } else { 1 });
-    assert!(t_large < bound, "{} elements took {:?}", n, t_large);
-    // 4x the elements: ~4x the time when linear, ~16x when quadratic.
+    // of a stream (in release, 250k elements took 17 s and 1M took 250 s). With a binary search,
+    // 200k index in ~0.2 s in debug. One generous bound only: wall-clock ratios are fragile on
+    // shared CI runners, and the quadratic version is two orders of magnitude over this.
+    let n = 200_000;
+    let elements = (0..n).map(|i| Val::Str(format!("e{:07}", i))).collect();
+    let op = KeyedOperator::new(0x0f, 1, 128, Ser::String)
+        .op_state(0, OpState::list("big-list", Ser::String, elements));
+    let dir = write(Storage::Inline, false, op, "op-linear");
+    let savepoint = parser::parse_metadata(&dir.join("_metadata")).unwrap();
+    let t = Instant::now();
+    let idx = build_index(&savepoint, 0, 0, &dir);
+    let elapsed = t.elapsed();
+    let s = &idx.operators[0].states[0];
+    assert_eq!(s.entries.len(), n);
+    assert_eq!(
+        s.entries[n - 1].key,
+        format!("\"e{:07}\"", n - 1).into_bytes()
+    );
     assert!(
-        t_large < t_small * 10 + Duration::from_millis(200),
-        "{:?} for {} vs {:?} for {}: not linear",
-        t_large,
+        elapsed < Duration::from_secs(20),
+        "{} elements took {:?}",
         n,
-        t_small,
-        n / 4
+        elapsed
     );
 }
 
@@ -336,6 +321,7 @@ fn operator_stream_matches_real_flink_streams() {
         let savepoint = parser::parse_metadata(&dir.join("_metadata")).unwrap();
         let idx = build_index(&savepoint, 0, 0, dir);
         let mut checked = 0;
+        let mut dumped = false;
         for (op, cached) in savepoint.operators.iter().zip(&idx.operators) {
             let mut cached_states = cached.states.iter();
             for sub in &op.subtask_states {
@@ -388,6 +374,14 @@ fn operator_stream_matches_real_flink_streams() {
                 order.sort_by_key(|&i| os.partition_offsets[i].offsets.first().copied());
                 let states: Vec<OpState> = order.iter().map(|&i| states[i].clone()).collect();
                 let (ours, offsets) = synth::operator_stream(&states, compressed);
+                // The golden stream: the first one holding several states (list + broadcast).
+                if !dumped
+                    && states.len() >= 2
+                    && std::env::var_os("FLINK_EXPLORER_DUMP_GOLDEN").is_some()
+                {
+                    dump_golden(compressed, &states, &bs.data);
+                    dumped = true;
+                }
                 assert_eq!(
                     ours,
                     bs.data,
@@ -407,5 +401,85 @@ fn operator_stream_matches_real_flink_streams() {
             dir.display(),
             checked
         );
+    }
+}
+
+/// The golden files of `golden_operator_streams_are_what_flink_wrote`: one real operator-state
+/// stream per layout, as Flink 1.20 wrote it for `ClusterJob`, and the states it holds.
+/// Regenerate with `FLINK_EXPLORER_DUMP_GOLDEN=1 cargo test --test operator_state_test
+/// operator_stream_matches_real_flink_streams` after `mvn verify`.
+fn golden_paths(compressed: bool) -> (std::path::PathBuf, std::path::PathBuf) {
+    let tag = if compressed { "compressed" } else { "plain" };
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    (
+        dir.join(format!("cluster-job-operator-stream-{}.bin", tag)),
+        dir.join(format!("cluster-job-operator-stream-{}.json", tag)),
+    )
+}
+
+fn dump_golden(compressed: bool, states: &[OpState], stream: &[u8]) {
+    let (bin, json) = golden_paths(compressed);
+    let strings = |v: &[Val]| v.iter().map(Val::render).collect::<Vec<_>>();
+    let desc: Vec<Value> = states
+        .iter()
+        .map(|st| match st {
+            OpState::List {
+                name,
+                union,
+                elements,
+                ..
+            } => serde_json::json!({ "name": name, "union": union, "elements": strings(elements) }),
+            OpState::Broadcast { name, entries, .. } => serde_json::json!({
+                "name": name,
+                "entries": entries.iter().map(|(k, v)| [k.render(), v.render()]).collect::<Vec<_>>(),
+            }),
+        })
+        .collect();
+    std::fs::write(&bin, stream).unwrap();
+    std::fs::write(&json, serde_json::to_string_pretty(&desc).unwrap() + "\n").unwrap();
+}
+
+#[test]
+fn golden_operator_streams_are_what_flink_wrote() {
+    // CI anchor: synth's operator-state writer reproduces, byte for byte, streams Flink wrote.
+    for compressed in [false, true] {
+        let (bin, json) = golden_paths(compressed);
+        let real = std::fs::read(&bin).unwrap();
+        let desc: Vec<Value> =
+            serde_json::from_str(&std::fs::read_to_string(&json).unwrap()).unwrap();
+        let strs = |v: &Value| -> Vec<Val> {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|e| Val::str(e.as_str().unwrap()))
+                .collect()
+        };
+        let states: Vec<OpState> = desc
+            .iter()
+            .map(|d| {
+                let name = d["name"].as_str().unwrap();
+                if let Some(entries) = d.get("entries") {
+                    let entries = entries
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|kv| {
+                            (
+                                Val::str(kv[0].as_str().unwrap()),
+                                Val::str(kv[1].as_str().unwrap()),
+                            )
+                        })
+                        .collect();
+                    OpState::broadcast(name, Ser::String, Ser::String, entries)
+                } else if d["union"].as_bool().unwrap() {
+                    OpState::union_list(name, Ser::String, strs(&d["elements"]))
+                } else {
+                    OpState::list(name, Ser::String, strs(&d["elements"]))
+                }
+            })
+            .collect();
+        assert!(states.len() >= 2, "{}", json.display());
+        let (ours, _) = synth::operator_stream(&states, compressed);
+        assert_eq!(ours, real, "{}", bin.display());
     }
 }
