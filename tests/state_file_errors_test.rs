@@ -549,3 +549,41 @@ fn a_cut_file_is_caught_by_its_key_group_offsets_even_without_a_state_size() {
     let e = export_state_ndjson(&sp, &dir, None, "counter", None, &mut Vec::new()).unwrap_err();
     assert!(e.contains("truncated: key-group"), "{}", e);
 }
+
+#[cfg(unix)]
+#[test]
+fn the_cli_exports_to_dev_null_and_into_a_closed_pipe() {
+    // `<path>.partial` + rename protects a previous export, but `/dev/null`, a FIFO or a device
+    // cannot be replaced by a rename: they are written to directly.
+    let (dir, _) = savepoint("dev-null");
+    let out = Command::new(env!("CARGO_BIN_EXE_flink-explorer"))
+        .arg(&*dir)
+        .args(["--export-state", "counter", "-o", "/dev/null"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // A reader that stops early (`| head`) is not an error.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_flink-explorer"))
+        .arg(&*dir)
+        .args(["--export-state", "counter", "-o", "-"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take()); // close the pipe before anything is read
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
