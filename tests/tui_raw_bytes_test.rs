@@ -91,13 +91,14 @@ fn the_overlay_opens_on_a_keyed_value_with_its_bytes() {
     goto(&mut tree, 5, |p| p.ends_with("> alpha > count"));
 
     let raw = tree
-        .selected_raw_bytes()
+        .selected_raw_bytes(&index)
         .expect("bytes behind a keyed value");
     assert_eq!(raw.value, 7i64.to_be_bytes());
     assert_eq!(raw.value, part.values[0].clone().unwrap());
     assert_eq!(raw.key, b"alpha");
-    // Enter on the leaf opens the same thing.
-    assert_eq!(tree.expand(), Some(raw.clone()));
+    // Enter on the leaf expands nothing: the app opens these bytes instead.
+    assert!(!tree.expand());
+    assert_eq!(tree.selected_raw_bytes(&index), Some(raw.clone()));
 
     let mut overlay = DetailOverlay::new();
     overlay.open_raw(raw);
@@ -114,12 +115,183 @@ fn the_overlay_opens_on_a_keyed_value_with_its_bytes() {
     // A MAP value: the per-key blob the index builds, and said to be one.
     tree.move_down();
     assert!(tree.selected_path().ends_with("> alpha > m"));
-    let raw = tree.selected_raw_bytes().unwrap();
+    let raw = tree.selected_raw_bytes(&index).unwrap();
     assert_eq!(raw.value, part.values[1].clone().unwrap());
+    assert_eq!(raw.value_title, "m [Map<String,Long>]: per-key blob");
+    // The overlay's title fits on an 80-column terminal (its layout is in the README).
+    let mut overlay = DetailOverlay::new();
+    overlay.open_raw(raw);
+    let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+    terminal.draw(|f| overlay.render(f, f.area())).unwrap();
+    let screen = common::tui::screen(&terminal).join("\n");
     assert!(
-        raw.value_title.contains("per-key blob"),
+        screen.contains("m [Map<String,Long>]: per-key blob"),
+        "{}",
+        screen
+    );
+}
+
+/// The tree keeps no operator-state bytes of its own: `x` reads them from the index it is
+/// handed, so a change there shows (a copy taken by `TreeView::new` would not see it).
+#[test]
+fn operator_state_bytes_are_read_from_the_index() {
+    let (_dir, mut index) = savepoint();
+    let mut tree = TreeView::new(&index);
+    tree.jump_first();
+    goto(&mut tree, 20, |p| !p.contains('>') && p.contains("3232"));
+    tree.expand();
+    goto(&mut tree, 5, |p| p.ends_with("[internal] big"));
+    tree.expand();
+    tree.move_down();
+    assert!(tree.selected_path().ends_with("big[0]"));
+    assert_eq!(
+        tree.selected_raw_bytes(&index).unwrap().value,
+        element(0).encode()
+    );
+    let op = index
+        .operators
+        .iter()
+        .position(|o| o.states.iter().any(|s| s.name == "big"))
+        .unwrap();
+    index.operators[op].states[0].entries[0].value_ref =
+        flink_explorer::index::cache::ValueRef::Inline {
+            data: vec![0xab, 0xcd],
+        };
+    assert_eq!(tree.selected_raw_bytes(&index).unwrap().value, [0xab, 0xcd]);
+    index.operators[op].states[0].entries[0].value_ref =
+        flink_explorer::index::cache::ValueRef::Decoded;
+    let raw = tree.selected_raw_bytes(&index).unwrap();
+    assert!(raw.value.is_empty());
+    assert!(
+        raw.value_title.starts_with("no bytes"),
         "{}",
         raw.value_title
+    );
+}
+
+/// Open the `big` operator state (1200 elements, a window of 500) and return the tree, its
+/// cursor on the state's row.
+fn open_big(index: &IndexCache) -> TreeView {
+    let mut tree = TreeView::new(index);
+    tree.jump_first();
+    goto(&mut tree, 20, |p| !p.contains('>') && p.contains("3232"));
+    tree.expand();
+    goto(&mut tree, 5, |p| p.ends_with("[internal] big"));
+    tree.expand();
+    tree
+}
+
+/// The index of the selected element of `big`, from its path (`…big[i]`).
+fn element_at(tree: &TreeView) -> usize {
+    let path = tree.selected_path();
+    let i = path
+        .rsplit_once("big[")
+        .unwrap_or_else(|| panic!("not on an element: {}", path))
+        .1;
+    i.trim_end_matches(']').parse().unwrap()
+}
+
+#[test]
+fn page_down_and_up_move_a_page_through_the_elements() {
+    let (_dir, index) = savepoint();
+    let mut tree = open_big(&index);
+    // Rendered 22 rows high: 20 rows inside the borders, a page.
+    rows(&mut tree, 120, 22);
+    tree.page_down();
+    assert_eq!(element_at(&tree), 19);
+    // Past the window's 500 rows, PageDown scrolls it by the rest of the page.
+    let mut presses = 1;
+    while element_at(&tree) < 1199 {
+        tree.page_down();
+        presses += 1;
+        assert!(presses < 100, "stuck at {}", tree.selected_path());
+    }
+    // 1199 elements, a page of 20 a press (one step lost to the `↑` row appearing), not one
+    // per press as with `↓` (~700 presses past the first window).
+    assert_eq!(presses, 61);
+    tree.page_down(); // at the end: stays on the last element
+    assert_eq!(element_at(&tree), 1199);
+    let shown = rows(&mut tree, 120, 600);
+    assert!(shown.iter().any(|r| r == "    ↑ 701-1200 / 1200"));
+
+    rows(&mut tree, 120, 22); // a page is the height of the last render: 20 rows again
+    tree.page_up();
+    assert_eq!(element_at(&tree), 1179);
+    let mut presses = 1;
+    while element_at(&tree) > 0 {
+        tree.page_up();
+        presses += 1;
+        assert!(presses < 100, "stuck at {}", tree.selected_path());
+    }
+    assert_eq!(presses, 60);
+    let shown = rows(&mut tree, 120, 600);
+    assert!(shown.iter().any(|r| r == "    ↓ 1-500 / 1200"));
+    rows(&mut tree, 120, 22);
+    // From the first element, fewer than a page of rows lie above: PageUp stops at the top.
+    tree.page_up();
+    let top = tree.selected_path().to_string();
+    tree.jump_first();
+    assert_eq!(tree.selected_path(), top);
+}
+
+#[test]
+fn page_down_scrolls_the_keyed_partitions() {
+    let mut keyed =
+        KeyedOperator::new(0x41, 1, 128, Ser::String).state("v", Kind::Value(Ser::Long));
+    for i in 0..99 {
+        keyed.items.push(Item::Value {
+            state: 0,
+            key: Val::Str(format!("k{:02}", i)),
+            value: Val::Long(i),
+        });
+    }
+    let mut spec = Spec::new(Storage::Files);
+    spec.operators.push(keyed);
+    let dir = synth::temp_dir("tui-page-keys");
+    synth::write_savepoint(&spec, &dir);
+    let savepoint = parser::parse_metadata(&dir.join("_metadata")).unwrap();
+    let index = build_index(&savepoint, 0, 0, &dir);
+    let mut tree = TreeView::new(&index);
+    tree.jump_first();
+    tree.expand();
+    let last_key = index.operators[0].keyed_state.as_ref().unwrap().partitions[98]
+        .key
+        .clone();
+    rows(&mut tree, 120, 12); // a page of 10 rows
+    let mut presses = 0;
+    while !tree.selected_path().ends_with(&format!("> {}", last_key)) {
+        tree.page_down();
+        presses += 1;
+        assert!(presses < 30, "stuck at {}", tree.selected_path());
+    }
+    let shown = rows(&mut tree, 120, 200);
+    assert!(
+        shown.iter().any(|r| r.contains("↑ 70-99 / 99")),
+        "{}",
+        shown.join("\n")
+    );
+    // 99 keys, a page of 10 rows a press, not one per press.
+    assert_eq!(presses, 10);
+}
+
+/// `G` lands on the last data row, not on a `↓` pager row (stepping onto one scrolls).
+#[test]
+fn jump_last_lands_on_data() {
+    let (_dir, index) = savepoint();
+    let mut tree = open_big(&index);
+    let n = tree.row_count() as u16;
+    let shown = rows(&mut tree, 120, n + 2);
+    assert_eq!(shown.last().unwrap(), "    ↓ 1-500 / 1200");
+    tree.jump_last();
+    assert_eq!(element_at(&tree), 499);
+    // And `G` then `↓` scrolls the window, as at any other last row of a window.
+    tree.move_down();
+    assert_eq!(element_at(&tree), 499);
+    let shown = rows(&mut tree, 120, 600);
+    assert!(
+        shown.iter().any(|r| r == "    ↓ 2-501 / 1200"),
+        "{}",
+        shown.join("\n")
     );
 }
 
@@ -140,7 +312,7 @@ fn an_operator_state_of_1200_elements_pages_to_the_last_one() {
     let shown = rows(&mut tree, 120, 600);
     assert!(shown.iter().any(|r| r == "    • [1199] \"e-1199\""));
     assert!(shown.iter().any(|r| r == "    ↑ 701-1200 / 1200"));
-    let raw = tree.selected_raw_bytes().expect("an element's bytes");
+    let raw = tree.selected_raw_bytes(&index).expect("an element's bytes");
     assert_eq!(raw.value, element(1199).encode());
     assert_eq!(raw.key, b"\"e-1199\"");
 
@@ -161,7 +333,7 @@ fn an_operator_state_of_1200_elements_pages_to_the_last_one() {
     tree.jump_first();
     goto(&mut tree, 100, |p| p.ends_with("big[1195]"));
     assert_eq!(
-        tree.selected_raw_bytes().unwrap().value,
+        tree.selected_raw_bytes(&index).unwrap().value,
         element(1195).encode()
     );
 }

@@ -315,7 +315,8 @@ fn push_operator_stream_states(
                             .into_bytes(),
                         key_group: 0,
                         // Kept for the TUI's hex view (`x`): a partly decoded element is
-                        // checked against its bytes. At most the size of the label next to it.
+                        // checked against its bytes. Inflated when the stream is compressed, and
+                        // not bounded by the label (`[N bytes] <preview>` for any N).
                         value_ref: ValueRef::Inline {
                             data: elem.to_vec(),
                         },
