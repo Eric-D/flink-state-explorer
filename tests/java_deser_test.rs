@@ -114,6 +114,61 @@ fn read_utf_truncated() {
 }
 
 #[test]
+fn read_char_is_big_endian_utf16_unit() {
+    // DataOutputSerializer.writeChar writes the high byte first.
+    let data = [0x00u8, 0x41, 0xD8, 0x3D, 0x00];
+    let mut reader = JavaReader::new(&data[..]);
+    assert_eq!(reader.read_char().unwrap(), 0x0041);
+    assert_eq!(reader.read_char().unwrap(), 0xD83D);
+    assert_eq!(reader.position(), 4);
+    assert!(reader.read_char().is_err(), "one byte left is not a char");
+}
+
+// StringValue bytes below are written by hand from `StringValue.writeString` (flink-core
+// release-1.20, types/StringValue.java:798-850): var-length `charCount + 1`, then each UTF-16
+// unit var-length — `c | 0x80`, `(c >>> 7) | 0x80`, `c >>> 14` for a unit >= 0x4000.
+
+#[test]
+fn read_string_value_keeps_surrogate_pairs() {
+    // "a😀b": 4 UTF-16 units (U+1F600 is the pair D83D DE00), so the length byte is 5.
+    let data = [0x05u8, 0x61, 0xBD, 0xB0, 0x03, 0x80, 0xBC, 0x03, 0x62];
+    let mut reader = JavaReader::new(&data[..]);
+    assert_eq!(reader.read_string_value().unwrap(), "a😀b");
+    assert_eq!(reader.position(), data.len() as u64);
+}
+
+#[test]
+fn read_string_value_two_byte_unit() {
+    // "é" = U+00E9 → 0xE9 | 0x80, 0xE9 >>> 7.
+    let data = [0x02u8, 0xE9, 0x01];
+    let mut reader = JavaReader::new(&data[..]);
+    assert_eq!(reader.read_string_value().unwrap(), "é");
+}
+
+#[test]
+fn read_string_value_lone_surrogate_is_replacement_char() {
+    // "x" + a lone high surrogate D800, which a Java String may hold and a Rust one cannot.
+    let data = [0x03u8, 0x78, 0x80, 0xB0, 0x03];
+    let mut reader = JavaReader::new(&data[..]);
+    assert_eq!(reader.read_string_value().unwrap(), "x\u{FFFD}");
+    assert_eq!(reader.position(), data.len() as u64);
+}
+
+#[test]
+fn null_string_value_is_none_and_empty_is_some() {
+    // writeString(null) writes a single 0; writeString("") writes length 0 + 1.
+    let mut reader = JavaReader::new(&[0x00u8, 0x01][..]);
+    assert_eq!(reader.read_nullable_string_value().unwrap(), None);
+    assert_eq!(
+        reader.read_nullable_string_value().unwrap(),
+        Some(String::new())
+    );
+    // Where Flink never writes null (keys), the null reads as "".
+    let mut reader = JavaReader::new(&[0x00u8][..]);
+    assert_eq!(reader.read_string_value().unwrap(), "");
+}
+
+#[test]
 fn read_bytes_valid() {
     let data = [0x01u8, 0x02, 0x03, 0x04];
     let mut reader = JavaReader::new(&data[..]);

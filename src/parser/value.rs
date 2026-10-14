@@ -2,15 +2,76 @@
 //! a structured [`serde_json::Value`]. Both the JSON export and the TUI render this `Value`; neither
 //! contains its own binary-decoding logic. To support a new type, add it here once.
 //!
-//! Kryo-serialized fields are intentionally **not** decoded: they are marked `"[Kryo]"`. Because a
-//! Kryo blob has unknown length, any field that can't be decoded stops decoding of the remaining
-//! sibling fields (they become `null`).
+//! ## `null` and the markers
+//!
+//! `null` is only ever a value Flink stored as null: a null POJO field or POJO (`PojoSerializer`),
+//! a `NullableSerializer` null, a null `StringValue` (length 0), a null `GenericArraySerializer`
+//! element. A value this decoder could not read is never `null`; it is one of these strings, which
+//! [`value_to_display`] prints without quotes so the TUI keeps them apart from string data:
+//!
+//! - `"[Kryo]"`: a Kryo-serialized value. Not decoded, by design.
+//! - `"[undecodable: <type>]"`: a serializer this decoder does not handle (`<type>` is the type
+//!   read from the serializer snapshot, e.g. `Map<String,Int>`, `subclass a.B of A`), or bytes
+//!   that end before the value does.
+//! - `"[not decoded: follows <name>]"`: a POJO field, or a tuple field `f<i>`, that comes after
+//!   one that could not be fully decoded. Flink writes no length in front of a field, so once one
+//!   value's length is unknown nothing after it can be located.
+//! - `"[not decoded: <n> more elements]"`: the rest of a length-prefixed list or array whose
+//!   decoding stopped at an element; `"[not decoded: the rest of the list]"` for a keyed
+//!   `ListState`, whose elements are delimited, not counted.
+//!
+//! A value that could only be partly decoded keeps what was read, with the marker where decoding
+//! stopped (see [`Decoded`]). A marker sits where a value of any type would, so a reader can
+//! usually tell it from data by its type alone (a string where an `Int` was due); only a decoded
+//! String whose whole content is a marker's text cannot be told apart from one.
 
 use serde_json::{json, Map, Value};
 
 use crate::parser::java_deser::JavaReader;
 use crate::parser::pojo::{millis_to_iso, PojoInfo};
 use crate::proto::ProtoContext;
+
+/// The result of decoding one value.
+///
+/// `Ok` is fully decoded, and the reader sits right after the value. `Err` holds what could be
+/// decoded, with a marker where decoding stopped: the value's length is then unknown, so the
+/// reader position is unreliable and nothing after the value may be read.
+pub type Decoded = Result<Value, Value>;
+
+/// The value of a [`Decoded`], whether or not it was fully decoded.
+pub fn value_of(decoded: Decoded) -> Value {
+    decoded.unwrap_or_else(|partial| partial)
+}
+
+/// The marker for a Kryo-serialized value.
+pub const KRYO_MARKER: &str = "[Kryo]";
+
+/// The marker for a value of serializer type `type_name` that could not be decoded.
+pub fn undecodable(type_name: &str) -> Value {
+    if type_name.contains("Kryo") {
+        Value::String(KRYO_MARKER.to_string())
+    } else {
+        Value::String(format!("[undecodable: {}]", type_name))
+    }
+}
+
+/// The marker for a field that comes after `name`, which could not be fully decoded.
+pub fn not_decoded_after(name: &str) -> Value {
+    Value::String(format!("[not decoded: follows {}]", name))
+}
+
+/// Whether `s` is one of the markers of this module rather than decoded data.
+pub fn is_marker(s: &str) -> bool {
+    s == KRYO_MARKER
+        || (s.ends_with(']')
+            && (s.starts_with("[undecodable: ") || s.starts_with("[not decoded: ")))
+}
+
+// `PojoSerializer` flags (flink-core `api/java/typeutils/runtime/PojoSerializer.java:50-53`,
+// release-1.20). `NO_SUBCLASS` (2) is the only one under which the fields follow.
+const POJO_IS_NULL: u8 = 1;
+const POJO_IS_SUBCLASS: u8 = 4;
+const POJO_IS_TAGGED_SUBCLASS: u8 = 8;
 
 /// Decode a complete state value (the bytes stored for one `(key, state)` slot).
 ///
@@ -35,14 +96,16 @@ pub fn decode_state_value(
         .strip_prefix("Ttl<")
         .and_then(|s| s.strip_suffix('>'))
     {
-        let ts = r.read_long().ok();
+        let Ok(ts) = r.read_long() else {
+            return undecodable(value_type);
+        };
         let user_value = match pojo_info {
             Some(info) => decode_pojo(&mut r, info, proto),
-            None => decode_field(&mut r, inner, None, proto).unwrap_or(Value::Null),
+            None => decode_field(&mut r, inner, None, proto),
         };
         return json!({
-            "_ttlLastAccess": ts.map(millis_to_iso),
-            "value": user_value,
+            "_ttlLastAccess": millis_to_iso(ts),
+            "value": value_of(user_value),
         });
     }
     // A keyed ListState value is delimiter-separated (ListDelimitedSerializer), unlike a List
@@ -62,10 +125,10 @@ pub fn decode_state_value(
     // A bare POJO value (not List<Pojo>/Map<...,Pojo>, which carry pojo_info for their elements).
     if let Some(info) = pojo_info {
         if !value_type.contains('<') {
-            return decode_pojo(&mut r, info, proto);
+            return value_of(decode_pojo(&mut r, info, proto));
         }
     }
-    decode_field(&mut r, value_type, None, proto).unwrap_or(Value::Null)
+    value_of(decode_field(&mut r, value_type, None, proto))
 }
 
 /// Decode a keyed ListState value: elements serialized back-to-back and separated by the
@@ -80,14 +143,25 @@ fn decode_list(
     const DELIM: u8 = b',';
     let mut items = Vec::new();
     loop {
-        let v = match elem_pojo {
+        let element = match elem_pojo {
             Some(pi) => decode_pojo(r, pi, proto),
-            None => match decode_field(r, elem_type, None, proto) {
-                Some(v) => v,
-                None => break,
-            },
+            None => decode_field(r, elem_type, None, proto),
         };
-        items.push(v);
+        match element {
+            Ok(v) => items.push(v),
+            Err(partial) => {
+                // The next delimiter can't be found once an element's length is unknown: the
+                // element's marker ends the list. Say so when bytes remain, or a list of three
+                // Kryo elements would read as a list of one.
+                items.push(partial);
+                if r.remaining() > 0 {
+                    items.push(Value::String(
+                        "[not decoded: the rest of the list]".to_string(),
+                    ));
+                }
+                break;
+            }
+        }
         if items.len() > 1_000_000 {
             break;
         }
@@ -106,37 +180,62 @@ pub fn decode_pojo(
     r: &mut JavaReader<&[u8]>,
     info: &PojoInfo,
     proto: Option<&ProtoContext>,
-) -> Value {
-    let flags = match r.read_byte() {
-        Ok(f) => f,
-        Err(_) => return Value::Null,
+) -> Decoded {
+    let Ok(flags) = r.read_byte() else {
+        return Err(undecodable(&info.short_name));
     };
-    if flags & 0x01 != 0 {
-        return Value::Null;
-    }
-    // 0x00 is a NullableSerializer isNull=false byte; the real PojoSerializer flags follow.
+    // 0x00 is a NullableSerializer isNull=false byte; the real PojoSerializer flags follow
+    // (PojoSerializer itself never writes 0).
     let flags = if flags == 0x00 {
-        r.read_byte().unwrap_or(0x02)
+        match r.read_byte() {
+            Ok(f) => f,
+            Err(_) => return Err(undecodable(&info.short_name)),
+        }
     } else {
         flags
     };
-    if flags & 0x01 != 0 {
-        return Value::Null;
+    decode_pojo_body(r, flags, info, proto)
+}
+
+/// The rest of a POJO once its flags byte is read (`PojoSerializer.serialize`, flink-core
+/// `api/java/typeutils/runtime/PojoSerializer.java:354-411`, release-1.20).
+fn decode_pojo_body(
+    r: &mut JavaReader<&[u8]>,
+    flags: u8,
+    info: &PojoInfo,
+    proto: Option<&ProtoContext>,
+) -> Decoded {
+    if flags & POJO_IS_NULL != 0 {
+        return Ok(Value::Null);
     }
-    if flags & 0x08 != 0 {
-        let _ = r.read_int(); // subclass tag
-    } else if flags & 0x04 != 0 {
-        let _ = r.read_utf(); // subclass name
+    // A subclass instance is written after `writeUTF(className)` (or `writeByte(tag)` for a
+    // registered one) by the subclass's own serializer — another POJO layout, or Kryo — which
+    // the snapshot of this class does not describe (`PojoSerializer.java:382-386, 405-410`).
+    if flags & POJO_IS_SUBCLASS != 0 {
+        let class = r.read_utf().unwrap_or_else(|_| "?".to_string());
+        return Err(undecodable(&format!(
+            "subclass {} of {}",
+            class, info.short_name
+        )));
+    }
+    if flags & POJO_IS_TAGGED_SUBCLASS != 0 {
+        let tag = r.read_byte().map_or("?".to_string(), |t| t.to_string());
+        return Err(undecodable(&format!(
+            "registered subclass #{} of {}",
+            tag, info.short_name
+        )));
     }
     decode_pojo_fields(r, info, proto)
 }
 
-/// Render a decoded [`Value`] as the compact display string used by the TUI.
+/// Render a decoded [`Value`] as the compact display string used by the TUI. Markers (see the
+/// module docs) are printed as they are, strings in quotes.
 pub fn value_to_display(v: &Value) -> String {
     match v {
         Value::Null => "null".to_string(),
         Value::Bool(b) => b.to_string(),
         Value::Number(n) => n.to_string(),
+        Value::String(s) if is_marker(s) => s.clone(),
         Value::String(s) => format!("\"{}\"", s),
         Value::Array(items) => {
             let parts: Vec<String> = items.iter().map(value_to_display).collect();
@@ -152,120 +251,29 @@ pub fn value_to_display(v: &Value) -> String {
     }
 }
 
+/// The fields of a `NO_SUBCLASS` POJO, in the snapshot's order — which is Flink's: `PojoTypeInfo`
+/// sorts the fields by name (`api/java/typeutils/PojoTypeInfo.java:100-106`).
 fn decode_pojo_fields(
     r: &mut JavaReader<&[u8]>,
     info: &PojoInfo,
     proto: Option<&ProtoContext>,
-) -> Value {
+) -> Decoded {
     let mut obj = Map::new();
     let mut proto_class: Option<String> = None;
     let mut proto_bytes: Option<Vec<u8>> = None;
-    let mut ok = true;
+    // The first field that could not be fully decoded: nothing after it can be located.
+    let mut lost: Option<&str> = None;
 
     for field in &info.fields {
-        if !ok {
-            // A previous field could not be decoded (e.g. Kryo) — its length is unknown, so the
-            // reader position is no longer reliable; mark the rest as null.
-            obj.insert(field.name.clone(), Value::Null);
+        if let Some(after) = lost {
+            obj.insert(field.name.clone(), not_decoded_after(after));
             continue;
         }
-        let is_null = match r.read_boolean() {
-            Ok(b) => b,
-            Err(_) => {
-                ok = false;
-                obj.insert(field.name.clone(), Value::Null);
-                continue;
-            }
-        };
-        if is_null {
-            obj.insert(field.name.clone(), Value::Null);
-            continue;
+        let decoded = decode_pojo_field(r, field, proto, &mut proto_class, &mut proto_bytes);
+        if decoded.is_err() {
+            lost = Some(&field.name);
         }
-
-        // Nested POJO: optional Nullable wrapper byte, then a flags byte, then recurse.
-        if let Some(nested) = &field.nested_pojo {
-            if field.type_name.starts_with("Nullable<") {
-                match r.read_boolean() {
-                    Ok(true) => {
-                        obj.insert(field.name.clone(), Value::Null);
-                        continue;
-                    }
-                    Ok(false) => {}
-                    Err(_) => {
-                        ok = false;
-                        obj.insert(field.name.clone(), Value::Null);
-                        continue;
-                    }
-                }
-            }
-            let flags = match r.read_byte() {
-                Ok(f) => f,
-                Err(_) => {
-                    ok = false;
-                    obj.insert(field.name.clone(), Value::Null);
-                    continue;
-                }
-            };
-            // 0x00 may be a stray NullableSerializer isNull=false byte; re-read as flags.
-            let flags = if flags == 0x00 && !field.type_name.starts_with("Nullable<") {
-                r.read_byte().unwrap_or(0x02)
-            } else {
-                flags
-            };
-            if flags & 0x01 != 0 {
-                obj.insert(field.name.clone(), Value::Null);
-                continue;
-            }
-            if flags & 0x08 != 0 {
-                let _ = r.read_int();
-            } else if flags & 0x04 != 0 {
-                let _ = r.read_utf();
-            }
-            obj.insert(field.name.clone(), decode_pojo_fields(r, nested, proto));
-            continue;
-        }
-
-        // Raw protobuf-bytes field (captured for decoding once we also have the class-name field).
-        let is_proto_bytes = field.type_name == "byte[]"
-            && proto.map_or(false, |c| {
-                c.patterns.iter().any(|p| p.bytes_field == field.name)
-            });
-        if is_proto_bytes {
-            match read_len_bytes(r) {
-                Some(b) => {
-                    obj.insert(field.name.clone(), json!(format!("[{} bytes]", b.len())));
-                    proto_bytes = Some(b);
-                }
-                None => {
-                    ok = false;
-                    obj.insert(field.name.clone(), Value::Null);
-                }
-            }
-            continue;
-        }
-
-        match decode_field(r, &field.type_name, field.nested_pojo.as_deref(), proto) {
-            Some(v) => {
-                if proto.map_or(false, |c| {
-                    c.patterns.iter().any(|p| p.class_field == field.name)
-                }) {
-                    if let Value::String(s) = &v {
-                        proto_class = Some(s.clone());
-                    }
-                }
-                obj.insert(field.name.clone(), v);
-            }
-            None => {
-                // Undecodable — mark Kryo explicitly, otherwise generic; stop (length unknown).
-                let marker = if field.type_name.contains("Kryo") {
-                    "[Kryo]".to_string()
-                } else {
-                    format!("[undecodable: {}]", field.type_name)
-                };
-                obj.insert(field.name.clone(), Value::String(marker));
-                ok = false;
-            }
-        }
+        obj.insert(field.name.clone(), value_of(decoded));
     }
 
     // Protobuf pattern: decode the captured bytes against the captured class name.
@@ -285,21 +293,89 @@ fn decode_pojo_fields(
         }
     }
 
-    Value::Object(obj)
+    if lost.is_some() {
+        Err(Value::Object(obj))
+    } else {
+        Ok(Value::Object(obj))
+    }
 }
 
-/// Decode a single field/value. Returns `None` when the type is unknown or Kryo (length unknown).
+/// One POJO field: `writeBoolean(isNull)`, then, when not null, the field serializer's bytes
+/// (`PojoSerializer.java:390-399`). A byte[] field named by a protobuf pattern is captured into
+/// `proto_bytes`, and the pattern's class-name field into `proto_class`.
+fn decode_pojo_field(
+    r: &mut JavaReader<&[u8]>,
+    field: &crate::parser::pojo::PojoField,
+    proto: Option<&ProtoContext>,
+    proto_class: &mut Option<String>,
+    proto_bytes: &mut Option<Vec<u8>>,
+) -> Decoded {
+    match r.read_boolean() {
+        Ok(true) => return Ok(Value::Null),
+        Ok(false) => {}
+        Err(_) => return Err(undecodable(&field.type_name)),
+    }
+
+    // Raw protobuf-bytes field (captured for decoding once we also have the class-name field).
+    let is_proto_bytes = field.type_name == "byte[]"
+        && proto.is_some_and(|c| c.patterns.iter().any(|p| p.bytes_field == field.name));
+    if is_proto_bytes {
+        let bytes = read_len_bytes(r).ok_or_else(|| undecodable(&field.type_name))?;
+        let shown = json!(format!("[{} bytes]", bytes.len()));
+        *proto_bytes = Some(bytes);
+        return Ok(shown);
+    }
+
+    let v = decode_field(r, &field.type_name, field.nested_pojo.as_deref(), proto)?;
+    if proto.is_some_and(|c| c.patterns.iter().any(|p| p.class_field == field.name)) {
+        if let Value::String(s) = &v {
+            *proto_class = Some(s.clone());
+        }
+    }
+    Ok(v)
+}
+
+/// Decode a single field/value of serializer type `type_name`. `nested` is the POJO layout when
+/// the type is a POJO, or a list/array/nullable of one. See [`Decoded`] for what `Err` means.
 pub fn decode_field(
     r: &mut JavaReader<&[u8]>,
     type_name: &str,
     nested: Option<&PojoInfo>,
     proto: Option<&ProtoContext>,
-) -> Option<Value> {
-    if let Some(info) = nested {
-        // The PojoSerializer flags byte was already consumed by the caller for nested fields;
-        // here (list elements) we read a fresh POJO value including its flags byte.
-        return Some(decode_pojo(r, info, proto));
+) -> Decoded {
+    let is_container = ["List<", "Array<", "Nullable<", "Map<"]
+        .iter()
+        .any(|p| type_name.starts_with(p));
+    if let (Some(info), false) = (nested, is_container) {
+        // The type is the POJO itself (its type name is the class's short name).
+        return decode_pojo(r, info, proto);
     }
+    match type_name {
+        "String[]" => decode_string_array(r),
+        t if t.starts_with("Tuple<") => decode_tuple(r, t, proto),
+        t if t.starts_with("List<") || t.starts_with("Array<") => {
+            decode_list_field(r, t, nested, proto)
+        }
+        t if t.starts_with("Nullable<") => {
+            // NullableSerializer: `writeBoolean(isNull)`, then the value when not null
+            // (`api/java/typeutils/runtime/NullableSerializer.java:198-206`).
+            let inner = t
+                .strip_prefix("Nullable<")
+                .and_then(|s| s.strip_suffix('>'))
+                .unwrap_or("?");
+            match r.read_boolean() {
+                Ok(true) => Ok(Value::Null),
+                Ok(false) => decode_field(r, inner, nested, proto),
+                Err(_) => Err(undecodable(t)),
+            }
+        }
+        t => decode_scalar(r, t).ok_or_else(|| undecodable(t)),
+    }
+}
+
+/// A value with no inner value to stop at: read whole, or not at all. `None` when the type is
+/// unknown (Kryo included) — its length is then unknown too — or the bytes end first.
+fn decode_scalar(r: &mut JavaReader<&[u8]>, type_name: &str) -> Option<Value> {
     match type_name {
         "Int" => r.read_int().ok().map(|v| json!(v)),
         "Long" => r.read_long().ok().map(|v| json!(v)),
@@ -308,7 +384,15 @@ pub fn decode_field(
         "Float" => r.read_int().ok().map(|v| json!(f32::from_bits(v as u32))),
         "Short" => r.read_short().ok().map(|v| json!(v)),
         "Byte" => r.read_byte().ok().map(|v| json!(v as i8)),
-        "String" => r.read_string_value().ok().map(Value::String),
+        // CharSerializer: `writeChar`, one UTF-16 code unit (`api/common/typeutils/base/
+        // CharSerializer.java:66-68`).
+        "Char" => r.read_char().ok().map(char_value),
+        // StringSerializer is `StringValue.writeString` (`StringSerializer.java:67-68`), which,
+        // unlike most serializers, writes a null String (as length 0): that one is a real null.
+        "String" => r
+            .read_nullable_string_value()
+            .ok()
+            .map(|s| s.map_or(Value::Null, Value::String)),
         "byte[]" => read_len_bytes(r).map(|b| bytes_to_value(&b)),
         // Flink LocalDateTimeSerializer: int(year) + byte(month) + byte(day) + byte(hour)
         // + byte(minute) + byte(second) + int(nano)  → 13 bytes.
@@ -385,21 +469,6 @@ pub fn decode_field(
                 None => json!(ordinal),
             })
         }
-        "String[]" => {
-            // StringArraySerializer: int(length) + StringValue per element (var-int length).
-            let len = r.read_int().ok()?;
-            if !(0..=100_000).contains(&len) {
-                return None;
-            }
-            let mut items = Vec::new();
-            for _ in 0..len {
-                match r.read_string_value() {
-                    Ok(s) => items.push(Value::String(s)),
-                    Err(_) => break,
-                }
-            }
-            Some(Value::Array(items))
-        }
         "int[]" => read_prim_array(r, |r| r.read_int().ok().map(|v| json!(v))),
         "long[]" => read_prim_array(r, |r| r.read_long().ok().map(|v| json!(v))),
         "double[]" => read_prim_array(r, |r| {
@@ -410,63 +479,121 @@ pub fn decode_field(
         }),
         "short[]" => read_prim_array(r, |r| r.read_short().ok().map(|v| json!(v))),
         "boolean[]" => read_prim_array(r, |r| r.read_boolean().ok().map(|v| json!(v))),
-        t if t.starts_with("Tuple<") => {
-            let inner = t.strip_prefix("Tuple<")?.strip_suffix('>')?;
-            let mut items = Vec::new();
-            for elem_type in split_top_level(inner) {
-                match decode_field(r, elem_type.trim(), None, proto) {
-                    Some(v) => items.push(v),
-                    None => {
-                        items.push(Value::Null);
-                        break;
-                    }
-                }
-            }
-            Some(Value::Array(items))
-        }
-        t if t.starts_with("List<") || t.starts_with("Array<") => {
-            let size = r.read_int().ok()?;
-            if !(0..=1_000_000).contains(&size) {
-                return None;
-            }
-            let elem_type = t
-                .strip_prefix("List<")
-                .or_else(|| t.strip_prefix("Array<"))
-                .and_then(|s| s.strip_suffix('>'))
-                .unwrap_or("?");
-            if elem_type == "?" && nested.is_none() && size > 0 {
-                return None;
-            }
-            let is_array = t.starts_with("Array<");
-            let mut items = Vec::new();
-            for _ in 0..size {
-                if is_array && !r.read_boolean().unwrap_or(false) {
-                    items.push(Value::Null);
-                    continue;
-                }
-                match decode_field(r, elem_type, None, proto) {
-                    Some(v) => items.push(v),
-                    None => break,
-                }
-            }
-            Some(Value::Array(items))
-        }
-        t if t.starts_with("Nullable<") => {
-            if r.read_boolean().ok()? {
-                return Some(Value::Null);
-            }
-            let inner = t
-                .strip_prefix("Nullable<")
-                .and_then(|s| s.strip_suffix('>'))
-                .unwrap_or("?");
-            decode_field(r, inner, nested, proto)
-        }
+        // CharPrimitiveArraySerializer: `writeInt(length)` + `writeChar` per element
+        // (`api/common/typeutils/base/array/CharPrimitiveArraySerializer.java:73-77`).
+        "char[]" => read_prim_array(r, |r| r.read_char().ok().map(char_value)),
         // Kryo and unknown serializers: cannot decode (and length is unknown → caller stops).
         _ => None,
     }
 }
 
-/// Decode a MAP value from the index blob: `int(count) + [int nsLen, ns, int valLen, val]*`.
+/// A Java `char` as a one-character string. A lone surrogate (half of a pair, which a `char` may
+/// hold) has no Rust `char` and becomes U+FFFD.
+fn char_value(unit: u16) -> Value {
+    Value::String(
+        char::decode_utf16([unit])
+            .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
+            .collect(),
+    )
+}
+
+/// `TupleSerializer`: the fields back to back, no null flags (`api/java/typeutils/runtime/
+/// TupleSerializer.java:129-137`).
+fn decode_tuple(r: &mut JavaReader<&[u8]>, t: &str, proto: Option<&ProtoContext>) -> Decoded {
+    let Some(inner) = t.strip_prefix("Tuple<").and_then(|s| s.strip_suffix('>')) else {
+        return Err(undecodable(t));
+    };
+    let mut items = Vec::new();
+    let mut lost: Option<String> = None;
+    for (i, elem_type) in split_top_level(inner).into_iter().enumerate() {
+        if let Some(after) = &lost {
+            items.push(not_decoded_after(after));
+            continue;
+        }
+        match decode_field(r, elem_type.trim(), None, proto) {
+            Ok(v) => items.push(v),
+            Err(v) => {
+                items.push(v);
+                lost = Some(format!("f{}", i));
+            }
+        }
+    }
+    if lost.is_some() {
+        Err(Value::Array(items))
+    } else {
+        Ok(Value::Array(items))
+    }
+}
+
+/// A length-prefixed `List<T>` (`ListSerializer`: `writeInt(size)` + each element,
+/// `api/common/typeutils/base/ListSerializer.java:118-128`) or `Array<T>`
+/// (`GenericArraySerializer`: `writeInt(length)`, then per element `writeBoolean(notNull)` + the
+/// element, `api/common/typeutils/base/GenericArraySerializer.java:116-127`).
+fn decode_list_field(
+    r: &mut JavaReader<&[u8]>,
+    t: &str,
+    nested: Option<&PojoInfo>,
+    proto: Option<&ProtoContext>,
+) -> Decoded {
+    let is_array = t.starts_with("Array<");
+    let elem_type = t
+        .strip_prefix("List<")
+        .or_else(|| t.strip_prefix("Array<"))
+        .and_then(|s| s.strip_suffix('>'))
+        .unwrap_or("?");
+    let size = match r.read_int() {
+        Ok(n) if (0..=1_000_000).contains(&n) => n as usize,
+        _ => return Err(undecodable(t)),
+    };
+    let mut items = Vec::with_capacity(size.min(4096));
+    for i in 0..size {
+        let element = if is_array {
+            match r.read_boolean() {
+                Ok(false) => Ok(Value::Null),
+                Ok(true) => decode_field(r, elem_type, nested, proto),
+                Err(_) => Err(undecodable(elem_type)),
+            }
+        } else {
+            decode_field(r, elem_type, nested, proto)
+        };
+        match element {
+            Ok(v) => items.push(v),
+            Err(v) => return Err(stopped_at(items, v, size - i - 1)),
+        }
+    }
+    Ok(Value::Array(items))
+}
+
+/// `StringArraySerializer`: `writeInt(length)`, then each element as a `StringValue`, nulls
+/// included (`api/common/typeutils/base/array/StringArraySerializer.java:74-78`).
+fn decode_string_array(r: &mut JavaReader<&[u8]>) -> Decoded {
+    let len = match r.read_int() {
+        Ok(n) if (0..=100_000).contains(&n) => n as usize,
+        _ => return Err(undecodable("String[]")),
+    };
+    let mut items = Vec::with_capacity(len.min(4096));
+    for i in 0..len {
+        match r.read_nullable_string_value() {
+            Ok(s) => items.push(s.map_or(Value::Null, Value::String)),
+            Err(_) => return Err(stopped_at(items, undecodable("String"), len - i - 1)),
+        }
+    }
+    Ok(Value::Array(items))
+}
+
+/// The partial array of a length-prefixed list whose decoding stopped at `failed`, with `rest`
+/// elements left unread.
+fn stopped_at(mut items: Vec<Value>, failed: Value, rest: usize) -> Value {
+    items.push(failed);
+    if rest > 0 {
+        items.push(Value::String(format!(
+            "[not decoded: {} more elements]",
+            rest
+        )));
+    }
+    Value::Array(items)
+}
+
 /// Split a `Map<K,V>` serializer type string into its key and value types.
 pub fn split_map_types(value_type: &str) -> (String, String) {
     value_type
@@ -489,6 +616,9 @@ pub fn split_map_types(value_type: &str) -> (String, String) {
 /// `docs/parsing-format.md`. Shared by [`decode_map_blob`] (which walks the blob the index
 /// builder assembles per key) and by the streaming single-state export, which emits one row per
 /// entry — so both read map bytes through the same code.
+///
+/// A map key that cannot be decoded is its marker followed by `#<fallback_key>`, which keeps the
+/// keys of one map apart.
 pub fn decode_map_entry(
     namespace: &[u8],
     value: &[u8],
@@ -507,20 +637,24 @@ pub fn decode_map_entry(
     let key_str = {
         let mut kr = JavaReader::new(key_payload);
         match decode_field(&mut kr, key_type, None, proto) {
-            Some(Value::String(s)) => s,
-            Some(v) => v.to_string().trim_matches('"').to_string(),
-            None => format!("key{}", fallback_key),
+            Ok(Value::String(s)) => s,
+            // A null key (a heap MapState accepts one; StringSerializer writes it as length 0)
+            // must not read as the string "null".
+            Ok(Value::Null) => "[null]".to_string(),
+            Ok(v) => v.to_string().trim_matches('"').to_string(),
+            Err(marker) => format!("{} #{}", value_to_display(&marker), fallback_key),
         }
     };
     // Value bytes are `NullableSerializer(isNull byte) + serialized value`.
     let decoded = match value.first() {
         Some(1) => Value::Null,
         Some(_) => decode_state_value(&value[1..], val_type, pojo_info, proto),
-        None => Value::Null,
+        None => undecodable(val_type),
     };
     (key_str, decoded)
 }
 
+/// Decode a MAP value from the index blob: `int(count) + [int nsLen, ns, int valLen, val]*`.
 fn decode_map_blob(
     bytes: &[u8],
     value_type: &str,
@@ -532,7 +666,7 @@ fn decode_map_blob(
     let mut r = JavaReader::new(bytes);
     let count = match r.read_int() {
         Ok(c) if (0..=1_000_000).contains(&c) => c,
-        _ => return Value::Null,
+        _ => return undecodable(value_type),
     };
     let mut obj = Map::new();
     for i in 0..count {

@@ -23,7 +23,12 @@ use crate::error::IndexError;
 ///    heuristic (a key over 10,000 bytes used to drop the rest of its key-group); header
 ///    extractors read the whole header, not its first 50 KB (later states used to vanish); and
 ///    `CachedKeyedState` reports malformed key-groups.
-pub const CACHE_FORMAT: u32 = 5;
+/// 6: `char`/`Character` and `char[]` serializers map to the types `Char` and `char[]` (POJO field
+///    types and state value types, which used to hold the raw snapshot class name);
+///    `StringValue` strings keep their surrogate pairs (String keys and operator-state elements
+///    with an emoji used to lose it); POJO keys, rendered by `parser::value`, decode their `char`
+///    fields and show markers instead of `null` for what could not be decoded.
+pub const CACHE_FORMAT: u32 = 6;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IndexCache {
