@@ -450,9 +450,10 @@ where
     };
     let data: Vec<u8> = match effective_delegate {
         StreamStateHandle::ByteStream(bs) => bs.data.clone(),
-        StreamStateHandle::Relative(rel) => {
-            crate::state_file::read(&savepoint_dir.join(&rel.relative_path), rel.state_size)?
-        }
+        StreamStateHandle::Relative(rel) => crate::state_file::read(
+            &crate::state_file::relative_path(savepoint_dir, &rel.relative_path)?,
+            rel.state_size,
+        )?,
         StreamStateHandle::File(f) => {
             crate::state_file::read(&crate::state_file::local_path(&f.file_path)?, f.state_size)?
         }

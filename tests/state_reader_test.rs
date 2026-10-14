@@ -1288,3 +1288,129 @@ fn a_reader_is_send_and_sync() {
         }
     });
 }
+
+/// Replace the `writeUTF(from)` of `_metadata` in `dir` by `writeUTF(to)`.
+fn patch_metadata_utf(dir: &Path, from: &str, to: &str) {
+    let meta_path = dir.join("_metadata");
+    let meta = std::fs::read(&meta_path).unwrap();
+    let mut needle = (from.len() as u16).to_be_bytes().to_vec();
+    needle.extend_from_slice(from.as_bytes());
+    let at = meta
+        .windows(needle.len())
+        .position(|w| w == needle.as_slice())
+        .expect("the handle's path is in _metadata");
+    let mut patched = meta[..at].to_vec();
+    patched.extend_from_slice(&(to.len() as u16).to_be_bytes());
+    patched.extend_from_slice(to.as_bytes());
+    patched.extend_from_slice(&meta[at + needle.len()..]);
+    std::fs::write(&meta_path, patched).unwrap();
+}
+
+/// Every page of `op` from the start: how many keys were read, and what was unreadable.
+fn page_through(r: &StateReader, op: &str) -> (usize, Vec<flink_explorer::reader::Unreadable>) {
+    let mut cursor = Cursor::START;
+    let (mut keys, mut unreadable) = (0, Vec::new());
+    for _ in 0..1000 {
+        let page = r.key_page(op, &cursor, 100).unwrap();
+        keys += page.keys.len();
+        unreadable.extend(page.unreadable);
+        match page.next {
+            Some(n) => cursor = n,
+            None => break,
+        }
+    }
+    (keys, unreadable)
+}
+
+/// A `RelativeFileStateHandle` must name a file inside the savepoint directory: `..` and an
+/// absolute path (which `Path::join` would let replace the base) are refused naming the path,
+/// even though the file they point at exists and is a valid state file.
+#[test]
+fn a_relative_handle_escaping_the_savepoint_directory_is_refused() {
+    for escape in ["dotdot", "absolute"] {
+        let op = synth::sample_operator(200);
+        let outer = synth::temp_dir("reader-escape");
+        let written = synth::write_savepoint(
+            &spec_with(std::slice::from_ref(&op), Storage::Files, false),
+            &outer,
+        );
+        // The savepoint moves one level down; its state files stay where `..` (or the absolute
+        // path) finds them, and copies sit next to `_metadata` for the untouched handles.
+        let inner = outer.join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        std::fs::rename(outer.join("_metadata"), inner.join("_metadata")).unwrap();
+        for (_, _, p) in &written.state_files {
+            std::fs::copy(p, inner.join(p.file_name().unwrap())).unwrap();
+        }
+        let (_, _, target) = written.state_files[0].clone();
+        let name = target.file_name().unwrap().to_string_lossy().to_string();
+        let hostile = match escape {
+            "dotdot" => format!("../{}", name),
+            _ => target.display().to_string(),
+        };
+        patch_metadata_utf(&inner, &name, &hostile);
+
+        let r = reader(&inner);
+        let id = op.id_hex();
+        let states = r.states(&id).unwrap();
+        assert_eq!(states.errors.len(), 1, "{}: {:?}", escape, states.errors);
+        assert!(
+            states.errors[0].contains(&hostile) && states.errors[0].contains("refused"),
+            "{}: {}",
+            escape,
+            states.errors[0]
+        );
+        let (keys, unreadable) = page_through(&r, &id);
+        assert!(keys > 0, "the other subtask is still read");
+        assert_eq!(unreadable.len(), 1, "{:?}", unreadable);
+        assert!(
+            unreadable[0].error.contains(&hostile),
+            "{}",
+            unreadable[0].error
+        );
+    }
+}
+
+/// A state file that is a FIFO is refused (opening one would block until a writer appears, here
+/// forever), and the reader does not hang on it.
+#[cfg(unix)]
+#[test]
+fn a_fifo_state_file_is_refused_without_hanging() {
+    let op = synth::sample_operator(200);
+    let dir = synth::temp_dir("reader-fifo");
+    let written = synth::write_savepoint(
+        &spec_with(std::slice::from_ref(&op), Storage::Files, false),
+        &dir,
+    );
+    let (_, _, target) = written.state_files[0].clone();
+    std::fs::remove_file(&target).unwrap();
+    match std::process::Command::new("mkfifo").arg(&target).status() {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("mkfifo unavailable: skipped");
+            return;
+        }
+    }
+    let name = target.file_name().unwrap().to_string_lossy().to_string();
+    let dir_path = dir.to_path_buf();
+    let id = op.id_hex();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let r = reader(&dir_path);
+        let errors = r.states(&id).unwrap().errors;
+        let paged = page_through(&r, &id);
+        let _ = tx.send((errors, paged));
+    });
+    let (errors, (keys, unreadable)) = rx
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("the reader hung on a FIFO");
+    assert_eq!(errors.len(), 1, "{:?}", errors);
+    assert!(
+        errors[0].contains(&name) && errors[0].contains("not a regular file"),
+        "{}",
+        errors[0]
+    );
+    assert!(keys > 0);
+    assert_eq!(unreadable.len(), 1);
+    assert!(unreadable[0].error.contains("not a regular file"));
+}

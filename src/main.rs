@@ -51,6 +51,23 @@ struct Cli {
     /// List the keyed states available to --export-state, then exit
     #[arg(long)]
     list_states: bool,
+
+    /// Serve a read-only browser UI instead of the TUI (prints the URL to open, with its token)
+    #[arg(long, conflicts_with_all = ["export_state", "list_states"])]
+    web: bool,
+
+    /// Port for --web; 0 picks a free one
+    #[arg(long, value_name = "N", default_value_t = 0, requires = "web")]
+    port: u16,
+
+    /// Address --web binds to. Only loopback is private: anything else exposes the savepoint's
+    /// data to the network (the token still guards it)
+    #[arg(long, value_name = "IP", default_value = "127.0.0.1", requires = "web")]
+    bind: std::net::IpAddr,
+
+    /// With --web, open the URL in the default browser
+    #[arg(long, requires = "web")]
+    open: bool,
 }
 
 fn main() -> ExitCode {
@@ -59,6 +76,15 @@ fn main() -> ExitCode {
     // Headless paths must not touch the terminal: they are meant to be piped and scripted.
     if cli.list_states {
         return match list_states(&cli) {
+            Ok(()) => ExitCode::from(0),
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                ExitCode::from(2)
+            }
+        };
+    }
+    if cli.web {
+        return match web(&cli) {
             Ok(()) => ExitCode::from(0),
             Err(e) => {
                 eprintln!("Error: {}", e);
@@ -144,6 +170,94 @@ fn parse_savepoint(cli: &Cli) -> Result<flink_explorer::parser::Savepoint, Strin
         .map_err(|e| format!("parse {}: {}", metadata.display(), e))
 }
 
+/// The profile's protobuf context, built the way the TUI builds it.
+fn proto_context(cli: &Cli) -> Option<flink_explorer::proto::ProtoContext> {
+    cli.profile
+        .as_deref()
+        .and_then(|name| flink_explorer::profile::storage::load_profile(name).ok())
+        .and_then(|p| flink_explorer::tui::app::build_proto_context(&p))
+        .map(|(ctx, _loaded)| ctx)
+}
+
+#[cfg(feature = "web")]
+fn web(cli: &Cli) -> Result<(), String> {
+    // A key page renders at most this many entries per state, then links to the rest.
+    let mut reader = flink_explorer::reader::StateReader::open(&cli.savepoint_dir)?
+        .with_entry_limit(flink_explorer::web::ENTRY_LIMIT);
+    if let Some(proto) = proto_context(cli) {
+        reader = reader.with_proto(std::sync::Arc::new(proto));
+    }
+    let server = flink_explorer::web::serve(reader, std::net::SocketAddr::new(cli.bind, cli.port))?;
+    if !cli.bind.is_loopback() {
+        eprintln!(
+            "WARNING: listening on {}, which is NOT loopback: anyone who can reach this address \
+             and obtains the URL below can read this savepoint's data, over plain HTTP. Prefer \
+             the default (127.0.0.1) with `ssh -L` for remote use.",
+            server.addr()
+        );
+    }
+    eprintln!(
+        "Serving {} (read-only). Open this URL — it holds the session token, keep it private:",
+        cli.savepoint_dir.display()
+    );
+    println!("{}", server.url());
+    if cli.bind.is_unspecified() {
+        eprintln!(
+            "(Bound to every interface: from another machine, replace 127.0.0.1 in that URL with \
+             an address of this one.)"
+        );
+    }
+    eprintln!("Press Ctrl-C to stop.");
+    if cli.open {
+        open_browser(server.url());
+    }
+    server.wait();
+    eprintln!("Stopped.");
+    Ok(())
+}
+
+#[cfg(not(feature = "web"))]
+fn web(_cli: &Cli) -> Result<(), String> {
+    Err("this build has no web UI; rebuild with `--features web` (on by default)".to_string())
+}
+
+/// Best effort: a failure is reported and the server keeps running. The child is reaped by a
+/// detached thread (no zombie while the server runs). The URL, token included, is on the child's
+/// command line, which other local users can read (`ps`): the README says so.
+#[cfg(feature = "web")]
+fn open_browser(url: &str) {
+    use std::process::{Command, Stdio};
+    let mut cmd = if cfg!(target_os = "windows") {
+        // Not `cmd /C start`: cmd would parse the URL, and `&` in it ends the command. The URL
+        // handler takes it as one argument, unparsed.
+        let mut c = Command::new("rundll32");
+        c.args(["url.dll,FileProtocolHandler", url]);
+        c
+    } else if cfg!(target_os = "macos") {
+        let mut c = Command::new("open");
+        c.arg(url);
+        c
+    } else {
+        let mut c = Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    match cmd.spawn() {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(e) => eprintln!(
+            "Could not open a browser ({}); open the URL above yourself.",
+            e
+        ),
+    }
+}
+
 fn list_states(cli: &Cli) -> Result<(), String> {
     let savepoint = parse_savepoint(cli)?;
     let listing = flink_explorer::export_state::list_states(&savepoint, &cli.savepoint_dir);
@@ -175,12 +289,7 @@ fn export_state(cli: &Cli) -> Result<(), String> {
     let savepoint = parse_savepoint(cli)?;
 
     // Reuse the TUI's proto-context builder so protobuf-in-POJO decodes identically headless.
-    let proto = cli
-        .profile
-        .as_deref()
-        .and_then(|name| flink_explorer::profile::storage::load_profile(name).ok())
-        .and_then(|p| flink_explorer::tui::app::build_proto_context(&p))
-        .map(|(ctx, _loaded)| ctx);
+    let proto = proto_context(cli);
 
     let to_stdout = cli.out.as_deref().is_some_and(|p| p == Path::new("-"));
     let extension = match cli.format.as_str() {

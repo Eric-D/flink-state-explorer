@@ -38,10 +38,69 @@ pub fn local_path(flink_path: &str) -> Result<PathBuf, String> {
 /// means Flink could not tell (`getPos()` threw and left `-1`): only existence and readability
 /// are checked then.
 pub fn open(path: &Path, expected_len: i64) -> Result<(File, u64), String> {
-    let file = File::open(path).map_err(|e| io_error(path, &e))?;
-    let len = file.metadata().map_err(|e| io_error(path, &e))?.len();
+    let (file, len) = open_regular(path)?;
     check_len(path, len, expected_len)?;
     Ok((file, len))
+}
+
+/// Open `path` for reading only if it is a **regular file**, and return it with its length.
+///
+/// The path comes from `_metadata`, i.e. from whoever wrote the savepoint: opening a FIFO blocks
+/// until a writer appears (forever, inside a reader's lock), and a device or a directory is never
+/// a state file. So the path is `stat`ed first (following symlinks, as `open` does) and refused
+/// unless it is a regular file, and the opened handle is checked again (the path may have been
+/// swapped in between; a FIFO swapped in there can still block the open itself, a race only the
+/// savepoint's own writer can win).
+pub fn open_regular(path: &Path) -> Result<(File, u64), String> {
+    let meta = std::fs::metadata(path).map_err(|e| io_error(path, &e))?;
+    if !meta.is_file() {
+        return Err(not_regular(path, &meta));
+    }
+    let file = File::open(path).map_err(|e| io_error(path, &e))?;
+    let meta = file.metadata().map_err(|e| io_error(path, &e))?;
+    if !meta.is_file() {
+        return Err(not_regular(path, &meta));
+    }
+    Ok((file, meta.len()))
+}
+
+fn not_regular(path: &Path, meta: &std::fs::Metadata) -> String {
+    let kind = if meta.is_dir() {
+        "a directory"
+    } else {
+        "not a regular file (FIFO, socket or device?)"
+    };
+    format!("{}: refused: {}", path.display(), kind)
+}
+
+/// The path of a `RelativeFileStateHandle`: `relative` under `savepoint_dir`.
+///
+/// A relative handle is how a savepoint references the files next to its `_metadata`
+/// (`RelativeFileStateHandle`, Flink writes only the file name), so it must stay **inside** the
+/// savepoint directory: a path that is absolute (which `Path::join` would let replace the base)
+/// or that contains a `..` component (or, on Windows, a drive/UNC prefix) is refused with an
+/// error naming it. Absolute `FileStateHandle` / segment paths ([`local_path`]) are still
+/// allowed: that is how a checkpoint or an externalised savepoint references its files, and the
+/// user chose to open that savepoint.
+pub fn relative_path(savepoint_dir: &Path, relative: &str) -> Result<PathBuf, String> {
+    use std::path::Component;
+    let rel = Path::new(relative);
+    let escapes = rel.is_absolute()
+        || rel.has_root()
+        || rel.components().any(|c| {
+            matches!(
+                c,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        });
+    if escapes || relative.is_empty() {
+        return Err(format!(
+            "relative state handle {:?}: refused: a relative handle must name a file inside the \
+             savepoint directory (no absolute path, no `..`)",
+            relative
+        ));
+    }
+    Ok(savepoint_dir.join(rel))
 }
 
 /// Read the whole of `path`, checked like [`open`].
