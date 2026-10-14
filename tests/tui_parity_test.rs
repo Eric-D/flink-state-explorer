@@ -50,7 +50,7 @@ fn operator() -> KeyedOperator {
             op.items.push(item(7, Val::Byte(-1)));
             continue;
         }
-        // Key 0 has more entries and elements than the TUI lists ("… +N more").
+        // Key 0 has more entries and elements than the TUI lists (a `↓` pager row, "… +N more").
         let (n_map, n_list) = if i == 0 {
             (57, 130)
         } else {

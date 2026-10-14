@@ -8,15 +8,22 @@
 //!
 //! Every value shown here was decoded by [`crate::parser::value`] (inside the reader), rendered by
 //! [`value_to_display`] — the same decoding the JSON and `--export-state` exports use. A MAP's
-//! rows are the entries of the object its entries make ([`crate::export::state_value`]), a LIST's
-//! rows the elements of the decoded array, a POJO's rows its decoded fields. What this module adds
-//! is presentation: display limits, `auto_date` (an epoch-millis `Long` shown as a date) and the
-//! debug hex suffix.
+//! rows are its entries, a window of [`MAP_DISPLAY_LIMIT`] at a time in on-disk order behind
+//! pager rows (a window past the entries returned with the key is read alone, never the whole
+//! map), a LIST's rows the elements of the decoded array, a POJO's rows its decoded fields. What
+//! this module adds is presentation: display limits, `auto_date` (an epoch-millis `Long` shown as
+//! a date) and the debug hex suffix.
 //!
-//! A filter (`/`) searches the keys with [`StateReader::scan`], a step at a time under a byte
-//! budget ([`TreeView::search_step`]), so it shows matches as it finds them and can be cancelled;
-//! an exact key is looked up with [`StateReader::get`] (its key-group computed, one block read)
-//! when the key type is hashable.
+//! A filter (`/`) searches the keys with [`StateReader::scan`] on a **worker thread**
+//! ([`crate::tui::jobs::start_search`]), one block per call, so the UI keeps drawing and
+//! answering keys while it runs, shows matches as they are reported ([`TreeView::poll_search`]),
+//! and a cancel stops it between two blocks; an exact key is looked up with [`StateReader::get`]
+//! (its key-group computed, one block read) when the key type is hashable.
+//!
+//! What still runs on the UI thread is bounded by a page, not by the savepoint — but each read
+//! is a whole key-group, which cannot be interrupted: the window of keys (`key_page`), an exact
+//! key (`get`), and the page of a MAP's entries shown (`entries`). One huge key-group (a single
+//! hot key with millions of entries) makes each of them take as long as reading it.
 
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, List, ListItem, ListState};
@@ -26,13 +33,14 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::export::state_value;
+use crate::export::{map_key_of, state_value};
 use crate::operators::{KeyedInfo, OperatorSummary};
 use crate::parser::pojo::millis_to_iso;
 use crate::parser::value::{split_map_types, value_to_display};
 use crate::proto::ProtoContext;
 use crate::reader::{Cursor, KeyRecord, Lookup, ReaderError, StateEntry, StateReader};
 use crate::tui::filter::AppliedFilter;
+use crate::tui::jobs::{start_search, Job, SearchMsg, SearchTarget};
 use crate::tui::text;
 
 /// Operator-state elements listed at once; past it, `↑`/`↓` pager rows scroll the window.
@@ -53,7 +61,8 @@ const AUTO_DATE_MILLIS: std::ops::Range<i64> = 946_684_800_000..2_208_988_800_00
 const KAFKA_ICON: &str = "📨 ";
 /// Marker on an operator some of whose state files could not be read (details under `i`).
 const LOAD_ERROR_MARK: &str = "⚠ ";
-/// Stored bytes of blocks one search step scans ([`TreeView::search_step`]).
+/// Stored bytes of blocks the search worker reads between two reports
+/// ([`TreeView::set_search_step_bytes`]).
 pub const SEARCH_STEP_BYTES: u64 = 4 << 20;
 
 /// Whether an operator-state name is a Kafka connector state (source reader / sink writer+committer).
@@ -175,13 +184,44 @@ struct StateDesc {
     pojo_detail: String,
 }
 
-/// One state of one key: its entries (those the reader returned, all of them once completed),
-/// how many it has, and the value they make.
+/// One state of one key: its entries (those the reader returned with the key — at most its
+/// entry limit), how many it has, and the value they make. An expanded MAP shows a window of
+/// [`MAP_DISPLAY_LIMIT`] entries from `map_offset` on, scrolled by its pager rows; a window past
+/// the entries returned with the key is read alone ([`StateReader::entries`]) into `page`, so a
+/// map of millions of entries never is read whole.
 #[derive(Debug, Clone)]
 struct Slot {
     entries: Vec<StateEntry>,
     total: usize,
     value: Option<Value>,
+    /// First MAP entry shown.
+    map_offset: usize,
+    /// The MAP entries shown, read from `.0` on, when they lie past `entries`.
+    page: Option<(usize, Vec<StateEntry>)>,
+}
+
+impl Slot {
+    /// The MAP entries shown: `map_offset..` up to [`MAP_DISPLAY_LIMIT`] of them, as far as they
+    /// were read.
+    fn map_window(&self) -> (usize, &[StateEntry]) {
+        let start = self.map_offset.min(self.total);
+        let end = (start + MAP_DISPLAY_LIMIT).min(self.total);
+        if end <= self.entries.len() {
+            return (start, &self.entries[start..end]);
+        }
+        match &self.page {
+            Some((off, page)) if *off == start => (start, page),
+            _ => (start, &[]),
+        }
+    }
+
+    /// The `i`-th entry of the state, if it was read.
+    fn entry(&self, i: usize) -> Option<&StateEntry> {
+        self.entries.get(i).or_else(|| match &self.page {
+            Some((off, page)) => page.get(i.checked_sub(*off)?),
+            None => None,
+        })
+    }
 }
 
 /// A key the tree shows, built from a [`KeyRecord`] once (its values are decoded by the reader):
@@ -202,6 +242,8 @@ impl KeyRow {
                 entries: Vec::new(),
                 total: 0,
                 value: None,
+                map_offset: 0,
+                page: None,
             })
             .collect();
         for e in record.entries {
@@ -241,7 +283,7 @@ struct KeySeq {
     /// sought directly).
     start_kg: u16,
     /// Search matches: not contiguous in reader order (each fetched on its own), found by
-    /// [`TreeView::search_step`] rather than by paging.
+    /// the search worker ([`TreeView::poll_search`]) rather than by paging.
     matches: bool,
     /// Matches already in `positions` (a key found by `get` and again by the scan).
     seen: HashSet<Cursor>,
@@ -465,13 +507,15 @@ fn pager_label(indent: &str, arrow: char, start: usize, end: usize, of: &str) ->
     format!("{}{} {}-{} / {}", indent, arrow, start + 1, end, of)
 }
 
-/// A search over the keys of every keyed operator, run a step at a time.
+/// A search over the keys of every keyed operator, run by a worker thread
+/// ([`crate::tui::jobs::start_search`]) whose reports the tree applies as they come.
 struct Search {
-    filter: AppliedFilter,
     /// Keyed operators still to scan, in order.
     queue: std::collections::VecDeque<usize>,
     /// Operators it was started on, for the progress.
     total_ops: usize,
+    /// Dropping it stops the worker (between two blocks) and joins it.
+    job: Job<SearchMsg>,
 }
 
 pub struct TreeView {
@@ -488,8 +532,12 @@ pub struct TreeView {
     page_rows: usize,
     proto_ctx: Option<Arc<ProtoContext>>,
     search: Option<Search>,
+    /// Stored bytes of blocks the search worker reads between two reports.
+    search_step_bytes: u64,
     /// Keys received from the reader (each decoded once, by it), for tests.
     fetched: usize,
+    /// Entries of keyed states received from [`StateReader::entries`] (MAP pages), for tests.
+    entries_fetched: usize,
 }
 
 impl TreeView {
@@ -540,7 +588,9 @@ impl TreeView {
             page_rows: DEFAULT_PAGE_ROWS,
             proto_ctx: None,
             search: None,
+            search_step_bytes: SEARCH_STEP_BYTES,
             fetched: 0,
+            entries_fetched: 0,
         };
         tv.rebuild_flat_list();
         if !tv.nodes.is_empty() {
@@ -730,51 +780,49 @@ impl TreeView {
         self.fetched += fetched;
     }
 
-    /// Read every entry of a MAP state the reader cut at its entry limit, so that its rows are
-    /// those of the whole map.
-    fn complete_slot(&mut self, op_idx: usize, key: Cursor, ei: usize) {
+    /// Read the window of an expanded MAP state when it lies past the entries returned with its
+    /// key: one page of [`MAP_DISPLAY_LIMIT`] entries, never the whole map.
+    fn ensure_map_window(&mut self, op_idx: usize, key: Cursor, ei: usize) {
         let reader = self.reader.clone();
         let Some(k) = self.operators[op_idx].keyed.as_mut() else {
             return;
         };
-        let Some(desc) = k.descriptors.get(ei).cloned() else {
+        let Some(desc) = k.descriptors.get(ei) else {
             return;
         };
         let Some(row) = k.rows.get_mut(&key) else {
             return;
         };
         let slot = &mut row.slots[ei];
-        if desc.state_type != "MAP" || slot.entries.len() >= slot.total {
+        if desc.state_type != "MAP" {
             return;
         }
-        let mut offset = slot.entries.len();
-        let mut error = None;
-        while offset < slot.total {
-            match reader.entries(&k.op_hex, &key, &desc.name, offset, 10_000) {
-                Ok(p) if !p.entries.is_empty() => {
-                    offset += p.entries.len();
-                    slot.entries.extend(p.entries);
-                    if p.next.is_none() {
-                        break;
-                    }
-                }
-                Ok(_) => break,
-                Err(e) => {
-                    error = Some(e);
-                    break;
-                }
-            }
+        let start = slot.map_offset.min(slot.total);
+        let end = (start + MAP_DISPLAY_LIMIT).min(slot.total);
+        if end <= slot.entries.len() || slot.page.as_ref().is_some_and(|(o, _)| *o == start) {
+            return;
         }
-        slot.total = slot.entries.len().max(slot.total);
-        let refs: Vec<&StateEntry> = slot.entries.iter().collect();
-        slot.value = state_value(&desc.state_type, &refs);
-        if let Some(e) = error {
-            k.note_error(e);
+        match reader.entries(&k.op_hex, &key, &desc.name, start, MAP_DISPLAY_LIMIT) {
+            Ok(p) => {
+                self.entries_fetched += p.entries.len();
+                slot.page = Some((start, p.entries));
+            }
+            Err(e) => {
+                slot.page = Some((start, Vec::new()));
+                k.note_error(e);
+            }
         }
     }
 
-    /// Before rows are built: load the windows of the expanded keyed operators, and complete
-    /// the expanded MAP states that were cut.
+    /// Entries of keyed states read by the tree with [`StateReader::entries`] since this view
+    /// was created: the pages of MAP windows past the entries returned with their keys.
+    #[doc(hidden)]
+    pub fn entries_read(&self) -> usize {
+        self.entries_fetched
+    }
+
+    /// Before rows are built: load the windows of the expanded keyed operators, and of their
+    /// expanded MAP states.
     fn prepare(&mut self) {
         let expanded_ops: Vec<usize> = self
             .nodes
@@ -792,7 +840,7 @@ impl TreeView {
             .filter_map(|n| Some((n.op_idx, n.key?, n.entry_idx?)))
             .collect();
         for (op, key, ei) in expanded_entries {
-            self.complete_slot(op, key, ei);
+            self.ensure_map_window(op, key, ei);
         }
     }
 
@@ -1167,15 +1215,31 @@ impl TreeView {
     /// scrolled.
     fn scroll(&mut self, pager_idx: usize, forward: bool, amount: usize) -> usize {
         let selected_before = self.list_state.selected().unwrap_or(0);
-        let (op_idx, state_idx) = {
+        let (op_idx, state_idx, map) = {
             let n = &self.nodes[pager_idx];
-            (n.op_idx, n.state_idx)
+            let map = match (n.level, n.key, n.entry_idx) {
+                (NodeLevel::MapEntry, Some(key), Some(ei)) => Some((key, ei)),
+                _ => None,
+            };
+            (n.op_idx, n.state_idx, map)
         };
         let Some(op) = self.operators.get_mut(op_idx) else {
             return 0;
         };
-        let (offset, visible, page) = match state_idx {
-            None => match &mut op.keyed {
+        let (offset, visible, page) = match (map, state_idx) {
+            // The entries of an expanded MAP.
+            (Some((key, ei)), _) => {
+                match op
+                    .keyed
+                    .as_mut()
+                    .and_then(|k| k.rows.get_mut(&key))
+                    .and_then(|r| r.slots.get_mut(ei))
+                {
+                    Some(slot) => (&mut slot.map_offset, slot.total, MAP_DISPLAY_LIMIT),
+                    None => return 0,
+                }
+            }
+            (None, None) => match &mut op.keyed {
                 Some(k) => {
                     let seq = k.seq_mut();
                     let visible = seq.positions.len();
@@ -1183,7 +1247,7 @@ impl TreeView {
                 }
                 None => return 0,
             },
-            Some(si) => match op.states.get_mut(si) {
+            (None, Some(si)) => match op.states.get_mut(si) {
                 Some(s) => {
                     let visible = s.visible_count();
                     (&mut s.entry_offset, visible, ENTRY_PAGE_SIZE)
@@ -1211,8 +1275,8 @@ impl TreeView {
 
     /// Apply a filter to the keys and the operator-state elements. Operator-state elements are
     /// filtered at once; keys are looked up (`get`, for an exact key of a hashable type), sought
-    /// (a key-group range) or searched (a pattern): a search goes on with
-    /// [`TreeView::search_step`].
+    /// (a key-group range) or searched (a pattern): a search runs on
+    /// a worker thread, whose reports [`TreeView::poll_search`] applies.
     pub fn apply_filter(&mut self, filter: &Option<AppliedFilter>) {
         self.search = None;
         let reader = self.reader.clone();
@@ -1303,14 +1367,31 @@ impl TreeView {
         self.fetched += found;
         if let Some(f) = filter {
             if !queue.is_empty() {
+                let targets = queue
+                    .iter()
+                    .filter_map(|&op| {
+                        let k = self.operators[op].keyed.as_ref()?;
+                        Some(SearchTarget {
+                            op,
+                            hex: k.op_hex.clone(),
+                            from: k.filtered.as_ref()?.next?,
+                        })
+                    })
+                    .collect();
                 self.search = Some(Search {
-                    filter: f.clone(),
                     total_ops: queue.len(),
                     queue,
+                    job: start_search(reader, targets, f.clone(), self.search_step_bytes),
                 });
             }
         }
         self.rebuild_flat_list();
+    }
+
+    /// Stored bytes of blocks the search reads between two reports (at least one block): what
+    /// a filter applied from now on uses.
+    pub fn set_search_step_bytes(&mut self, bytes: u64) {
+        self.search_step_bytes = bytes.max(1);
     }
 
     /// Whether a search is still running.
@@ -1344,66 +1425,88 @@ impl TreeView {
         }
     }
 
-    /// Scan about `byte_budget` more of the savepoint for the filter (at least one key-group).
-    /// Returns whether the search goes on.
-    pub fn search_step(&mut self, byte_budget: u64) -> bool {
-        let Some(search) = self.search.as_mut() else {
-            return false;
-        };
-        let Some(&op_idx) = search.queue.front() else {
-            self.search = None;
-            return false;
-        };
-        let filter = search.filter.clone();
-        let reader = self.reader.clone();
-        let k = self.operators[op_idx]
-            .keyed
-            .as_mut()
-            .expect("searched operators are keyed");
-        let seq = k
-            .filtered
-            .as_mut()
-            .expect("searched operators are filtered");
-        let mut finished = true;
-        if let Some(from) = seq.next {
-            let exact = match &filter {
-                AppliedFilter::Exact(b) => Some(String::from_utf8_lossy(b).into_owned()),
-                _ => None,
-            };
-            let mut matches = |key: &str| match &exact {
-                Some(e) => key == e,
-                None => filter.matches_str(key, 0),
-            };
-            match reader.scan(&k.op_hex, &from, byte_budget, &mut matches) {
-                Ok(page) => {
-                    k.note_page(&page.unreadable, &page.malformed);
-                    let seq = k.filtered.as_mut().expect("filtered");
-                    let window = seq.offset..seq.offset + 2 * PARTITION_PAGE_SIZE;
-                    for record in page.matches {
-                        let pos = record.position;
-                        let before = seq.positions.len();
-                        seq.push_match(pos);
-                        // The first windows are shown as the matches come: keep their rows.
-                        if seq.positions.len() > before && window.contains(&before) {
-                            k.rows.insert(pos, KeyRow::new(record, &k.descriptors));
-                            self.fetched += 1;
-                        }
+    /// Apply one report of the search worker.
+    fn apply_search(&mut self, msg: SearchMsg) {
+        let (op_idx, finished) = match msg {
+            SearchMsg::Page {
+                op,
+                matches,
+                next,
+                unreadable,
+                malformed,
+            } => {
+                let Some(k) = self.operators[op].keyed.as_mut() else {
+                    return;
+                };
+                k.note_page(&unreadable, &malformed);
+                let Some(seq) = k.filtered.as_mut() else {
+                    return;
+                };
+                let window = seq.offset..seq.offset + 2 * PARTITION_PAGE_SIZE;
+                for record in matches {
+                    let pos = record.position;
+                    let before = seq.positions.len();
+                    seq.push_match(pos);
+                    // The first windows are shown as the matches come: keep their rows.
+                    if seq.positions.len() > before && window.contains(&before) {
+                        k.rows.insert(pos, KeyRow::new(record, &k.descriptors));
+                        self.fetched += 1;
                     }
-                    seq.next = page.next;
-                    finished = seq.next.is_none();
                 }
-                Err(e) => {
-                    k.note_error(e);
-                    k.filtered.as_mut().expect("filtered").next = None;
+                seq.next = next;
+                (op, next.is_none())
+            }
+            SearchMsg::Failed { op, error } => {
+                if let Some(k) = self.operators[op].keyed.as_mut() {
+                    k.note_error(error);
+                    if let Some(seq) = k.filtered.as_mut() {
+                        seq.next = None;
+                    }
+                }
+                (op, true)
+            }
+        };
+        if finished {
+            if let Some(s) = self.search.as_mut() {
+                s.queue.retain(|&o| o != op_idx);
+                if s.queue.is_empty() {
+                    self.search = None;
                 }
             }
         }
-        if finished {
-            let s = self.search.as_mut().expect("searching");
-            s.queue.pop_front();
-            if s.queue.is_empty() {
-                self.search = None;
-            }
+    }
+
+    /// Apply what the search worker reported since the last call, without waiting (the event
+    /// loop calls it between frames). Returns whether the search goes on.
+    pub fn poll_search(&mut self) -> bool {
+        let Some(search) = self.search.as_mut() else {
+            return false;
+        };
+        let ended = !search.job.is_running();
+        let msgs = search.job.drain();
+        let any = !msgs.is_empty();
+        for m in msgs {
+            self.apply_search(m);
+        }
+        if ended && self.search.is_some() {
+            // Every report was received: nothing more will come.
+            self.search = None;
+        }
+        if any || ended {
+            self.rebuild_flat_list();
+        }
+        self.search.is_some()
+    }
+
+    /// Wait for the search worker's next report and apply it (tests and headless use: each
+    /// report covers about the step bytes of blocks). Returns whether the search goes on.
+    pub fn search_step(&mut self) -> bool {
+        let Some(search) = self.search.as_mut() else {
+            return false;
+        };
+        match search.job.recv() {
+            Some(m) => self.apply_search(m),
+            None => self.search = None,
         }
         self.rebuild_flat_list();
         self.search.is_some()
@@ -1411,7 +1514,7 @@ impl TreeView {
 
     /// Run the search to its end (tests, and headless use).
     pub fn finish_search(&mut self) {
-        while self.search_step(SEARCH_STEP_BYTES) {}
+        while self.search_step() {}
     }
 
     // --- navigation ----------------------------------------------------------------------------
@@ -1543,7 +1646,7 @@ impl TreeView {
         );
         if desc.state_type == "MAP" {
             let i = node.item.unwrap_or(0);
-            let Some(e) = slot.entries.get(i) else {
+            let Some(e) = slot.entry(i) else {
                 return Some(RawBytes {
                     key_title,
                     key: row.key.clone().into_bytes(),
@@ -1620,6 +1723,14 @@ impl TreeView {
     pub fn jump_first(&mut self) {
         if !self.nodes.is_empty() {
             self.list_state.select(Some(0));
+        }
+    }
+
+    /// Select row `i` as it is (tests: unlike moving onto a pager row, this scrolls nothing).
+    #[doc(hidden)]
+    pub fn select_row(&mut self, i: usize) {
+        if i < self.nodes.len() {
+            self.list_state.select(Some(i));
         }
     }
 
@@ -1839,21 +1950,33 @@ fn child_rows(
 ) {
     const INDENT: &str = "        ";
     match (desc.state_type.as_str(), value) {
-        ("MAP", Value::Object(map)) => {
+        ("MAP", Value::Object(_)) => {
+            // A window of the entries, in on-disk order, between pager rows.
             let (_, val_type) = split_map_types(&desc.value_type);
-            for (k, v) in map.iter().take(MAP_DISPLAY_LIMIT) {
+            let (start, window) = slot.map_window();
+            let end = (start + MAP_DISPLAY_LIMIT).min(slot.total);
+            let of = slot.total.to_string();
+            let pager = |arrow: char, kind: NodeKind| ChildRow {
+                label: pager_label(INDENT, arrow, start, end, &of),
+                path: path.to_string(),
+                kind,
+                item: None,
+            };
+            if start > 0 {
+                out.push(pager('↑', NodeKind::PagerUp));
+            }
+            for (j, e) in window.iter().enumerate() {
+                let k = map_key_of(e, start + j);
                 out.push(ChildRow {
-                    label: format!("{}{} : {}", INDENT, k, style.show(v, &val_type)),
+                    label: format!("{}{} : {}", INDENT, k, style.show(&e.value, &val_type)),
                     path: format!("{}[{}]", path, k),
                     kind: NodeKind::Data,
-                    // The last entry with that map key: the one the object kept.
-                    item: slot
-                        .entries
-                        .iter()
-                        .rposition(|e| e.map_key.as_deref() == Some(k.as_str())),
+                    item: Some(start + j),
                 });
             }
-            more_row(map.len(), MAP_DISPLAY_LIMIT, INDENT, path, out);
+            if end < slot.total {
+                out.push(pager('↓', NodeKind::PagerDown));
+            }
         }
         ("LIST", Value::Array(items)) => {
             let elem_type = desc

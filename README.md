@@ -49,9 +49,11 @@ payloads. Everything visible in the TUI is also available as a JSON export.
   first frame is up once `_metadata` and the state headers are read, every key of every subtask
   is reachable (no key cap), and memory stays at a few pages of keys plus a small block cache (a
   211 MB / 1M-key savepoint: first frame in a few milliseconds, 100 000 keys paged in under a
-  second at ~26 MB).
-- **Filtering** — glob pattern (searched step by step, cancellable), exact key (looked up
-  directly by its key-group), or key-group range.
+  second at ~26 MB). One caveat: a key-group is read whole, so a single hot key with millions of
+  entries costs the memory and time of its key-group; what is decoded and shown of it stays a page
+  (an expanded MAP shows 50 entries at a time behind `↑`/`↓` pager rows).
+- **Filtering** — glob pattern (searched on a background thread, cancellable), exact key
+  (looked up directly by its key-group), or key-group range.
 - **Key counts** — counted in the background (`≥ N keys` until then), cached under the user cache
   directory (counts only, never in the savepoint directory).
 - **Web UI** (`--web`) — the same savepoint in a browser, read-only, loopback-only, token-guarded;
@@ -147,7 +149,7 @@ fail with the file's path and a non-zero exit code.
 | `g` / `Home` | Jump to first |
 | `G` / `End` | Jump to the last row (of the keys or elements shown: `↓` past it scrolls) |
 | `i` | Operator info (OperatorID, parallelism, state names, …) |
-| `E` | Export every operator and key, decoded, to `export.json` (in the background) |
+| `E` | Export every operator and key, decoded, to `export.json` (in the background; progress on the status bar) |
 | `C` | Stop / restart the background key count |
 | `S` | Savepoint summary |
 | `I` | List loaded `.proto` files |
@@ -155,7 +157,7 @@ fail with the file's path and a non-zero exit code.
 | `P` | Profile picker |
 | `H` | Toggle hiding empty operators |
 | `D` | Toggle debug mode (extra type tags, key-groups) |
-| `q` / `Ctrl-C` | Quit (`Ctrl-C` also from the filter bar and overlays, during a search or the key count, and while loading — then the process exits with 130; once loaded, quitting is a normal exit, 0) |
+| `q` / `Ctrl-C` | Quit. While an `E` export runs, `q` first asks ("q again to abort the export and quit, or wait"): a second `q` in a row aborts it (no `export.json` is left), any other key cancels the question. `Ctrl-C` quits at once, aborting whatever runs — also from the filter bar and overlays, during a search or the key count, and while loading (then the process exits with 130; once loaded, quitting is a normal exit, 0) |
 
 In the detail overlay: `Tab` switches the key/value panel, `↑`/`↓` scroll, `Esc` closes. The value
 panel holds the entry's bytes as the savepoint stores them. Under a MAP state each entry is its
@@ -178,8 +180,9 @@ on Windows), one small file per savepoint holding counts only, ignored once `_me
 Nothing is ever written into the savepoint directory except by `E` and `--export-state`.
 
 The filter bar's **pattern** (`*` and `?` wildcards, case-insensitive) is searched through every
-key a few key-groups at a time: matches show as they are found, with the search's progress, and
-`Esc` stops it (keeping what it found). An **exact** key of a String, numeric, Boolean, Char,
+key on a background thread, so the TUI keeps answering keys meanwhile: matches show as they are
+found, with the search's progress, and `Esc` stops it (keeping what it found) between two
+key-groups — one key-group is read whole, so a huge one delays the stop by its read. An **exact** key of a String, numeric, Boolean, Char,
 BigInteger, Date, LocalDate or Flink-tuple key type is looked up directly — its key-group computed
 with Flink's hash, one block read; a pattern without wildcard shows that key at once, then
 searches for its other cases. Other key types (POJOs) are searched. A **key-group range** pages
@@ -193,9 +196,18 @@ operators (not just keyed ones): per operator its `operator_states`, its `state_
 `value_class` when known), **every key** with its decoded values (`{key, key_group, states}`), then
 `total_keys`, `load_errors`, `malformed_key_groups` and an `info` block (these follow the keys:
 they are known once the keys are read). It is streamed from the savepoint a page of keys at a
-time, on a background thread, so memory stays bounded whatever the savepoint's size. A MAP state
-is one object of all its entries; another state holds the value of its first entry (a key with
-several windows or timers: the first one, as in the TUI). The export and the TUI share the same
+time — and a MAP of one key a page of entries at a time — on a background thread, so memory
+stays bounded whatever the savepoint's size (but for one key-group, read whole: a single hot key
+with millions of entries costs its key-group's size). A MAP state is one object of all its
+entries, in on-disk order (an entry whose map key could not be decoded is written under
+`#<its index>`); another state holds the value of its first entry (a key with several windows or
+timers: the first one, as in the TUI).
+
+Compared with the exports of earlier versions (built from the in-memory index): `truncated` is
+still written, at the top level and per operator, but is always `false` (nothing is left out);
+`stored_keys` is gone (`total_keys` is the count); `total_keys`, `load_errors`,
+`malformed_key_groups` and `info` now come **after** `keys`; keys are in the reader's order
+(key-groups ascending, on-disk order inside one), not sorted; MAP entries are in on-disk order. The export and the TUI share the same
 decoder (`src/parser/value.rs`), so they never diverge. To export one state as NDJSON or Parquet,
 use `--export-state`.
 

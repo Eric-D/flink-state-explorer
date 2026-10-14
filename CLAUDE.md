@@ -280,7 +280,7 @@ as U+FFFD.
 `flink-explorer <savepoint> --web [--port N] [--bind IP] [--open]` (`--open` spawns
 `xdg-open`/`open`/`rundll32 url.dll,FileProtocolHandler <url>` — never `cmd /C start`, which
 parses `&` — and reaps the child on a detached thread): a read-only browser UI built
-**only on `reader::StateReader`** (never on `src/index`), so it opens at once and reads one
+**only on `reader::StateReader`** (no in-memory index), so it opens at once and reads one
 key-group per request. Feature `web` is **on by default** (users take the released binary);
 `--no-default-features` is the TUI-only build and CI checks it (`cargo check
 --no-default-features --all-targets`). A build without it answers `--web` with an error.
@@ -435,8 +435,12 @@ key-group per request. Feature `web` is **on by default** (users take the releas
   memory is a few pages, the positions paged through (12 bytes a key) and the reader's 8 MiB block
   cache. A rebuild of the rows (expand, toggle, scroll inside the window) reads nothing:
   `decode_calls()` counts the keys received from the reader. A MAP cut at the reader's entry
-  limit (1000) shows its true `total` and is completed with `reader.entries` when expanded, so its
-  rows are those of the whole map. A new proto context makes a new reader over the same savepoint.
+  limit (1000) shows its true `total` (`KeyRecord.truncated`) and, expanded, a **window** of 50
+  entries in on-disk order behind `↑`/`↓` pager rows (`Slot::map_offset`, scrolled by
+  `TreeView::scroll` like the keys); a window past the entries the record carries is read alone
+  (`reader.entries(offset, 50)` into `Slot::page`) — never the whole map (it used to be: a
+  1.6M-entry map took 1 s and +670 MB on the UI thread). `entries_read()` counts those entries
+  for the tests. A new proto context makes a new reader over the same savepoint.
 - **Order.** Keys come in the reader's order — key-groups ascending, Flink's on-disk order inside
   one — not sorted (they used to be, by the index).
 - **Counts** are shown as known: `N keys` once counted or paged to the end, `≥ N keys` before,
@@ -447,21 +451,38 @@ key-group per request. Feature `web` is **on by default** (users take the releas
   counts (no unreadable or malformed key-group) are saved by `tui/counts.rs` under the user cache
   dir (`$XDG_CACHE_HOME`/`~/.cache` or `%LOCALAPPDATA%`, `std::env` only), one text file per
   savepoint named by an FNV-1a hash of its canonical path: a 3-line header (format, `_metadata`
-  size + mtime in ns, path) checked before the body, then `<op hex> <count>` lines. Counts only,
+  size + mtime in ns, path) checked before the body, then `<op hex> <count>` lines; written
+  through a side file of its own (`counts::temp_file`: `.<pid>-<n>.partial`), `sync_all`ed, then
+  renamed. Counts only,
   never a key; never in the savepoint directory. `--no-cache` disables it (`AppOptions`).
-- **Filter.** A pattern is searched by `TreeView::search_step` (one `reader.scan` under a byte
-  budget per step, `SEARCH_STEP_BYTES` 4 MiB; the event loop runs a step per turn and reads keys
-  between them, so `q`, `Esc` — which stops the search and keeps its matches — and Ctrl-C answer
-  at once), operator after operator, with `searching N%` on the row. Matches are kept as positions
+- **Filter.** A pattern is searched on a **worker thread** (`jobs::start_search`: `reader.scan`
+  one block per call, so a cancel is seen between any two blocks; a report every
+  `SEARCH_STEP_BYTES` 4 MiB of blocks or 1000 matches, through a bounded channel of 4 so the
+  worker never runs far ahead), operator after operator, with `searching N%` on the row. The
+  event loop applies the reports between frames (`TreeView::poll_search`, never waiting), so keys
+  are answered while it runs: `Esc` stops it and keeps its matches, Ctrl-C quits; dropping the
+  `Job` cancels and joins it (receiving meanwhile, which frees a worker blocked on a full
+  channel). `search_step()` waits for one report (tests, `bench_tui`). Still on the UI thread, and
+  not interruptible inside one key-group (a block is read whole): the window's `key_page`, an
+  exact key's `get`, a MAP window's `entries` — each bounded by a page of what it decodes, but a
+  single hot key's key-group costs its full read. Matches are kept as positions
   (their rows fetched by `key_page(pos, 1)` when shown). An exact key goes through `reader.get`
   (instant, no scan) and falls back to a scan only on `NeedsScan` (POJO keys…); a pattern without
   wildcard is first looked up with `get` (then the scan adds its other cases; matches are
   de-duplicated by position). A key-group range seeks its first key-group's cursor (the subtask
   from `subtask_for_key_group`) and stops past its last.
 - **`E` export** streams from the reader on a worker thread (`export::export_json`, through
-  `export.json.partial`): every operator and every key, no cap, no `truncated` flag any more.
-  The document's per-operator `total_keys`, `load_errors`, `malformed_key_groups` and `info`
-  follow its `keys` (they are known once the keys are read).
+  `export.json.partial`): every operator and every key, no cap; `"truncated": false` is still
+  written (top level and per operator) for older readers. A MAP is streamed entry by entry, the
+  record's entries then `reader.entries` pages of `EXPORT_ENTRY_PAGE` (10 000), checking the
+  cancel flag between pages (`ExportSummary::max_entries_held` proves it never holds a map: it
+  used to collect every entry, 1.43 GB peak on a 1.6M-entry map); a non-MAP state reads past the
+  record only when none of its entries is non-empty. Missing map keys go under `#<i>`. The
+  document's per-operator `total_keys`, `load_errors`, `malformed_key_groups` and `info` follow
+  its `keys` (they are known once the keys are read); a key's states are by name. Progress
+  (`ExportProgress`: keys, operators done) is on the status bar; **`q` while it runs asks first**
+  (`App::quit_or_confirm`: a second `q` in a row aborts it and quits, any other key disarms),
+  Ctrl-C aborts at once.
 - **Measured** on `savepoint-big` (release, `examples/bench_tui.rs`, warm page cache): first frame
   after 1 ms at 5 MB RSS (was 4–5 s and 1.06 GB); expand + first page 12 ms; 100 000 keys paged with
   PageDown in 0.8 s (0.5 ms a press, frames 0.15 ms) at 26 MB; the count pass over 1M keys 1.4 s;
@@ -500,9 +521,9 @@ pojo_info, proto)`. The JSON export (`src/export.rs`), the streaming export and 
 add it here once.
 
 - **TUI.** Every label is `value_to_display` of the decoded Value; a MAP's rows are the decoded
-  object's entries (one `StateEntry` per map entry from the reader, `decode_map_entry`),
-  a LIST's rows the decoded array's elements, a structure's rows its decoded fields (first 50 map
-  entries / 100 elements, then `… +N more`). The TUI only adds presentation: `auto_date` (a `Long`
+  entries (one `StateEntry` per map entry from the reader, `decode_map_entry`), 50 at a time in
+  on-disk order behind pager rows, a LIST's rows the decoded array's elements, a structure's rows
+  its decoded fields (first 100 elements, then `… +N more`). The TUI only adds presentation: `auto_date` (a `Long`
   in the 2000–2040 epoch-millis range shown as a date — on by default, so compare with the export
   with it off) and the debug hex suffix. It used to have ~900 lines of decoders of its own, which
   disagreed with the export on 18 of 43 states of `savepoint-gitlab` (MAP values read with their
@@ -839,13 +860,22 @@ source** (branch `release-1.20`, https://github.com/apache/flink) rather than gu
   over 2 subtasks paged with PageDown to the very last key (subtask 1's) and back, keys of both
   subtasks shown, the pager's total exact at the end (`↑ 149971-150000 / 150000`); `↓` row by row
   shows every key once in the reader's order; 3 and 4 subtasks all reachable; the `E` export
-  (`write_json`) streams every key (valid JSON, no `truncated`, cancellable) and the app runs it in
-  the background; a tree over a subset of operators.
+  (`write_json`) streams every key (valid JSON, `truncated: false`, cancellable) and the app runs
+  it in the background; a tree over a subset of operators. A key with a 200 000-entry MAP:
+  expanding it reads one page of 50 entries (`entries_read`), the pager scrolls it a page at a
+  time, its hex detail works on a paged entry; the export streams it with at most one page held
+  (`max_entries_held`), in on-disk order, and a cancel lands inside the map; missing map keys
+  don't collide (`#<i>`); keys containing `↓`/`↑` are not pager rows; `q` during an export asks
+  first (a second `q` aborts, another key disarms), Ctrl-C aborts at once. Each was reverted once
+  to check its test fails.
 - `tests/tui_search_test.rs` (fixture-free, CI) — a glob is scanned step by step (progress on the
   row, every match of both subtasks); an exact String or Long key is found by `get` with no scan
   (one key read), an absent one at once, a pattern without wildcard shown before the scan and not
   twice; a key-group range across the subtask split; Ctrl-C stops (and joins) the count, `C`
-  toggles it; Ctrl-C and `Esc` stop a search; opening, paging, filtering and counting change
+  toggles it; Ctrl-C and `Esc` stop a search; the search runs on a worker (`poll_search` never
+  waits, `cancel_search` joins it), and a `Job` blocked on a full bounded channel is still
+  cancelled and joined; the counts cache goes through a unique side file (pid + counter), none
+  left behind; opening, paging, filtering and counting change
   nothing in the savepoint directory, the counts file holds counts only, is reused, and is stale
   once `_metadata` changes; `--no-cache` and `XDG_CACHE_HOME`/`HOME` give the cache dir.
 - `tests/tui_text_test.rs` (fixture-free, CI) — `TestBackend` renders of long non-ASCII values (é,
