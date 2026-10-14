@@ -223,7 +223,10 @@ fn undecodable_state_values_are_markers_not_null() {
     // Bytes that end before the value does.
     assert_eq!(decode(&[0x00, 0x00], "Long"), json!("[undecodable: Long]"));
     // A list state whose element type is unknown says so instead of being empty.
-    assert_eq!(decode(&[0x01, 0x02], "List<Kryo>"), json!(["[Kryo]"]));
+    assert_eq!(
+        decode(&[0x01, 0x02], "List<Kryo>"),
+        json!(["[Kryo]", "[not decoded: the rest of the list]"])
+    );
 }
 
 #[test]
@@ -290,4 +293,35 @@ fn the_tui_field_reader_reports_a_lost_position() {
         decode_pojo(&mut r, &inner, None),
         Err(json!({ "x": 7, "k": "[Kryo]" }))
     );
+}
+
+#[test]
+fn a_keyed_list_stopped_at_an_element_says_the_rest_is_not_decoded() {
+    // ListDelimitedSerializer: elements separated by ','. A Kryo element has no known length,
+    // so the list cannot go on; it must not look like a one-element list.
+    let mut bytes = vec![1u8, 2, 3];
+    bytes.push(b',');
+    bytes.extend_from_slice(&[9, 9, 9]);
+    let v = decode(&bytes, "List<Kryo>");
+    let items = v.as_array().expect("an array");
+    assert_eq!(items[0], json!("[Kryo]"));
+    assert_eq!(
+        items.last().unwrap(),
+        &json!("[not decoded: the rest of the list]")
+    );
+}
+
+#[test]
+fn a_null_map_key_does_not_read_as_the_string_null() {
+    // VoidNamespace byte, then StringValue null (length 0).
+    let (key, _) = flink_explorer::parser::value::decode_map_entry(
+        &[0, 0],
+        &[0, 0, 0, 0, 0, 0, 0, 0, 7],
+        "String",
+        "Long",
+        None,
+        None,
+        0,
+    );
+    assert_eq!(key, "[null]");
 }

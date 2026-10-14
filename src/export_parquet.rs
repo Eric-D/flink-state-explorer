@@ -73,6 +73,10 @@ fn schema(value: ValueColumn) -> Arc<Schema> {
         Field::new("map_key", DataType::Utf8, true),
         Field::new("namespace_hex", DataType::Utf8, true),
         Field::new("value", value.data_type(), true),
+        // Why `value` is NULL when the state did hold something: the decoder's marker (e.g.
+        // `[undecodable: Long]`), or the JSON of a value the typed column cannot hold. NULL
+        // otherwise, so a NULL `value` with a NULL note is a value Flink stored as null.
+        Field::new("value_note", DataType::Utf8, true),
     ]))
 }
 
@@ -94,6 +98,7 @@ struct Builders {
     map_key: StringBuilder,
     namespace_hex: StringBuilder,
     value: ValueBuilder,
+    value_note: StringBuilder,
     rows: usize,
 }
 
@@ -115,6 +120,7 @@ impl Builders {
                 ValueColumn::Boolean => ValueBuilder::Boolean(BooleanBuilder::new()),
                 ValueColumn::Utf8 | ValueColumn::Json => ValueBuilder::Str(StringBuilder::new()),
             },
+            value_note: StringBuilder::new(),
             rows: 0,
         }
     }
@@ -134,17 +140,38 @@ impl Builders {
         // boolean — becomes NULL rather than a silently coerced wrong value. So does, in a typed
         // scalar column, the marker of a value that could not be decoded (`parser::value`): only
         // bytes that end before the scalar does produce one there.
-        match (&mut self.value, kind) {
-            (ValueBuilder::Int64(b), _) => b.append_option(row.value.as_i64()),
-            (ValueBuilder::Float64(b), _) => b.append_option(row.value.as_f64()),
-            (ValueBuilder::Boolean(b), _) => b.append_option(row.value.as_bool()),
-            (ValueBuilder::Str(b), ValueColumn::Utf8) => b.append_option(row.value.as_str()),
+        let fits = match (&mut self.value, kind) {
+            (ValueBuilder::Int64(b), _) => {
+                b.append_option(row.value.as_i64());
+                row.value.as_i64().is_some()
+            }
+            (ValueBuilder::Float64(b), _) => {
+                b.append_option(row.value.as_f64());
+                row.value.as_f64().is_some()
+            }
+            (ValueBuilder::Boolean(b), _) => {
+                b.append_option(row.value.as_bool());
+                row.value.as_bool().is_some()
+            }
+            (ValueBuilder::Str(b), ValueColumn::Utf8) => {
+                b.append_option(row.value.as_str());
+                row.value.as_str().is_some()
+            }
             (ValueBuilder::Str(b), _) => {
                 if row.value.is_null() {
                     b.append_null();
                 } else {
                     b.append_value(row.value.to_string());
                 }
+                true
+            }
+        };
+        if fits || row.value.is_null() {
+            self.value_note.append_null();
+        } else {
+            match row.value.as_str() {
+                Some(marker) => self.value_note.append_value(marker),
+                None => self.value_note.append_value(row.value.to_string()),
             }
         }
         self.rows += 1;
@@ -168,6 +195,7 @@ impl Builders {
             Arc::new(self.map_key.finish()),
             Arc::new(self.namespace_hex.finish()),
             value,
+            Arc::new(self.value_note.finish()),
         ];
         self.rows = 0;
         RecordBatch::try_new(schema, columns).map_err(|e| format!("arrow batch: {}", e))
@@ -276,5 +304,57 @@ impl<W: std::io::Write + Send> RowSink for ParquetSink<W> {
             w.close().map_err(|e| format!("parquet close: {}", e))?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{Array, Int64Array, StringArray};
+    use serde_json::{json, Value};
+
+    fn row<'a>(value: &'a Value) -> StateRow<'a> {
+        StateRow {
+            operator: "op",
+            subtask: 0,
+            state: "s",
+            state_type: "VALUE",
+            value_type: "Long",
+            key: "k",
+            key_group: 0,
+            map_key: None,
+            namespace_hex: None,
+            value,
+        }
+    }
+
+    #[test]
+    fn a_null_typed_value_says_why_unless_flink_stored_null() {
+        let mut b = Builders::new(ValueColumn::Int64);
+        let (ok, null, marker) = (json!(7), Value::Null, json!("[undecodable: Long]"));
+        for v in [&ok, &null, &marker] {
+            b.push(&row(v), ValueColumn::Int64);
+        }
+        let batch = b.finish(schema(ValueColumn::Int64)).unwrap();
+        let value = batch
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let note = batch
+            .column_by_name("value_note")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(value.value(0), 7);
+        assert!(note.is_null(0));
+        assert!(
+            value.is_null(1) && note.is_null(1),
+            "a stored null has no note"
+        );
+        assert!(value.is_null(2));
+        assert_eq!(note.value(2), "[undecodable: Long]");
     }
 }
