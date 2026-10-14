@@ -9,20 +9,19 @@ use ratatui::Terminal;
 use crate::error::{AppError, UiError};
 use crate::tui::text;
 
+/// What the TUI does before its first frame: `_metadata`, the profile, then each operator's
+/// operator states and keyed-stream headers. No key is read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoadingStep {
     Start,
     CheckingMetadata,
-    LoadingCache,
     ParsingMetadata,
-    BuildingIndex {
+    LoadingProtos,
+    ReadingHeaders {
         total_operators: usize,
         current_operator: usize,
         operator_name: String,
-        total_keys: usize,
     },
-    BuildingTree,
-    LoadingProtos,
     Done,
 }
 
@@ -31,12 +30,10 @@ impl LoadingStep {
         match self {
             Self::Start => 0,
             Self::CheckingMetadata => 1,
-            Self::LoadingCache => 2,
-            Self::ParsingMetadata => 3,
-            Self::BuildingIndex { .. } => 4,
-            Self::BuildingTree => 5,
-            Self::LoadingProtos => 6,
-            Self::Done => 7,
+            Self::ParsingMetadata => 2,
+            Self::LoadingProtos => 3,
+            Self::ReadingHeaders { .. } => 4,
+            Self::Done => 5,
         }
     }
 }
@@ -96,11 +93,9 @@ impl LoadingScreen {
 
         let steps: &[(&str, usize)] = &[
             ("Checking metadata", 1),
-            ("Loading cache", 2),
-            ("Parsing metadata", 3),
-            ("Building index", 4),
-            ("Building tree", 5),
-            ("Loading proto context", 6),
+            ("Parsing metadata", 2),
+            ("Loading proto context", 3),
+            ("Reading state headers", 4),
         ];
 
         let current_order = current.order();
@@ -132,17 +127,16 @@ impl LoadingScreen {
 
             // Default label
             let detail = if step_order == 4 {
-                // Building index — show progress
+                // Reading headers — show progress
                 match current {
-                    LoadingStep::BuildingIndex {
+                    LoadingStep::ReadingHeaders {
                         total_operators,
                         current_operator,
-                        total_keys,
                         ..
                     } if current_order == 4 => {
                         format!(
-                            " {} — {}/{} operators, {} keys",
-                            label, current_operator, total_operators, total_keys
+                            " {} — {}/{} operators",
+                            label, current_operator, total_operators
                         )
                     }
                     _ if current_order > 4 => format!(" {}", label),
@@ -158,8 +152,8 @@ impl LoadingScreen {
             ]));
         }
 
-        // Show current operator name during index building
-        if let LoadingStep::BuildingIndex { operator_name, .. } = current {
+        // Show the current operator's name while its headers are read
+        if let LoadingStep::ReadingHeaders { operator_name, .. } = current {
             if !operator_name.is_empty() {
                 // Cut by columns on a char boundary: a byte slice panicked on non-ASCII names.
                 let name = text::ellipsize(operator_name, 55, "...").into_owned();

@@ -6,10 +6,12 @@
 mod common;
 
 use std::path::Path;
+use std::sync::Arc;
 
 use common::tui::compare_operator;
-use flink_explorer::index::builder::build_index;
+use flink_explorer::operators::summarize;
 use flink_explorer::parser;
+use flink_explorer::reader::StateReader;
 
 #[test]
 fn every_key_and_state_of_the_gitlab_fixture_renders_as_exported() {
@@ -19,17 +21,19 @@ fn every_key_and_state_of_the_gitlab_fixture_renders_as_exported() {
         "fixture missing: run `mvn verify` in test-flink-job"
     );
     let savepoint = parser::parse_metadata(&dir.join("_metadata")).unwrap();
-    // Built, not loaded: no cache is read from or written into the fixture directory.
-    let index = build_index(&savepoint, 0, 0, dir);
+    // The TUI writes nothing into the savepoint directory.
+    let reader = Arc::new(StateReader::open(dir).unwrap());
 
     let (mut pairs, mut states, mut diffs) = (0, 0, Vec::new());
-    for op in &index.operators {
-        let Some(ks) = &op.keyed_state else { continue };
-        if ks.partitions.is_empty() {
+    for op in summarize(&savepoint, dir) {
+        let Some(ks) = common::keyed::keyed(dir, &op.operator_id_hex()) else {
+            continue;
+        };
+        if ks.keys.is_empty() {
             continue;
         }
-        states += ks.descriptors.len();
-        let (n, d) = compare_operator(&savepoint, dir, &index, op);
+        states += ks.states.len();
+        let (n, d) = compare_operator(&savepoint, dir, &reader, &op);
         pairs += n;
         diffs.extend(d);
     }

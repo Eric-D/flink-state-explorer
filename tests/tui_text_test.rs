@@ -6,8 +6,6 @@ mod common;
 
 use common::synth::{self, Item, KeyedOperator, Kind, Ser, Spec, Storage, Val};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use flink_explorer::index::builder::build_index;
-use flink_explorer::parser;
 use flink_explorer::tui::app::App;
 use flink_explorer::tui::loading::{LoadingScreen, LoadingStep};
 use flink_explorer::tui::text;
@@ -102,12 +100,10 @@ fn render_everything(tree: &mut TreeView, width: u16) -> Vec<String> {
 #[test]
 fn long_non_ascii_values_render_at_80_and_120_columns() {
     let dir = savepoint_with_long_values();
-    let savepoint = parser::parse_metadata(&dir.join("_metadata")).unwrap();
-    let index = build_index(&savepoint, 0, 0, &dir);
 
     for width in [80u16, 120] {
         for debug in [false, true] {
-            let mut tree = TreeView::new(&index);
+            let mut tree = TreeView::open(&dir).unwrap();
             if debug {
                 tree.toggle_debug(); // longer labels (hex suffix): more of them are cut
             }
@@ -165,11 +161,10 @@ fn the_loading_screen_shortens_a_non_ascii_operator_name() {
         "short ünïcödé".to_string(),
     ] {
         let mut loading = LoadingScreen::new(std::path::Path::new("/tmp/savepoint-é"));
-        loading.advance(LoadingStep::BuildingIndex {
+        loading.advance(LoadingStep::ReadingHeaders {
             total_operators: 3,
             current_operator: 1,
             operator_name: name.clone(),
-            total_keys: 42,
         });
         terminal.draw(|f| loading.draw(f)).unwrap();
         let rows = screen(&terminal);

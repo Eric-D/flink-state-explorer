@@ -24,7 +24,6 @@ crossterm = "0.29"
 rocksdb = { version = "0.24", features = ["snappy"], optional = true }
 protox = "0.9"
 prost-reflect = "0.16"
-postcard = { version = "1", default-features = false, features = ["use-std"] }
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 clap = { version = "4", features = ["derive"] }

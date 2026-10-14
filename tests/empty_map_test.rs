@@ -1,62 +1,22 @@
 //! An empty MapState should render as a dimmed leaf labelled "empty" (not a dead expandable node).
-use flink_explorer::index::cache::{
-    CachedKeyedState, CachedOperator, IndexCache, KeyPartition, StateDescriptor,
-};
+//!
+//! A key that holds no entry of a registered MAP state (it holds another state's value) is
+//! written to a synthetic savepoint and read back through the `StateReader`, as the TUI does.
+
+mod common;
+
+use common::synth::{self, Item, KeyedOperator, Kind, Ser, Spec, Storage, Val};
 use flink_explorer::tui::tree::TreeView;
 use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
 use ratatui::widgets::Block;
 use ratatui::Terminal;
 
-fn cache_with_map(values: Vec<Option<Vec<u8>>>) -> IndexCache {
-    IndexCache {
-        metadata_size: 0,
-        metadata_mtime: 0,
-        checkpoint_id: 0,
-        savepoint_version: 4,
-        cache_format: flink_explorer::index::cache::CACHE_FORMAT,
-        master_states: vec![],
-        operators: vec![CachedOperator {
-            id: [0u8; 16],
-            display_name: "op".into(),
-            identifier_name: String::new(),
-            parallelism: 1,
-            max_parallelism: 128,
-            subtask_count: 1,
-            keyed_state_size: 0,
-            fully_finished: false,
-            has_coordinator_state: false,
-            coordinator_info: None,
-            states: vec![],
-            keyed_state: Some(CachedKeyedState {
-                descriptors: vec![StateDescriptor {
-                    name: "my-map".into(),
-                    state_type: "MAP".into(),
-                    value_type: "Map<String,String>".into(),
-                    pojo_detail: String::new(),
-                    pojo_info: None,
-                    entry_count: 0,
-                }],
-                partitions: vec![KeyPartition {
-                    key: "k1".into(),
-                    key_group: 0,
-                    values,
-                }],
-                total_keys: 1,
-                key_type: "String".into(),
-                malformed_key_groups: 0,
-                first_malformed: None,
-            }),
-            load_errors: vec![],
-        }],
-    }
-}
-
-fn render_expanded(cache: &IndexCache) -> String {
-    let mut tv = TreeView::new(cache);
+fn render_expanded(dir: &std::path::Path) -> String {
+    let mut tv = TreeView::open(dir).unwrap();
     tv.expand(); // operator
     tv.move_down();
-    tv.expand(); // key partition → entries appear
+    tv.expand(); // the key → its states appear
     let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
     term.draw(|f| tv.render(f, Block::default(), Rect::new(0, 0, 120, 40)))
         .unwrap();
@@ -73,7 +33,20 @@ fn render_expanded(cache: &IndexCache) -> String {
 
 #[test]
 fn empty_map_no_data_is_leaf_labelled_empty() {
-    let screen = render_expanded(&cache_with_map(vec![None]));
+    let mut op = KeyedOperator::new(0x21, 1, 128, Ser::String)
+        .state("my-map", Kind::Map(Ser::String, Ser::String))
+        .state("v", Kind::Value(Ser::Long));
+    op.items.push(Item::Value {
+        state: 1,
+        key: Val::str("k1"),
+        value: Val::Long(1),
+    });
+    let mut spec = Spec::new(Storage::Files);
+    spec.operators.push(op);
+    let dir = synth::temp_dir("empty-map");
+    synth::write_savepoint(&spec, &dir);
+
+    let screen = render_expanded(&dir);
     let line = screen
         .lines()
         .find(|l| l.contains("my-map"))
@@ -85,23 +58,5 @@ fn empty_map_no_data_is_leaf_labelled_empty() {
     assert!(
         line.contains('•') && !line.contains('⯈'),
         "empty map should be a leaf: {line:?}"
-    );
-}
-
-#[test]
-fn zero_count_map_blob_is_leaf_labelled_empty() {
-    // A 4-byte int32(0) blob = a map with zero entries.
-    let screen = render_expanded(&cache_with_map(vec![Some(vec![0, 0, 0, 0])]));
-    let line = screen
-        .lines()
-        .find(|l| l.contains("my-map"))
-        .expect("map line present");
-    assert!(
-        line.contains("empty"),
-        "zero-count map should say 'empty': {line:?}"
-    );
-    assert!(
-        line.contains('•') && !line.contains('⯈'),
-        "zero-count map should be a leaf: {line:?}"
     );
 }

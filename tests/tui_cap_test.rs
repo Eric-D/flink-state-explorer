@@ -1,263 +1,34 @@
-//! The index keeps at most `MAX_STORED_PARTITIONS` keys per operator (#13). These fixture-free
-//! tests check that the TUI pages only through the keys it holds and says how many it holds, that
-//! the kept keys come from every subtask, and that the `E` export says when it is truncated.
+//! The TUI has no key cap any more (#13, #24). It used to keep at most 100,000 keys per operator
+//! in an in-memory index; it now asks the `StateReader` for the page it shows, so every key of
+//! every subtask is reachable. These fixture-free tests page a synthetic 2-subtask savepoint with
+//! more keys than the old cap to its last key and back, check that both subtasks' keys are shown,
+//! and that the `E` export streams every key.
 
 mod common;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
+use std::sync::atomic::AtomicBool;
 
 use common::synth::{self, Item, KeyedOperator, Kind, Ser, Spec, Storage, Val};
-use flink_explorer::index::builder::{build_index, build_index_with_cap};
-use flink_explorer::index::cache::{
-    CachedKeyedState, CachedOperator, IndexCache, KeyPartition, StateDescriptor,
-};
-use flink_explorer::parser;
-use flink_explorer::tui::filter::AppliedFilter;
-use flink_explorer::tui::text;
+use common::tui::{draw, labels, open_tree};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use flink_explorer::reader::{Cursor, StateReader};
+use flink_explorer::tui::app::{App, AppOptions};
 use flink_explorer::tui::tree::TreeView;
 use ratatui::backend::TestBackend;
-use ratatui::widgets::{Block, Borders};
 use ratatui::Terminal;
 use serde_json::Value;
 
-/// The screen as text, one string per row (the cells a wide character hides are skipped).
-fn screen(terminal: &Terminal<TestBackend>) -> Vec<String> {
-    let buf = terminal.backend().buffer();
-    (0..buf.area.height)
-        .map(|y| {
-            let mut row = String::new();
-            let mut hidden = 0;
-            for x in 0..buf.area.width {
-                if hidden > 0 {
-                    hidden -= 1;
-                    continue;
-                }
-                let symbol = buf[(x, y)].symbol();
-                row.push_str(symbol);
-                hidden = text::width(symbol).saturating_sub(1);
-            }
-            row.trim_end().to_string()
-        })
-        .collect()
-}
+/// More than the old `MAX_STORED_PARTITIONS` (100,000).
+const MANY: usize = 150_000;
 
-fn draw(terminal: &mut Terminal<TestBackend>, tree: &mut TreeView) -> Vec<String> {
-    terminal
-        .draw(|f| tree.render(f, Block::default().borders(Borders::ALL), f.area()))
-        .unwrap();
-    screen(terminal)
-}
-
-/// An index whose one operator holds `stored` keys out of `total`: what the builder produces
-/// past the cap, without writing 100 000+ keys.
-fn capped_index(stored: usize, total: usize) -> IndexCache {
-    let partitions = (0..stored)
-        .map(|i| KeyPartition {
-            key: format!("key-{:04}", i),
-            key_group: (i % 128) as u16,
-            values: vec![Some((i as i64).to_be_bytes().to_vec())],
-        })
-        .collect();
-    let keyed = CachedKeyedState {
-        descriptors: vec![StateDescriptor {
-            name: "counter".to_string(),
-            state_type: "VALUE".to_string(),
-            value_type: "Long".to_string(),
-            pojo_detail: String::new(),
-            entry_count: total,
-            pojo_info: None,
-        }],
-        partitions,
-        total_keys: total,
-        key_type: "String".to_string(),
-        malformed_key_groups: 0,
-        first_malformed: None,
-    };
-    index_of(keyed)
-}
-
-fn index_of(keyed: CachedKeyedState) -> IndexCache {
-    IndexCache {
-        metadata_size: 0,
-        metadata_mtime: 0,
-        checkpoint_id: 7,
-        savepoint_version: 4,
-        master_states: Vec::new(),
-        operators: vec![CachedOperator {
-            id: [0xab; 16],
-            display_name: "keyed-op".to_string(),
-            identifier_name: String::new(),
-            parallelism: 2,
-            max_parallelism: 128,
-            subtask_count: 2,
-            keyed_state_size: 0,
-            fully_finished: false,
-            has_coordinator_state: false,
-            coordinator_info: None,
-            states: Vec::new(),
-            keyed_state: Some(keyed),
-            load_errors: Vec::new(),
-        }],
-        cache_format: flink_explorer::index::cache::CACHE_FORMAT,
-    }
-}
-
-fn row<'a>(rows: &'a [String], needle: &str) -> &'a str {
-    rows.iter()
-        .find(|r| r.contains(needle))
-        .unwrap_or_else(|| panic!("no row contains {:?}:\n{}", needle, rows.join("\n")))
-}
-
-#[test]
-fn paging_past_the_stored_keys_reaches_the_end_without_panicking() {
-    let index = capped_index(100, 1000);
-    let mut tree = TreeView::new(&index);
-    let mut terminal = Terminal::new(TestBackend::new(110, 40)).unwrap();
-
-    let rows = draw(&mut terminal, &mut tree);
-    assert!(
-        row(&rows, "keyed-op").contains("(100 of 1000 keys shown, 1 states)"),
-        "{}",
-        row(&rows, "keyed-op")
-    );
-
-    tree.expand(); // the operator
-    let rows = draw(&mut terminal, &mut tree);
-    assert!(row(&rows, "↓ 1-30 / 100").contains("(100 of 1000 keys shown)"));
-
-    // Hold ↓ well past the 100 stored keys: this used to index `partitions[100]` and panic
-    // (in `move_down` itself), since paging was bounded by the savepoint's 1000 keys.
-    for i in 0..1100 {
-        tree.move_down();
-        if i % 25 == 0 {
-            draw(&mut terminal, &mut tree);
-        }
-    }
-    let rows = draw(&mut terminal, &mut tree);
-    assert!(row(&rows, "↑ 71-100 / 100").contains("(100 of 1000 keys shown)"));
-    row(&rows, "key-0099");
-    assert!(!rows.iter().any(|r| r.contains("key-0100")));
-    assert!(
-        !rows.iter().any(|r| r.contains('↓')),
-        "no page after the last stored key"
-    );
-    // The end of the stored keys says it is not the end of the operator's keys.
-    assert!(row(&rows, "900 more keys not indexed").contains("--export-state"));
-
-    // And back up to the first key.
-    for i in 0..1100 {
-        tree.move_up();
-        if i % 25 == 0 {
-            draw(&mut terminal, &mut tree);
-        }
-    }
-    let rows = draw(&mut terminal, &mut tree);
-    row(&rows, "key-0000");
-    assert_eq!(tree.selected_path(), "keyed-op");
-}
-
-#[test]
-fn a_filter_says_it_searched_only_the_stored_keys() {
-    let index = capped_index(100, 1000);
-    let mut tree = TreeView::new(&index);
-    let mut terminal = Terminal::new(TestBackend::new(110, 40)).unwrap();
-    tree.expand();
-
-    tree.apply_filter(&Some(AppliedFilter::Pattern("key-00*".to_string())));
-    let rows = draw(&mut terminal, &mut tree);
-    assert!(
-        row(&rows, "keyed-op").contains("(100 match in 100 of 1000 keys shown, 1 states)"),
-        "{}",
-        row(&rows, "keyed-op")
-    );
-    assert!(row(&rows, "↓ 1-30 / 100").contains("(filter searched 100 of 1000 keys)"));
-
-    tree.apply_filter(&Some(AppliedFilter::Pattern("key-009*".to_string())));
-    let rows = draw(&mut terminal, &mut tree);
-    assert!(row(&rows, "keyed-op").contains("(10 match in 100 of 1000 keys shown, 1 states)"));
-    for _ in 0..50 {
-        tree.move_down();
-        draw(&mut terminal, &mut tree);
-    }
-    let rows = draw(&mut terminal, &mut tree);
-    row(&rows, "key-0099");
-    row(
-        &rows,
-        "900 more keys not indexed (not shown, not searched by /)",
-    );
-}
-
-#[test]
-fn a_filter_matching_no_stored_key_keeps_the_capped_operator_listed() {
-    // The key may be among the ones the index did not keep: the operator and the row saying so
-    // must stay visible, or a real key past the cap looks absent.
-    let index = capped_index(100, 1000);
-    let mut tree = TreeView::new(&index);
-    let mut terminal = Terminal::new(TestBackend::new(110, 40)).unwrap();
-    tree.expand();
-    tree.apply_filter(&Some(AppliedFilter::Pattern("key-0999*".to_string())));
-    let rows = draw(&mut terminal, &mut tree);
-    assert!(
-        row(&rows, "keyed-op").contains("(0 match in 100 of 1000 keys shown, 1 states)"),
-        "{}",
-        row(&rows, "keyed-op")
-    );
-    for _ in 0..5 {
-        tree.move_down();
-        draw(&mut terminal, &mut tree);
-    }
-    let rows = draw(&mut terminal, &mut tree);
-    row(
-        &rows,
-        "900 more keys not indexed (not shown, not searched by /)",
-    );
-}
-
-#[test]
-fn below_the_cap_the_counts_read_as_before() {
-    let index = capped_index(40, 40);
-    let mut tree = TreeView::new(&index);
-    let mut terminal = Terminal::new(TestBackend::new(110, 40)).unwrap();
-    let rows = draw(&mut terminal, &mut tree);
-    assert!(row(&rows, "keyed-op").contains("(40 keys, 1 states)"));
-    tree.expand();
-    let rows = draw(&mut terminal, &mut tree);
-    assert!(!row(&rows, "↓ 1-30 / 40").contains("keys shown"));
-    assert!(!rows.iter().any(|r| r.contains("not indexed")));
-    tree.apply_filter(&Some(AppliedFilter::Pattern("key-001*".to_string())));
-    let rows = draw(&mut terminal, &mut tree);
-    assert!(row(&rows, "keyed-op").contains("(10/40 keys, 1 states)"));
-}
-
-#[test]
-fn a_key_containing_an_arrow_is_not_taken_for_the_pager() {
-    let mut keyed = capped_index(3, 3).operators.remove(0).keyed_state.unwrap();
-    keyed.partitions[1].key = "b ↓ c".to_string();
-    keyed.partitions[2].key = "↑ d".to_string();
-    let index = index_of(keyed);
-    let mut tree = TreeView::new(&index);
-    tree.expand();
-    let mut path = Vec::new();
-    for _ in 0..3 {
-        tree.move_down();
-        path.push(tree.selected_path().to_string());
-    }
-    assert_eq!(
-        path,
-        ["keyed-op > key-0000", "keyed-op > b ↓ c", "keyed-op > ↑ d"]
-    );
-    tree.move_up();
-    assert_eq!(tree.selected_path(), "keyed-op > b ↓ c");
-}
-
-/// One VALUE state over `keys` String keys, `parallelism` subtasks, maxParallelism 128.
 fn operator(keys: usize, parallelism: i32) -> KeyedOperator {
     let mut op = KeyedOperator::new(0x2a, parallelism, 128, Ser::String)
         .state("counter", Kind::Value(Ser::Long));
     for i in 0..keys {
         op.items.push(Item::Value {
             state: 0,
-            key: Val::Str(format!("key-{:05}", i)),
+            key: Val::Str(format!("key-{:06}", i)),
             value: Val::Long(i as i64 * 3 + 1),
         });
     }
@@ -282,147 +53,249 @@ fn subtask_of(key: &str, op: &KeyedOperator) -> i32 {
         .unwrap()
 }
 
-#[test]
-fn stored_keys_come_from_every_subtask() {
-    for (keys, parallelism, cap) in [(400, 2, 50), (300, 3, 31), (500, 4, 7)] {
-        let op = operator(keys, parallelism);
-        let dir = write(&op, "cap-spread");
-        let savepoint = parser::parse_metadata(&dir.join("_metadata")).unwrap();
-        let index = build_index_with_cap(&savepoint, 0, 0, &dir, cap);
-        let ks = index.operators[0].keyed_state.as_ref().unwrap();
-
-        assert_eq!(ks.total_keys, keys, "every key is still counted");
-        assert_eq!(ks.stored_keys(), cap);
-        assert!(ks.is_truncated());
-
-        // Every subtask holds keys here, so every subtask must be represented, in equal
-        // shares (each holds far more than `cap / parallelism` keys).
-        let mut per_subtask: BTreeMap<i32, Vec<&str>> = BTreeMap::new();
-        for p in &ks.partitions {
-            per_subtask
-                .entry(subtask_of(&p.key, &op))
-                .or_default()
-                .push(&p.key);
-        }
-        assert_eq!(
-            per_subtask.keys().copied().collect::<Vec<_>>(),
-            (0..parallelism).collect::<Vec<_>>(),
-            "{} keys over {} subtasks, cap {}: kept from {:?}",
-            keys,
-            parallelism,
-            cap,
-            per_subtask.keys()
-        );
-        let share = cap / parallelism as usize;
-        for (s, kept) in &per_subtask {
-            assert!(
-                kept.len() == share || kept.len() == share + 1,
-                "subtask {} kept {} of a share of {}",
-                s,
-                kept.len(),
-                share
-            );
-            // Within a subtask, its smallest keys, as before.
-            let all: BTreeSet<String> = (0..keys)
-                .map(|i| format!("key-{:05}", i))
-                .filter(|k| subtask_of(k, &op) == *s)
-                .collect();
-            let smallest: Vec<&str> = all.iter().take(kept.len()).map(String::as_str).collect();
-            assert_eq!(kept, &smallest, "subtask {}", s);
-        }
-
-        // Keys and values still pair up.
-        for p in &ks.partitions {
-            let i: i64 = p.key["key-".len()..].parse().unwrap();
-            let raw = p.values[0].as_deref().unwrap();
-            assert_eq!(raw, (i * 3 + 1).to_be_bytes());
-        }
-
-        // And the TUI says how many of them it shows.
-        let mut tree = TreeView::new(&index);
-        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
-        let rows = draw(&mut terminal, &mut tree);
-        assert!(row(&rows, "2a2a2a").contains(&format!("({} of {} keys shown", cap, keys)));
-    }
+fn row<'a>(rows: &'a [String], needle: &str) -> &'a str {
+    rows.iter()
+        .find(|r| r.contains(needle))
+        .unwrap_or_else(|| panic!("no row contains {:?}:\n{}", needle, rows.join("\n")))
 }
 
+/// The keys of the drawn rows (`⯈ key (1 states)`).
+fn shown_keys(rows: &[String]) -> Vec<String> {
+    rows.iter()
+        .filter_map(|r| r.trim_start().strip_prefix("⯈ "))
+        .filter_map(|r| r.strip_suffix(" (1 states)"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The keys in the reader's order: key-groups ascending, on-disk order inside one.
+fn reader_order(dir: &std::path::Path) -> Vec<String> {
+    let reader = StateReader::open(dir).unwrap();
+    let op = reader.operators()[0].id.clone();
+    let mut out = Vec::new();
+    let mut cursor = Some(Cursor::START);
+    while let Some(c) = cursor {
+        let page = reader.key_page(&op, &c, 50_000).unwrap();
+        out.extend(page.keys.into_iter().map(|k| k.key));
+        cursor = page.next;
+    }
+    out
+}
+
+/// 150,000 keys over two subtasks: PageDown reaches the very last key (through both subtasks),
+/// the pager counts every one of them, and PageUp goes back to the first. Nothing caps it.
 #[test]
-fn a_small_or_empty_subtask_leaves_its_share_to_the_others() {
-    // Subtask 0 holds 100 keys, subtask 1 none, subtask 2 only 2: with a cap of 20, the last
-    // subtask keeps both of its keys (filling from subtask 0 kept none of them) and subtask 0
-    // the other 18.
-    let probe = operator(0, 3);
-    let mut picked: BTreeMap<i32, Vec<String>> = BTreeMap::new();
-    for i in 0.. {
-        let key = format!("key-{:05}", i);
-        let s = subtask_of(&key, &probe);
-        let want = [100, 0, 2][s as usize];
-        let got = picked.entry(s).or_default();
-        if got.len() < want {
-            got.push(key);
+fn paging_reaches_every_key_of_both_subtasks_past_the_old_cap() {
+    let op = operator(MANY, 2);
+    let dir = write(&op, "no-cap");
+    let order = reader_order(&dir);
+    assert_eq!(order.len(), MANY);
+    let (first, last) = (order[0].clone(), order[MANY - 1].clone());
+    assert_eq!(subtask_of(&first, &op), 0);
+    assert_eq!(subtask_of(&last, &op), 1, "the last key is subtask 1's");
+
+    let mut tree = open_tree(&dir);
+    // A tall terminal: a page is ~500 rows, so a PageDown scrolls the keys by that much.
+    let mut terminal = Terminal::new(TestBackend::new(100, 502)).unwrap();
+    let rows = labels(&draw(&mut terminal, &mut tree));
+    assert!(
+        row(&rows, "2a2a").contains("(? keys, 1 states)"),
+        "{:?}",
+        rows
+    );
+    tree.jump_first();
+    tree.expand();
+    let rows = labels(&draw(&mut terminal, &mut tree));
+    // Before the end is reached, the total is a lower bound.
+    assert!(
+        row(&rows, "↓ 1-30 / ").contains("/ ≥ "),
+        "{}",
+        row(&rows, "↓ 1-30")
+    );
+    assert_eq!(shown_keys(&rows)[0], first);
+
+    let mut subtasks = BTreeSet::new();
+    let mut presses = 0;
+    loop {
+        tree.page_down();
+        presses += 1;
+        let path = tree.selected_path().to_string();
+        if let Some(key) = path.rsplit(" > ").next().filter(|k| k.starts_with("key-")) {
+            subtasks.insert(subtask_of(key, &op));
         }
-        if picked.get(&0).map_or(0, Vec::len) == 100 && picked.get(&2).map_or(0, Vec::len) == 2 {
+        if path.ends_with(&format!("> {}", last)) {
             break;
         }
+        assert!(presses < 1_000, "stuck at {}", path);
+        if presses % 50 == 0 {
+            draw(&mut terminal, &mut tree);
+        }
     }
-    let mut op =
-        KeyedOperator::new(0x2a, 3, 128, Ser::String).state("counter", Kind::Value(Ser::Long));
-    for key in picked.values().flatten() {
-        op.items.push(Item::Value {
-            state: 0,
-            key: Val::Str(key.clone()),
-            value: Val::Long(1),
-        });
-    }
-    let dir = write(&op, "cap-uneven");
-    let savepoint = parser::parse_metadata(&dir.join("_metadata")).unwrap();
-    let index = build_index_with_cap(&savepoint, 0, 0, &dir, 20);
-    let ks = index.operators[0].keyed_state.as_ref().unwrap();
-    assert_eq!((ks.total_keys, ks.stored_keys()), (102, 20));
-    let mut per_subtask: BTreeMap<i32, usize> = BTreeMap::new();
-    for p in &ks.partitions {
-        *per_subtask.entry(subtask_of(&p.key, &op)).or_default() += 1;
-    }
-    assert_eq!(per_subtask, BTreeMap::from([(0, 18), (2, 2)]));
-}
-
-fn export(index: &IndexCache, tag: &str) -> Value {
-    let path = std::env::temp_dir().join(format!(
-        "flink-explorer-cap-{}-{}.json",
-        tag,
-        std::process::id()
-    ));
-    let count = flink_explorer::export::export_json(index, None, &path).unwrap();
-    let root: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    std::fs::remove_file(&path).ok();
-    let keys = root["operators"][0]["keys"].as_array().unwrap().len();
-    assert_eq!(count, keys);
-    root
-}
-
-#[test]
-fn export_json_says_when_it_is_truncated() {
-    let op = operator(400, 2);
-    let dir = write(&op, "cap-export");
-    let savepoint = parser::parse_metadata(&dir.join("_metadata")).unwrap();
-
-    let capped = export(&build_index_with_cap(&savepoint, 0, 0, &dir, 50), "capped");
-    let opj = &capped["operators"][0];
-    assert_eq!(capped["truncated"], Value::Bool(true));
-    assert_eq!(opj["truncated"], Value::Bool(true));
-    assert_eq!(opj["stored_keys"], 50);
-    assert_eq!(opj["total_keys"], 400);
-    assert_eq!(opj["keys"].as_array().unwrap().len(), 50);
     assert_eq!(
-        opj["info"]["Keys"],
-        "400 (50 shown; --export-state reads them all)"
+        subtasks,
+        BTreeSet::from([0, 1]),
+        "keys of both subtasks shown"
     );
+    let rows = labels(&draw(&mut terminal, &mut tree));
+    // At the end the count is exact: every key, no "not indexed" remainder.
+    let up = format!("↑ {}-{} / {}", MANY - 29, MANY, MANY);
+    row(&rows, &up);
+    assert!(
+        !rows.iter().any(|r| r.contains('↓')),
+        "no page past the last key"
+    );
+    assert!(!rows.iter().any(|r| r.contains("not indexed")));
+    assert!(row(&rows, "2a2a").contains(&format!("({} keys, 1 states)", MANY)));
+    assert_eq!(shown_keys(&rows).last(), Some(&last));
 
-    let full = export(&build_index(&savepoint, 0, 0, &dir), "full");
-    let opj = &full["operators"][0];
-    assert_eq!(full["truncated"], Value::Bool(false));
-    assert_eq!(opj["truncated"], Value::Bool(false));
-    assert_eq!(opj["stored_keys"], 400);
-    assert_eq!(opj["total_keys"], 400);
-    assert_eq!(opj["info"]["Keys"], "400");
+    // And back to the first key.
+    let mut presses = 0;
+    while !tree.selected_path().ends_with(&format!("> {}", first)) {
+        tree.page_up();
+        presses += 1;
+        assert!(presses < 1_000, "stuck at {}", tree.selected_path());
+    }
+    let rows = labels(&draw(&mut terminal, &mut tree));
+    assert!(!rows.iter().any(|r| r.contains('↑')), "{}", rows.join("\n"));
+}
+
+/// `↓` held from the first key to the last of a few hundred keys, one row at a time, reaches
+/// every key exactly in the reader's order, and `↑` comes back (the cap used to stop it, then
+/// panic).
+#[test]
+fn moving_down_row_by_row_shows_every_key_in_reader_order() {
+    let op = operator(400, 2);
+    let dir = write(&op, "row-by-row");
+    let order = reader_order(&dir);
+    let mut tree = open_tree(&dir);
+    tree.jump_first();
+    tree.expand();
+    let mut seen = Vec::new();
+    for _ in 0..order.len() + 10 {
+        tree.move_down();
+        let key = tree
+            .selected_path()
+            .rsplit(" > ")
+            .next()
+            .unwrap()
+            .to_string();
+        if seen.last() != Some(&key) {
+            seen.push(key);
+        }
+    }
+    assert_eq!(seen, order, "every key, once, in the reader's order");
+    for _ in 0..order.len() + 10 {
+        tree.move_up();
+    }
+    assert!(
+        !tree.selected_path().contains(" > "),
+        "back on the operator"
+    );
+}
+
+/// The keys of every subtask are shown, whatever their number: three and four subtasks.
+#[test]
+fn every_subtask_is_reachable() {
+    for parallelism in [3, 4] {
+        let op = operator(300, parallelism);
+        let dir = write(&op, "every-subtask");
+        let mut tree = open_tree(&dir);
+        tree.jump_first();
+        tree.expand();
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        let mut subtasks = BTreeSet::new();
+        for _ in 0..40 {
+            for k in shown_keys(&labels(&draw(&mut terminal, &mut tree))) {
+                subtasks.insert(subtask_of(&k, &op));
+            }
+            tree.page_down();
+        }
+        let all: BTreeSet<i32> = (0..parallelism).collect();
+        assert_eq!(subtasks, all, "parallelism {}", parallelism);
+    }
+}
+
+/// `E` streams every key of every subtask into the JSON export — there is no `truncated` flag
+/// any more, since nothing is left out.
+#[test]
+fn the_json_export_streams_every_key() {
+    let op = operator(MANY / 10, 2);
+    let dir = write(&op, "export-all");
+    let reader = StateReader::open(&dir).unwrap();
+    let summaries = flink_explorer::operators::summarize(reader.savepoint(), &dir);
+    let mut out = Vec::new();
+    let mut last_progress = 0;
+    let summary = flink_explorer::export::write_json(
+        &reader,
+        &summaries,
+        &mut out,
+        &AtomicBool::new(false),
+        &mut |n| last_progress = n,
+    )
+    .unwrap();
+    assert_eq!(summary.keys, MANY / 10);
+    assert_eq!(last_progress, MANY / 10);
+    let v: Value = serde_json::from_slice(&out).expect("valid JSON");
+    assert!(v.get("truncated").is_none());
+    let ops = v["operators"].as_array().unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0]["total_keys"], MANY / 10);
+    let keys = ops[0]["keys"].as_array().unwrap();
+    assert_eq!(keys.len(), MANY / 10);
+    let subtasks: BTreeSet<i32> = keys
+        .iter()
+        .map(|k| subtask_of(k["key"].as_str().unwrap(), &op))
+        .collect();
+    assert_eq!(subtasks, BTreeSet::from([0, 1]));
+    let k = keys.iter().find(|k| k["key"] == "key-000007").unwrap();
+    assert_eq!(k["states"]["counter"], 22);
+    assert_eq!(ops[0]["info"]["Keys"], (MANY / 10).to_string());
+    assert_eq!(ops[0]["state_descriptors"][0]["name"], "counter");
+
+    // Cancelled, it stops instead of writing on.
+    let err = flink_explorer::export::write_json(
+        &reader,
+        &summaries,
+        &mut Vec::new(),
+        &AtomicBool::new(true),
+        &mut |_| {},
+    )
+    .unwrap_err();
+    assert!(err.contains("cancelled"), "{}", err);
+}
+
+/// `E` in the app runs on a worker thread and writes `export.json` (through a side file).
+#[test]
+fn the_app_exports_in_the_background() {
+    let op = operator(500, 2);
+    let dir = write(&op, "export-app");
+    let mut app = App::open(dir.to_path_buf(), AppOptions::default(), |_| {}).unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Char('E'), KeyModifiers::SHIFT));
+    app.wait_for_export();
+    let status = app.status().unwrap_or_default().to_string();
+    assert!(status.starts_with("Exported 500 keys to "), "{}", status);
+    let v: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("export.json")).unwrap()).unwrap();
+    assert_eq!(v["operators"][0]["keys"].as_array().unwrap().len(), 500);
+    assert!(!dir.join("export.json.partial").exists());
+}
+
+/// A tree made of one operator's summary shows that operator only (what the parity tests use).
+#[test]
+fn a_tree_over_a_subset_of_operators() {
+    let mut spec = Spec::new(Storage::Inline);
+    spec.operators.push(operator(10, 1));
+    let mut other = operator(5, 1);
+    other.id = [0x3b; 16];
+    spec.operators.push(other);
+    let dir = synth::temp_dir("subset");
+    synth::write_savepoint(&spec, &dir);
+    let reader = std::sync::Arc::new(StateReader::open(&dir).unwrap());
+    let mut summaries = flink_explorer::operators::summarize(reader.savepoint(), &dir);
+    let second = summaries.remove(1);
+    let mut tree = TreeView::new(reader, vec![second]);
+    let mut terminal = Terminal::new(TestBackend::new(100, 10)).unwrap();
+    let rows = labels(&draw(&mut terminal, &mut tree));
+    assert!(rows.iter().any(|r| r.contains("3b3b")), "{:?}", rows);
+    assert!(!rows.iter().any(|r| r.contains("2a2a")), "{:?}", rows);
 }

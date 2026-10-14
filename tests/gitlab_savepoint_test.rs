@@ -1,58 +1,58 @@
+mod common;
+
 use std::path::Path;
 
-use flink_explorer::index::builder::build_index;
-use flink_explorer::index::cache::{CachedOperator, IndexCache};
+use common::keyed::{find_with_state, operators, Keyed};
+use flink_explorer::operators::OperatorSummary;
 use flink_explorer::parser;
 
 const SAVEPOINT_DIR: &str = "tests/fixtures/savepoint-gitlab";
 
-fn load_index() -> IndexCache {
+/// Every operator of the fixture, its keyed state read whole through the `StateReader`.
+fn load() -> Vec<(OperatorSummary, Option<Keyed>)> {
     let dir = Path::new(SAVEPOINT_DIR);
-    let metadata_path = dir.join("_metadata");
-    assert!(metadata_path.exists(), "Savepoint _metadata not found");
-    let savepoint = parser::parse_metadata(&metadata_path).expect("Failed to parse metadata");
-    let meta = std::fs::metadata(&metadata_path).unwrap();
-    build_index(&savepoint, meta.len(), 0u64, dir)
+    assert!(
+        dir.join("_metadata").exists(),
+        "Savepoint _metadata not found"
+    );
+    operators(dir)
 }
 
-/// Find an operator by checking if it has a specific state descriptor name.
-fn find_operator_with_state<'a>(
-    index: &'a IndexCache,
+/// The keyed state of the operator holding state `state_name`.
+fn find_operator_with_state(
+    ops: &[(OperatorSummary, Option<Keyed>)],
     state_name: &str,
-) -> Option<&'a CachedOperator> {
-    index.operators.iter().find(|o| {
-        o.keyed_state.as_ref().map_or(false, |ks| {
-            ks.descriptors.iter().any(|d| d.name == state_name)
-        })
-    })
+) -> Option<Keyed> {
+    find_with_state(ops, state_name).map(|(_, k)| k)
 }
 
 #[test]
 fn savepoint_loads_successfully() {
-    let index = load_index();
-    println!("Checkpoint ID: {}", index.checkpoint_id);
-    println!("Version: {}", index.savepoint_version);
-    println!("Operators: {}", index.operators.len());
-    assert!(index.operators.len() > 0);
+    let dir = Path::new(SAVEPOINT_DIR);
+    let savepoint = parser::parse_metadata(&dir.join("_metadata")).unwrap();
+    let ops = load();
+    println!("Checkpoint ID: {}", savepoint.checkpoint_id);
+    println!("Version: {}", savepoint.version);
+    println!("Operators: {}", ops.len());
+    assert!(!ops.is_empty());
 }
 
 #[test]
 fn all_types_operator_found() {
-    let index = load_index();
-    let op = find_operator_with_state(&index, "counter")
+    let ops = load();
+    let ks = find_operator_with_state(&ops, "counter")
         .expect("All Types operator (with 'counter' state) not found");
-    let ks = op.keyed_state.as_ref().unwrap();
 
     println!(
         "All Types operator: {} keys, {} states, key_type={}",
-        ks.total_keys,
-        ks.descriptors.len(),
+        ks.keys.len(),
+        ks.states.len(),
         ks.key_type
     );
     assert_eq!(ks.key_type, "String");
-    assert!(ks.total_keys > 0);
+    assert!(!ks.keys.is_empty());
 
-    let names: Vec<&str> = ks.descriptors.iter().map(|d| d.name.as_str()).collect();
+    let names = ks.state_names();
     println!("States: {:?}", names);
 
     // VALUE states
@@ -78,18 +78,12 @@ fn all_types_operator_found() {
 
 #[test]
 fn counter_value_is_long() {
-    let index = load_index();
-    let op = find_operator_with_state(&index, "counter").unwrap();
-    let ks = op.keyed_state.as_ref().unwrap();
-    let idx = ks
-        .descriptors
-        .iter()
-        .position(|d| d.name == "counter")
-        .unwrap();
-    let part = &ks.partitions[0];
-    let raw = part.values.get(idx).and_then(|v| v.as_ref());
-    assert!(raw.is_some(), "counter has no value for key: {}", part.key);
-    let raw = raw.unwrap();
+    let ops = load();
+    let ks = find_operator_with_state(&ops, "counter").unwrap();
+    let key = &ks.keys[0].key;
+    let raw = ks
+        .raw(key, "counter")
+        .unwrap_or_else(|| panic!("counter has no value for key: {}", key));
     assert_eq!(
         raw.len(),
         8,
@@ -97,104 +91,82 @@ fn counter_value_is_long() {
         raw.len()
     );
     let val = i64::from_be_bytes(raw[..8].try_into().unwrap());
-    println!("counter = {} for key '{}'", val, part.key);
+    println!("counter = {} for key '{}'", val, key);
     assert!(val > 0);
+    // The reader decodes it the same way.
+    assert_eq!(ks.value(key, "counter"), Some(serde_json::json!(val)));
 }
 
 #[test]
 fn label_value_is_string() {
-    let index = load_index();
-    let op = find_operator_with_state(&index, "label").unwrap();
-    let ks = op.keyed_state.as_ref().unwrap();
-    let idx = ks
-        .descriptors
-        .iter()
-        .position(|d| d.name == "label")
-        .unwrap();
-    let part = &ks.partitions[0];
-    let raw = part.values.get(idx).and_then(|v| v.as_ref());
-    assert!(raw.is_some(), "label has no value");
-    let raw = raw.unwrap();
+    let ops = load();
+    let ks = find_operator_with_state(&ops, "label").unwrap();
+    let key = &ks.keys[0].key;
+    let raw = ks.raw(key, "label").expect("label has no value");
     let mut r = flink_explorer::parser::java_deser::JavaReader::new(raw.as_slice());
     let val = r.read_string_value().expect("Failed to read StringValue");
-    println!("label = '{}' for key '{}'", val, part.key);
+    println!("label = '{}' for key '{}'", val, key);
     assert!(
         val.starts_with("label-for-"),
         "Expected 'label-for-...', got '{}'",
         val
     );
+    assert_eq!(ks.value(key, "label"), Some(serde_json::json!(val)));
 }
 
 #[test]
 fn long_key_operator() {
-    let index = load_index();
-    let op = find_operator_with_state(&index, "element-count")
+    let ops = load();
+    let ks = find_operator_with_state(&ops, "element-count")
         .expect("Long Key operator (with 'element-count') not found");
-    let ks = op.keyed_state.as_ref().unwrap();
-    println!("Long Key: {} keys, key_type={}", ks.total_keys, ks.key_type);
+    println!("Long Key: {} keys, key_type={}", ks.keys.len(), ks.key_type);
     assert_eq!(ks.key_type, "Long");
-    let part = &ks.partitions[0];
-    assert!(
-        part.key.parse::<i64>().is_ok(),
-        "Long key should be numeric: {}",
-        part.key
-    );
+    for k in &ks.keys {
+        assert!(
+            k.key.parse::<i64>().is_ok(),
+            "Long key should be numeric: {}",
+            k.key
+        );
+    }
 }
 
 #[test]
 fn pojo_key_operator() {
-    let index = load_index();
-    let op = find_operator_with_state(&index, "latest-event")
+    let ops = load();
+    let ks = find_operator_with_state(&ops, "latest-event")
         .expect("POJO Key operator (with 'latest-event') not found");
-    let ks = op.keyed_state.as_ref().unwrap();
-    println!("POJO Key: {} keys, key_type={}", ks.total_keys, ks.key_type);
+    println!("POJO Key: {} keys, key_type={}", ks.keys.len(), ks.key_type);
     assert!(ks.key_type == "Pojo" || ks.key_type.contains("Pojo"));
-    let part = &ks.partitions[0];
-    println!("Key: {}", part.key);
-    assert!(
-        part.key.contains("{"),
-        "POJO key should be JSON-like: {}",
-        part.key
-    );
+    let key = &ks.keys[0].key;
+    println!("Key: {}", key);
+    assert!(key.contains('{'), "POJO key should be JSON-like: {}", key);
 }
 
 #[test]
 fn map_state_has_entries() {
-    let index = load_index();
-    let op = find_operator_with_state(&index, "events-by-type").unwrap();
-    let ks = op.keyed_state.as_ref().unwrap();
-    let desc = ks
-        .descriptors
-        .iter()
-        .find(|d| d.name == "events-by-type")
-        .unwrap();
+    let ops = load();
+    let ks = find_operator_with_state(&ops, "events-by-type").unwrap();
+    let desc = ks.state("events-by-type").unwrap();
+    let entries = ks.entry_count("events-by-type");
     println!(
         "events-by-type: state_type={} value_type={} entries={}",
-        desc.state_type, desc.value_type, desc.entry_count
+        desc.state_type, desc.value_type, entries
     );
     assert_eq!(desc.state_type, "MAP");
-    assert!(desc.entry_count > 0, "MAP should have entries");
+    assert!(entries > 0, "MAP should have entries");
 
-    // Check blob format
-    let idx = ks
-        .descriptors
-        .iter()
-        .position(|d| d.name == "events-by-type")
-        .unwrap();
+    // One entry per map pair, each with its decoded map key; the value is the object of them.
     let mut map_count = 0;
-    for part in &ks.partitions {
-        if let Some(Some(raw)) = part.values.get(idx) {
-            if raw.len() >= 4 {
-                let count = i32::from_be_bytes(raw[..4].try_into().unwrap());
-                println!(
-                    "  key={}: {} map pairs, {} bytes",
-                    part.key,
-                    count,
-                    raw.len()
-                );
-                map_count += count;
-            }
+    for k in &ks.keys {
+        let es = ks.entries(&k.key, "events-by-type");
+        if es.is_empty() {
+            continue;
         }
+        assert!(es.iter().all(|e| e.map_key.is_some()));
+        let obj = ks.value(&k.key, "events-by-type").unwrap();
+        assert_eq!(obj.as_object().unwrap().len(), es.len(), "key {}", k.key);
+        println!("  key={}: {} map pairs", k.key, es.len());
+        map_count += es.len();
     }
     println!("Total MAP pairs across all keys: {}", map_count);
     assert!(map_count > 0, "Should have MAP pairs");
@@ -202,27 +174,22 @@ fn map_state_has_entries() {
 
 #[test]
 fn list_state_has_entries() {
-    let index = load_index();
-    let op = find_operator_with_state(&index, "large-list").unwrap();
-    let ks = op.keyed_state.as_ref().unwrap();
-    let desc = ks
-        .descriptors
-        .iter()
-        .find(|d| d.name == "large-list")
-        .unwrap();
+    let ops = load();
+    let ks = find_operator_with_state(&ops, "large-list").unwrap();
+    let desc = ks.state("large-list").unwrap();
     println!(
         "large-list: state_type={} entries={}",
-        desc.state_type, desc.entry_count
+        desc.state_type,
+        ks.entry_count("large-list")
     );
     assert_eq!(desc.state_type, "LIST");
 }
 
 #[test]
 fn coprocess_operator() {
-    let index = load_index();
-    let op = find_operator_with_state(&index, "left-value").expect("CoProcess operator not found");
-    let ks = op.keyed_state.as_ref().unwrap();
-    let names: Vec<&str> = ks.descriptors.iter().map(|d| d.name.as_str()).collect();
+    let ops = load();
+    let ks = find_operator_with_state(&ops, "left-value").expect("CoProcess operator not found");
+    let names = ks.state_names();
     println!("CoProcess states: {:?}", names);
     assert!(names.contains(&"left-value"));
     assert!(names.contains(&"right-value"));
@@ -232,31 +199,25 @@ fn coprocess_operator() {
 
 #[test]
 fn tuple_reduce_operator() {
-    let index = load_index();
-    let op =
-        find_operator_with_state(&index, "running-sum").expect("Tuple Reduce operator not found");
-    let ks = op.keyed_state.as_ref().unwrap();
-    let names: Vec<&str> = ks.descriptors.iter().map(|d| d.name.as_str()).collect();
+    let ops = load();
+    let ks =
+        find_operator_with_state(&ops, "running-sum").expect("Tuple Reduce operator not found");
+    let names = ks.state_names();
     println!("Tuple Reduce states: {:?}", names);
     assert!(names.contains(&"running-sum"));
     assert!(names.contains(&"tuple2-state"));
     assert!(names.contains(&"tuple3-state"));
 
-    let reducing = ks
-        .descriptors
-        .iter()
-        .find(|d| d.name == "running-sum")
-        .unwrap();
+    let reducing = ks.state("running-sum").unwrap();
     println!("running-sum state_type={}", reducing.state_type);
     assert_eq!(reducing.state_type, "REDUCING");
 }
 
 #[test]
 fn extra_types_operator() {
-    let index = load_index();
-    let op = find_operator_with_state(&index, "byte-val").expect("Extra Types operator not found");
-    let ks = op.keyed_state.as_ref().unwrap();
-    let names: Vec<&str> = ks.descriptors.iter().map(|d| d.name.as_str()).collect();
+    let ops = load();
+    let ks = find_operator_with_state(&ops, "byte-val").expect("Extra Types operator not found");
+    let names = ks.state_names();
     println!("Extra Types states: {:?}", names);
 
     for s in &[
@@ -275,24 +236,15 @@ fn extra_types_operator() {
     }
 
     // nullable-never-set should have no entries
-    let null_desc = ks
-        .descriptors
-        .iter()
-        .find(|d| d.name == "nullable-never-set")
-        .unwrap();
     assert_eq!(
-        null_desc.entry_count, 0,
+        ks.entry_count("nullable-never-set"),
+        0,
         "nullable-never-set should have 0 entries"
     );
 
     // byte-val should be 1 byte
-    let idx = ks
-        .descriptors
-        .iter()
-        .position(|d| d.name == "byte-val")
-        .unwrap();
-    let part = &ks.partitions[0];
-    if let Some(Some(raw)) = part.values.get(idx) {
+    let key = &ks.keys[0].key;
+    if let Some(raw) = ks.raw(key, "byte-val") {
         assert_eq!(raw.len(), 1, "byte-val should be 1 byte");
         println!("byte-val = {}", raw[0] as i8);
     }
@@ -300,49 +252,33 @@ fn extra_types_operator() {
 
 #[test]
 fn summary_report() {
-    let index = load_index();
+    let dir = Path::new(SAVEPOINT_DIR);
+    let savepoint = parser::parse_metadata(&dir.join("_metadata")).unwrap();
+    let ops = load();
     println!("\n=== SAVEPOINT SUMMARY ===");
-    println!("Version: {}", index.savepoint_version);
-    println!("Checkpoint ID: {}", index.checkpoint_id);
-    println!("Operators: {}", index.operators.len());
+    println!("Version: {}", savepoint.version);
+    println!("Checkpoint ID: {}", savepoint.checkpoint_id);
+    println!("Operators: {}", ops.len());
 
-    let keyed_ops = index
-        .operators
-        .iter()
-        .filter(|o| o.keyed_state.is_some())
-        .count();
-    let total_keys: usize = index
-        .operators
-        .iter()
-        .filter_map(|o| o.keyed_state.as_ref())
-        .map(|k| k.total_keys)
-        .sum();
-    let total_states: usize = index
-        .operators
-        .iter()
-        .filter_map(|o| o.keyed_state.as_ref())
-        .map(|k| k.descriptors.len())
-        .sum();
+    let keyed: Vec<&Keyed> = ops.iter().filter_map(|(_, k)| k.as_ref()).collect();
+    let total_keys: usize = keyed.iter().map(|k| k.keys.len()).sum();
+    let total_states: usize = keyed.iter().map(|k| k.states.len()).sum();
 
-    println!("Keyed operators: {}", keyed_ops);
+    println!("Keyed operators: {}", keyed.len());
     println!("Total keys: {}", total_keys);
     println!("Total states: {}", total_states);
 
-    let key_types: Vec<&str> = index
-        .operators
+    let key_types: Vec<&str> = keyed
         .iter()
-        .filter_map(|o| o.keyed_state.as_ref())
-        .filter(|k| k.total_keys > 0)
+        .filter(|k| !k.keys.is_empty())
         .map(|k| k.key_type.as_str())
         .collect();
     println!("Key types: {:?}", key_types);
 
     let mut types = std::collections::HashMap::new();
-    for op in &index.operators {
-        if let Some(ks) = &op.keyed_state {
-            for d in &ks.descriptors {
-                *types.entry(d.state_type.as_str()).or_insert(0) += 1;
-            }
+    for ks in &keyed {
+        for d in &ks.states {
+            *types.entry(d.state_type.as_str()).or_insert(0) += 1;
         }
     }
     println!("State types: {:?}", types);
@@ -357,9 +293,9 @@ fn entry_layouts_match_what_flink_wrote() {
     use flink_explorer::parser::state_handle::{StateHandle, StreamStateHandle};
     let dir = Path::new(SAVEPOINT_DIR);
     let savepoint = parser::parse_metadata(&dir.join("_metadata")).unwrap();
-    let index = load_index();
+    let ops = load();
     let mut checked = 0;
-    for (op, cached) in savepoint.operators.iter().zip(&index.operators) {
+    for (op, (_, keyed)) in savepoint.operators.iter().zip(&ops) {
         for st in &op.subtask_states {
             let StateHandle::KeyGroups(kg) = &st.managed_keyed_state else {
                 continue;
@@ -386,11 +322,7 @@ fn entry_layouts_match_what_flink_wrote() {
                     1
                 };
                 assert_eq!(l.namespace_len, Some(want), "namespace of {}", m.name);
-                let descriptor = cached
-                    .keyed_state
-                    .as_ref()
-                    .and_then(|ks| ks.descriptors.iter().find(|d| d.name == m.name))
-                    .unwrap();
+                let descriptor = keyed.as_ref().and_then(|ks| ks.state(&m.name)).unwrap();
                 let want_map_key = descriptor
                     .value_type
                     .strip_prefix("Map<")

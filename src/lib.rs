@@ -4,7 +4,7 @@ pub mod export;
 pub mod export_parquet;
 pub mod export_state;
 pub mod glob;
-pub mod index;
+pub mod operators;
 pub mod parser;
 pub mod profile;
 pub mod proto;

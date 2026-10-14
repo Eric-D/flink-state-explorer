@@ -6,11 +6,11 @@
 use std::path::Path;
 
 use flink_explorer::export_state::{export_state_ndjson, list_states};
-use flink_explorer::index::builder::build_index;
 use flink_explorer::parser;
 use flink_explorer::parser::key_group::{
     java_long_hash, java_string_hash, key_group_for_hash, murmur_hash, range_for_subtask,
 };
+use flink_explorer::reader::StateReader;
 use serde_json::Value;
 
 const SAVEPOINT_DIR: &str = "tests/fixtures/savepoint-gitlab";
@@ -37,19 +37,25 @@ fn savepoint() -> parser::Savepoint {
 }
 
 #[test]
-fn index_export_reports_the_key_group_flink_assigned() {
+fn reader_export_reports_the_key_group_flink_assigned() {
     let dir = Path::new(SAVEPOINT_DIR);
-    let metadata_path = dir.join("_metadata");
-    let sp = savepoint();
-    let len = std::fs::metadata(&metadata_path).unwrap().len();
-    let index = build_index(&sp, len, 0u64, dir);
+    savepoint(); // asserts the fixture exists
+    let reader = StateReader::open(dir).unwrap();
+    let summaries = flink_explorer::operators::summarize(reader.savepoint(), dir);
 
     let tmp = std::env::temp_dir().join(format!(
         "kg_assign_{}_{:?}.json",
         std::process::id(),
         std::thread::current().id()
     ));
-    flink_explorer::export::export_json(&index, None, &tmp).expect("export_json");
+    flink_explorer::export::export_json(
+        &reader,
+        &summaries,
+        &tmp,
+        &std::sync::atomic::AtomicBool::new(false),
+        &mut |_| {},
+    )
+    .expect("export_json");
     let root: Value = serde_json::from_str(&std::fs::read_to_string(&tmp).unwrap()).unwrap();
     std::fs::remove_file(&tmp).ok();
 
