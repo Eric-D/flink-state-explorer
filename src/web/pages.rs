@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 
 use super::html::{url_decode_path, url_encode, Html};
+use super::tools;
 use super::{App, Response};
 use crate::export_state::{namespace_hex, row_json, StateRow};
 use crate::parser::state_handle::{StateHandle, StreamStateHandle};
@@ -30,7 +31,7 @@ const TREE_MEMBERS: usize = 1000;
 /// Raw bytes shown in hex before the dump is cut.
 const HEX_BYTES: usize = 4096;
 /// Characters of a value shown in a table cell.
-const CELL_CHARS: usize = 160;
+pub(super) const CELL_CHARS: usize = 160;
 /// Characters of the one-line preview next to a value tree's summary.
 const PREVIEW_CHARS: usize = 80;
 /// Entries per page of the entries view unless `limit` says otherwise.
@@ -42,13 +43,15 @@ const DEFAULT_ENTRY_PAGE: usize = 100;
 pub const ENTRY_LIMIT: usize = 200;
 
 /// Why a request failed: the status, and a message safe to show (it is escaped like any text).
-enum Fail {
+pub(super) enum Fail {
     NotFound(String),
     BadRequest(String),
+    /// Refused for now (a limit is reached): `503`, retry later.
+    Busy(String),
     Internal(String),
 }
 
-type Res<T> = Result<T, Fail>;
+pub(super) type Res<T> = Result<T, Fail>;
 
 /// The status a reader error deserves: the caller's fault (unknown operator, bad cursor, …) or
 /// the savepoint's (unreadable, malformed).
@@ -69,7 +72,13 @@ impl From<ReaderError> for Fail {
     }
 }
 
-pub(super) fn route(app: &App, path: &str, query: &[(String, String)]) -> Response {
+/// `side_effects`: false for a `HEAD`, which must not start or cancel a count.
+pub(super) fn route(
+    app: &App,
+    path: &str,
+    query: &[(String, String)],
+    side_effects: bool,
+) -> Response {
     let segments: Vec<String> = path.split('/').skip(1).map(url_decode_path).collect();
     let segs: Vec<&str> = segments.iter().map(String::as_str).collect();
     let q = Query(query);
@@ -91,6 +100,9 @@ pub(super) fn route(app: &App, path: &str, query: &[(String, String)]) -> Respon
         ["op", op, "key"] => (false, key_page(app, op, &q)),
         ["op", op, "lookup"] => (false, lookup_page(app, op, &q)),
         ["op", op, "entries"] => (false, entries_page(app, op, &q)),
+        ["op", op, "search"] => (false, tools::search_page(app, op, &q)),
+        ["op", op, "count"] => (false, tools::count_page(app, op, &q, side_effects)),
+        ["op", op, "download"] => (false, tools::download(app, op, &q)),
         ["api", "operators"] => (true, api_operators(app)),
         ["api", "op", op] => (true, api_operator(app, op)),
         ["api", "op", op, "keys"] => (true, api_keys(app, op, &q, None)),
@@ -102,6 +114,8 @@ pub(super) fn route(app: &App, path: &str, query: &[(String, String)]) -> Respon
         ["api", "op", op, "key"] => (true, api_key(app, op, &q)),
         ["api", "op", op, "lookup"] => (true, api_lookup(app, op, &q)),
         ["api", "op", op, "entries"] => (true, api_entries(app, op, &q)),
+        ["api", "op", op, "search"] => (true, tools::api_search(app, op, &q)),
+        ["api", "op", op, "count"] => (true, tools::api_count(app, op, &q, side_effects)),
         _ if segs.first() == Some(&"api") => {
             (true, Err(Fail::NotFound("no such API route".into())))
         }
@@ -113,9 +127,10 @@ pub(super) fn route(app: &App, path: &str, query: &[(String, String)]) -> Respon
             let (status, msg) = match fail {
                 Fail::NotFound(m) => (404, m),
                 Fail::BadRequest(m) => (400, m),
+                Fail::Busy(m) => (503, m),
                 Fail::Internal(m) => (500, m),
             };
-            if api {
+            let mut r = if api {
                 json_response(status, &json!({ "error": msg }))
             } else {
                 let mut body = Html::new();
@@ -127,36 +142,40 @@ pub(super) fn route(app: &App, path: &str, query: &[(String, String)]) -> Respon
                 let mut r = layout(app, "Error", &[], &body);
                 r.status = status;
                 r
+            };
+            if status == 503 {
+                r.headers.push(("Retry-After", "5".to_string()));
             }
+            r
         }
     }
 }
 
 // --- query parameters ---------------------------------------------------------------------------
 
-struct Query<'a>(&'a [(String, String)]);
+pub(super) struct Query<'a>(&'a [(String, String)]);
 
 impl Query<'_> {
-    fn get(&self, name: &str) -> Option<&str> {
+    pub(super) fn get(&self, name: &str) -> Option<&str> {
         self.0
             .iter()
             .find(|(k, _)| k == name)
             .map(|(_, v)| v.as_str())
     }
 
-    fn required(&self, name: &str) -> Res<&str> {
+    pub(super) fn required(&self, name: &str) -> Res<&str> {
         self.get(name)
             .ok_or_else(|| Fail::BadRequest(format!("missing parameter {:?}", name)))
     }
 
-    fn cursor(&self, name: &str) -> Res<Option<Cursor>> {
+    pub(super) fn cursor(&self, name: &str) -> Res<Option<Cursor>> {
         match self.get(name) {
             None | Some("") => Ok(None),
             Some(c) => c.parse().map(Some).map_err(Fail::BadRequest),
         }
     }
 
-    fn limit(&self) -> Res<usize> {
+    pub(super) fn limit(&self) -> Res<usize> {
         self.limit_or(DEFAULT_LIMIT)
     }
 
@@ -177,7 +196,7 @@ impl Query<'_> {
 // --- operator data (shared by the page and its JSON twin) ---------------------------------------
 
 /// The canonical hex id of the operator `op` names (a hex id or a unique prefix of one).
-fn resolve(app: &App, op: &str) -> Res<(usize, String)> {
+pub(super) fn resolve(app: &App, op: &str) -> Res<(usize, String)> {
     // An empty prefix would match every operator: `/op/` is not a page.
     if op.is_empty() {
         return Err(Fail::NotFound("no operator id given".into()));
@@ -317,7 +336,7 @@ fn keyed_size(app: &App, op_index: usize) -> u64 {
 
 // --- links ----------------------------------------------------------------------------------------
 
-fn href(path: &str, params: &[(&str, &str)]) -> String {
+pub(super) fn href(path: &str, params: &[(&str, &str)]) -> String {
     let mut s = path.to_string();
     for (i, (k, v)) in params.iter().enumerate() {
         s.push(if i == 0 { '?' } else { '&' });
@@ -328,7 +347,7 @@ fn href(path: &str, params: &[(&str, &str)]) -> String {
     s
 }
 
-fn op_path(op: &str, sub: &str) -> String {
+pub(super) fn op_path(op: &str, sub: &str) -> String {
     if sub.is_empty() {
         format!("/op/{}", url_encode(op))
     } else {
@@ -336,7 +355,7 @@ fn op_path(op: &str, sub: &str) -> String {
     }
 }
 
-fn link(h: &mut Html, href: &str, text: &str) {
+pub(super) fn link(h: &mut Html, href: &str, text: &str) {
     h.raw("<a href=\"")
         .text(href)
         .raw("\">")
@@ -353,7 +372,7 @@ fn clip(s: &str, max: usize) -> String {
 
 // --- layout ---------------------------------------------------------------------------------------
 
-fn layout(app: &App, title: &str, crumbs: &[(String, String)], body: &Html) -> Response {
+pub(super) fn layout(app: &App, title: &str, crumbs: &[(String, String)], body: &Html) -> Response {
     let mut h = Html::new();
     h.raw("<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">")
         .raw("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">")
@@ -383,12 +402,12 @@ fn layout(app: &App, title: &str, crumbs: &[(String, String)], body: &Html) -> R
     )
 }
 
-fn json_response(status: u16, v: &Value) -> Response {
+pub(super) fn json_response(status: u16, v: &Value) -> Response {
     let body = serde_json::to_vec_pretty(v).unwrap_or_else(|_| b"{}".to_vec());
     Response::new(status, "application/json", body)
 }
 
-fn op_crumb(id: &str) -> (String, String) {
+pub(super) fn op_crumb(id: &str) -> (String, String) {
     (
         op_path(id, ""),
         format!("operator {}", &id[..id.len().min(12)]),
@@ -545,20 +564,40 @@ fn operator_page(app: &App, op: &str) -> Res<Response> {
         Some(Ok(k)) => {
             h.raw("<h2>Keyed state</h2>");
             lookup_form(&mut h, &id, "");
+            tools::search_form(&mut h, &id, "", crate::glob::MatchMode::Glob, (None, None));
             h.raw("<p>");
             link(
                 &mut h,
                 &op_path(&id, "keys"),
                 "Browse every key with all its states",
             );
+            h.raw(" · ");
+            let counts = app.counts.get(&id);
+            link(
+                &mut h,
+                &op_path(&id, "count"),
+                if counts.is_some() {
+                    "Key counts"
+                } else {
+                    "Count keys and entries"
+                },
+            );
             h.raw("</p>");
             for e in &k.errors {
                 h.raw("<p class=\"error\">").text(e).raw("</p>");
             }
-            h.raw("<table><thead><tr><th>State</th><th>Type</th><th>Value type</th>")
-                .raw("<th>Value class</th><th>Subtasks</th></tr></thead><tbody>");
+            // `app.js` refreshes the count cells while a count runs.
+            h.raw("<div");
+            if counts.as_ref().is_some_and(|c| c.status.is_live()) {
+                h.raw(" data-count-api=\"")
+                    .text(&format!("/api{}", op_path(&id, "count")))
+                    .raw("\"");
+            }
+            h.raw("><table><thead><tr><th>State</th><th>Type</th><th>Value type</th>")
+                .raw("<th>Value class</th><th>Subtasks</th><th>Keys</th><th>Entries</th>")
+                .raw("<th>Download</th></tr></thead><tbody>");
             for s in &k.states {
-                h.raw("<tr><td>");
+                h.raw("<tr data-state=\"").text(&s.name).raw("\"><td>");
                 link(
                     &mut h,
                     &href(&op_path(&id, "state"), &[("name", &s.name)]),
@@ -572,9 +611,26 @@ fn operator_page(app: &App, op: &str) -> Res<Response> {
                     .text(s.value_class.as_deref().unwrap_or(""))
                     .raw("</td><td>")
                     .display(s.subtasks)
-                    .raw("</td></tr>");
+                    .raw("</td>");
+                tools::count_cells(&mut h, counts.as_ref(), &s.name);
+                h.raw("<td>");
+                let dl = op_path(&id, "download");
+                link(
+                    &mut h,
+                    &href(&dl, &[("state", &s.name), ("format", "ndjson")]),
+                    "NDJSON",
+                );
+                if cfg!(feature = "parquet") {
+                    h.raw(" · ");
+                    link(
+                        &mut h,
+                        &href(&dl, &[("state", &s.name), ("format", "parquet")]),
+                        "Parquet",
+                    );
+                }
+                h.raw("</td></tr>");
             }
-            h.raw("</tbody></table>");
+            h.raw("</tbody></table></div>");
         }
     }
 
@@ -636,14 +692,26 @@ fn api_operator(app: &App, op: &str) -> Res<Response> {
     };
     Ok(json_response(
         200,
-        &json!({ "id": view.id, "info": info, "keyed": keyed, "operator_states": op_states }),
+        &json!({
+            "id": view.id,
+            "info": info,
+            "keyed": keyed,
+            "operator_states": op_states,
+            "counts": app.counts.get(&view.id).map(|snap| {
+                let names: Vec<String> = match &view.keyed {
+                    Some(Ok(k)) => k.states.iter().map(|s| s.name.clone()).collect(),
+                    _ => Vec::new(),
+                };
+                tools::count_json(&view.id, &names, &snap)
+            }),
+        }),
     ))
 }
 
 // --- key pages ------------------------------------------------------------------------------------
 
 /// Check that `name` is a keyed state of the operator.
-fn check_state(app: &App, id: &str, name: &str) -> Res<()> {
+pub(super) fn check_state(app: &App, id: &str, name: &str) -> Res<()> {
     let states = app.reader.states(id)?;
     if states.states.iter().any(|s| s.name == name) {
         Ok(())
@@ -691,7 +759,7 @@ fn entry_row_at(op: &str, subtask: i32, key: &str, key_group: u16, e: &StateEntr
     })
 }
 
-fn stats_json(stats: &ReadStats) -> Value {
+pub(super) fn stats_json(stats: &ReadStats) -> Value {
     json!({
         "blocks": stats.blocks,
         "cache_hits": stats.cache_hits,
@@ -701,7 +769,7 @@ fn stats_json(stats: &ReadStats) -> Value {
     })
 }
 
-fn unreadable_json(list: &[Unreadable]) -> Value {
+pub(super) fn unreadable_json(list: &[Unreadable]) -> Value {
     Value::Array(
         list.iter()
             .map(|u| {
@@ -746,7 +814,7 @@ fn entries_href(api: bool, id: &str, position: &Cursor, state: &str, offset: usi
 }
 
 /// A visible warning listing each key-group range a page could not read (and skipped).
-fn unreadable_warnings(h: &mut Html, list: &[Unreadable]) {
+pub(super) fn unreadable_warnings(h: &mut Html, list: &[Unreadable]) {
     if list.is_empty() {
         return;
     }
@@ -773,7 +841,7 @@ fn unreadable_warnings(h: &mut Html, list: &[Unreadable]) {
     h.raw("</ul></div>");
 }
 
-fn malformed_warnings(h: &mut Html, list: &[String]) {
+pub(super) fn malformed_warnings(h: &mut Html, list: &[String]) {
     for m in list {
         h.raw(
             "<p class=\"error\" role=\"alert\">Malformed key-group (what follows the defect \
@@ -851,8 +919,13 @@ fn keys_page(app: &App, op: &str, q: &Query, state: Option<&str>) -> Res<Respons
     lookup_form(&mut h, &id, "");
     h.raw(
         "<p class=\"note\">Keys in on-disk order: key-group by key-group, then as they appear \
-           in each key-group's block. Counts and search come later.</p>",
+           in each key-group's block.</p>",
     );
+    h.raw("<p>");
+    link(&mut h, &op_path(&id, "search"), "Search keys");
+    h.raw(" · ");
+    link(&mut h, &op_path(&id, "count"), "Key counts");
+    h.raw("</p>");
     unreadable_warnings(&mut h, &page.unreadable);
     malformed_warnings(&mut h, &page.malformed);
     h.raw("<table class=\"keys\"><thead><tr><th>Key</th>");
@@ -1157,7 +1230,7 @@ fn preview(v: &Value, max: usize) -> String {
 
 /// `state = value · state[map key] = value · …` for a row of the keys page, cut at `max`
 /// characters while it is built.
-fn summary(rec: &KeyRecord, max: usize) -> String {
+pub(super) fn summary(rec: &KeyRecord, max: usize) -> String {
     let mut p = Preview::new(max);
     for (i, e) in rec.entries.iter().enumerate() {
         let more = (i == 0 || p.push(" · "))
@@ -1416,10 +1489,33 @@ fn api_lookup(app: &App, op: &str, q: &Query) -> Res<Response> {
             "blocks_read": stats.blocks,
         }),
         Lookup::NeedsScan { reason } => {
-            json!({ "result": "needs_scan", "key": key, "reason": reason })
+            let (q, mode) = scan_query(&key);
+            json!({
+                "result": "needs_scan",
+                "key": key,
+                "reason": reason,
+                "scan": href(
+                    &format!("/api{}", op_path(&id, "search")),
+                    &[("q", q.as_str()), ("mode", mode)],
+                ),
+                "scan_mode": mode,
+            })
         }
     };
     Ok(json_response(200, &v))
+}
+
+/// The search a `NeedsScan` lookup offers: the exact key, or — longer than a search takes — a
+/// substring search for its first [`tools::MAX_QUERY_CHARS`] characters (which finds it too).
+fn scan_query(key: &str) -> (String, &'static str) {
+    if key.chars().count() <= tools::MAX_QUERY_CHARS {
+        (key.to_string(), "exact")
+    } else {
+        (
+            key.chars().take(tools::MAX_QUERY_CHARS).collect(),
+            "substring",
+        )
+    }
 }
 
 fn lookup_page(app: &App, op: &str, q: &Query) -> Res<Response> {
@@ -1454,8 +1550,31 @@ fn lookup_page(app: &App, op: &str, q: &Query) -> Res<Response> {
                     "</p><p>Its key-group cannot be computed from the text (POJO, Kryo or \
                       opaque keys have a user-defined <code>hashCode()</code>). ",
                 );
-            link(&mut h, &op_path(&id, "keys"), "Page through the keys");
-            h.raw(" instead; search by scanning comes later.</p>");
+            let (q, mode) = scan_query(&key);
+            if mode == "exact" {
+                link(
+                    &mut h,
+                    &href(&op_path(&id, "search"), &[("q", &q), ("mode", "exact")]),
+                    "Scan the operator for this exact key",
+                );
+                h.raw(" (it reads every key-group, a few megabytes per request), or ");
+                link(
+                    &mut h,
+                    &href(&op_path(&id, "search"), &[("q", &q), ("mode", "substring")]),
+                    "search for keys containing it",
+                );
+                h.raw(".</p>");
+            } else {
+                h.raw("This key is longer than ")
+                    .display(tools::MAX_QUERY_CHARS)
+                    .raw(" characters, the longest a search takes: ");
+                link(
+                    &mut h,
+                    &href(&op_path(&id, "search"), &[("q", &q), ("mode", "substring")]),
+                    "search for keys containing its first characters",
+                );
+                h.raw(" (it reads every key-group, a few megabytes per request).</p>");
+            }
         }
     }
     Ok(layout(

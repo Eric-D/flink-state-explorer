@@ -46,3 +46,7 @@ form.lookup input { width: min(28rem, 70vw); font: inherit; padding: .2rem .4rem
 .warning { border: 1px solid var(--err); border-radius: 4px; padding: .4rem .8rem; margin: .6rem 0; }
 .warning ul { margin: .3rem 0; padding-left: 1.2rem; }
 .more { margin: .4rem 0; }
+form.search select, form.search button { font: inherit; }
+form.search .range input { width: 6rem; }
+#search-stop { font: inherit; }
+td.count-keys, td.count-entries { white-space: nowrap; }
