@@ -707,13 +707,15 @@ pub fn decode_key(
     let mut r = JavaReader::new(bytes);
     if key_type == "Pojo" {
         let info = key_pojo?;
-        let v = decode_pojo(&mut r, info, None);
+        // A POJO key that did not fully decode (a Kryo field...) cannot be told apart from
+        // another one that stops at the same field: render it opaquely instead.
+        let v = decode_pojo(&mut r, info, None).ok()?;
         return Some((value_to_display(&v), r.position() as usize));
     }
     if !key_renders_injectively(key_type) {
         return None;
     }
-    let v = decode_field(&mut r, key_type, None, None)?;
+    let v = decode_field(&mut r, key_type, None, None).ok()?;
     let used = r.position() as usize;
     let text = render_key(&v).unwrap_or_else(|| opaque_key(&bytes[..used]));
     Some((text, used))
@@ -733,7 +735,9 @@ pub fn opaque_key(bytes: &[u8]) -> String {
 /// How many bytes one value of `type_name` occupies at the start of `bytes`, if it decodes.
 pub fn decoded_len(bytes: &[u8], type_name: &str) -> Option<usize> {
     let mut r = JavaReader::new(bytes);
-    decode_field(&mut r, type_name, None, None).map(|_| r.position() as usize)
+    decode_field(&mut r, type_name, None, None)
+        .ok()
+        .map(|_| r.position() as usize)
 }
 
 /// Key serializer types whose decoded form is rendered without losing information. (Enums and

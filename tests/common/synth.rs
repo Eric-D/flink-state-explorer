@@ -101,9 +101,6 @@ impl Ser {
             Ser::Float => {
                 "org.apache.flink.api.common.typeutils.base.FloatSerializer$FloatSerializerSnapshot"
             }
-            Ser::Char => {
-                "org.apache.flink.api.common.typeutils.base.CharSerializer$CharSerializerSnapshot"
-            }
             Ser::BigInteger => {
                 "org.apache.flink.api.common.typeutils.base.BigIntSerializer$BigIntSerializerSnapshot"
             }
