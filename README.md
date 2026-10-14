@@ -266,15 +266,23 @@ request at a time. Queries are at most 256 characters. A key the exact lookup ca
 
 **Counts.** "Count keys and entries" (`/op/<id>/count`) starts a background pass over the
 operator — one job per operator, kept for as long as the server runs, cancellable
-(`?cancel=1`; `?restart=1` counts again). Until it is done, the pages show `≥ N (counting… x %)`;
-then each state's exact number of keys and of entries (entries = rows of its download: one per
-value, per MAP entry, per timer).
+(`?cancel=1`, shown as *cancelling* until the pass has stopped; `?restart=1` counts again). At
+most two counts run at once; a third is refused with a message until one ends. Until it is done,
+the pages show `≥ N (counting… x %)`; then each state's exact number of keys and of entries
+(entries = rows of its download: one per value, per MAP entry, per timer). If some key-groups
+could not be read, the numbers stay lower bounds: `≥ N (incomplete: k key-group(s) unreadable)`.
 
 **Downloads.** Each keyed state of the operator page has an NDJSON link (and Parquet, in a build
 with `--features parquet`): the same bytes as `--export-state <state> -o -` (and the same Parquet
-file), streamed as it is read, with memory bounded by a key-group. A download that cannot be read
-at all answers an error; one that hits a malformed key-group, or whose client goes away, is
-aborted (the browser shows a failed download, never a short file passing for a whole one).
+file), streamed as it is read. An NDJSON download holds one key-group in memory; a Parquet one
+also buffers a whole 65 536-row group before writing it (about 17 MB measured on our 1M-key test
+savepoint, more with large values). At most two downloads stream at once (one
+more gets `503`), which bounds that memory, and a download whose client reads nothing for 45 s
+is aborted, freeing its place; a download never takes one of the page-reading slots, so stalled
+downloads cannot hold up the pages. A download that cannot be read at all answers an error (the
+cause goes to the server's log, not to the browser); one that hits a malformed key-group, or
+whose client goes away, is aborted (the browser shows a failed download, never a short file
+passing for a whole one).
 
 **Measured** on a 211 MB savepoint (1M keys, 128 key-groups, release build, local disk): a glob or
 substring search through all of it, 43 requests, 1.6 s; a key-group range of 2, 0.3 s; the count of

@@ -8,14 +8,16 @@
 //!   button (it stops issuing requests). Optionally restricted to a key-group range.
 //! - **Counts** (`/op/<id>/count`, JSON twin polled by `app.js`): a background job
 //!   ([`super::jobs`]) per operator; `?cancel=1` stops it, `?restart=1` starts a stopped one again.
+//!   A `HEAD` shows a job, never starts nor cancels one.
 //! - **Downloads** (`/op/<id>/download?state=&format=`): the state streamed through
 //!   [`export_state_rows`] and a [`RowSink`] — byte for byte what `--export-state -o -` writes —
-//!   as a chunked body produced on a blocking thread that holds a read permit ([`super::http`]).
+//!   as a chunked body produced on a blocking thread that holds a download slot
+//!   ([`super::http`]).
 
 use serde_json::{json, Value};
 
 use super::html::Html;
-use super::jobs::{CountSnapshot, JobStatus};
+use super::jobs::{Busy, CountSnapshot, JobStatus};
 use super::pages::{
     check_state, href, json_response, layout, link, malformed_warnings, op_crumb, op_path, resolve,
     stats_json, summary, unreadable_json, unreadable_warnings, Fail, Query, Res, CELL_CHARS,
@@ -84,6 +86,21 @@ impl Search {
     }
 }
 
+/// `op` resolved, and holding keyed state (else the reader's `NoKeyedState`, a 404): a search
+/// or a count of a non-keyed operator is not an empty result.
+fn keyed(app: &App, op: &str) -> Res<(usize, String)> {
+    let (i, id) = resolve(app, op)?;
+    let has_keyed = app
+        .reader
+        .operators()
+        .get(i)
+        .is_some_and(|o| o.keyed_subtasks > 0);
+    if !has_keyed {
+        return Err(crate::reader::ReaderError::NoKeyedState { op: id }.into());
+    }
+    Ok((i, id))
+}
+
 fn opt_u16(q: &Query, name: &str) -> Res<Option<u16>> {
     match q.get(name) {
         None | Some("") => Ok(None),
@@ -95,7 +112,7 @@ fn opt_u16(q: &Query, name: &str) -> Res<Option<u16>> {
 
 /// `Ok(None)`: no query yet (the HTML page then shows the form only).
 fn parse_search(app: &App, op: &str, q: &Query) -> Res<(String, Option<Search>)> {
-    let (i, id) = resolve(app, op)?;
+    let (i, id) = keyed(app, op)?;
     let query = match q.get("q") {
         None | Some("") => return Ok((id, None)),
         Some(s) => s.to_string(),
@@ -363,11 +380,30 @@ pub(super) fn search_page(app: &App, op: &str, q: &Query) -> Res<Response> {
 
 // --- counts ---------------------------------------------------------------------------------------
 
-/// `N` when exact, `≥ N (counting… x %)` while the job runs, `≥ N (cancelled)` and so on.
+/// What is missing from a finished pass: `k key-groups unreadable, m malformed`.
+fn incomplete_text(snap: &CountSnapshot) -> String {
+    let mut parts = Vec::new();
+    if snap.unreadable_key_groups > 0 {
+        parts.push(format!(
+            "{} key-group(s) unreadable",
+            snap.unreadable_key_groups
+        ));
+    }
+    if snap.malformed_key_groups > 0 {
+        parts.push(format!("{} malformed", snap.malformed_key_groups));
+    }
+    parts.join(", ")
+}
+
+/// `N` when exact; `≥ N (incomplete: k key-groups unreadable)` when the pass ended without
+/// reading some key-groups (whole); `≥ N (counting… x %)` while it runs, `≥ N (cancelled)` and
+/// so on.
 pub(super) fn count_text(snap: &CountSnapshot, n: u64) -> String {
     match &snap.status {
-        JobStatus::Done => n.to_string(),
+        JobStatus::Done if snap.exact() => n.to_string(),
+        JobStatus::Done => format!("≥ {} (incomplete: {})", n, incomplete_text(snap)),
         JobStatus::Running => format!("≥ {} (counting… {:.0} %)", n, snap.progress.percent()),
+        JobStatus::Cancelling => format!("≥ {} (cancelling…)", n),
         JobStatus::Cancelled => format!("≥ {} (cancelled at {:.0} %)", n, snap.progress.percent()),
         JobStatus::Failed(_) => format!("≥ {} (failed)", n),
     }
@@ -378,9 +414,17 @@ fn status_text(snap: &CountSnapshot) -> String {
     let secs = snap.elapsed.as_secs_f64();
     match &snap.status {
         JobStatus::Running => format!("Counting… {} · {:.1} s", p, secs),
-        JobStatus::Done => format!(
+        JobStatus::Cancelling => format!("Cancelling… (stopped after {}).", p),
+        JobStatus::Done if snap.exact() => format!(
             "Counted every key-group in {:.1} s ({} bytes read).",
             secs, snap.bytes_read
+        ),
+        JobStatus::Done => format!(
+            "Incomplete: went through every key-group in {:.1} s ({} bytes read), but {}: \
+             the counts are lower bounds.",
+            secs,
+            snap.bytes_read,
+            incomplete_text(snap)
         ),
         JobStatus::Cancelled => format!("Cancelled after {}.", p),
         JobStatus::Failed(e) => format!("Failed after {}: {}", p, e),
@@ -396,24 +440,31 @@ fn state_counts(snap: &CountSnapshot, name: &str) -> (u64, u64) {
         .unwrap_or((0, 0))
 }
 
-/// Start, show, cancel or restart the job of `op`, as the query says.
-fn count_job(app: &App, op: &str, q: &Query) -> Res<(String, Vec<String>, CountSnapshot)> {
-    let (_, id) = resolve(app, op)?;
+/// Start, show, cancel or restart the job of `op`, as the query says; without `side_effects`
+/// (a `HEAD`), only show it (`None`: there is none).
+fn count_job(
+    app: &App,
+    op: &str,
+    q: &Query,
+    side_effects: bool,
+) -> Res<(String, Vec<String>, Option<CountSnapshot>)> {
+    let (_, id) = keyed(app, op)?;
     let states = app.reader.states(&id)?;
     let names: Vec<String> = states.states.into_iter().map(|s| s.name).collect();
     let flag = |n: &str| q.get(n).is_some_and(|v| v == "1");
-    let snap = if flag("cancel") {
-        app.counts
-            .cancel(&id)
-            .ok_or_else(|| Fail::NotFound(format!("no count of operator {} to cancel", id)))?
-    } else {
-        app.counts.start(
-            &app.reader,
-            &id,
-            flag("restart"),
-            app.options.count_step_bytes,
-            app.options.count_step_pause,
+    let snap = if !side_effects {
+        app.counts.get(&id)
+    } else if flag("cancel") {
+        Some(
+            app.counts
+                .cancel(&id)
+                .ok_or_else(|| Fail::NotFound(format!("no count of operator {} to cancel", id)))?,
         )
+    } else {
+        let started = app
+            .counts
+            .start(&app.reader, &id, flag("restart"), &app.options);
+        Some(started.map_err(|Busy(m)| Fail::Busy(m))?)
     };
     Ok((id, names, snap))
 }
@@ -443,6 +494,8 @@ pub(super) fn count_json(id: &str, names: &[String], snap: &CountSnapshot) -> Va
         "status": snap.status.as_str(),
         "error": match &snap.status { JobStatus::Failed(e) => Some(e.as_str()), _ => None },
         "exact": snap.exact(),
+        "unreadable_key_groups": snap.unreadable_key_groups,
+        "malformed_key_groups": snap.malformed_key_groups,
         "keys": snap.keys,
         "keys_text": count_text(snap, snap.keys),
         "states": rows,
@@ -456,9 +509,13 @@ pub(super) fn count_json(id: &str, names: &[String], snap: &CountSnapshot) -> Va
     })
 }
 
-pub(super) fn api_count(app: &App, op: &str, q: &Query) -> Res<Response> {
-    let (id, names, snap) = count_job(app, op, q)?;
-    Ok(json_response(200, &count_json(&id, &names, &snap)))
+pub(super) fn api_count(app: &App, op: &str, q: &Query, side_effects: bool) -> Res<Response> {
+    let (id, names, snap) = count_job(app, op, q, side_effects)?;
+    let v = match snap {
+        Some(snap) => count_json(&id, &names, &snap),
+        None => json!({ "operator": id, "status": "none" }),
+    };
+    Ok(json_response(200, &v))
 }
 
 /// The cells of one state's counts, as the operator and count pages show them; `app.js` updates
@@ -479,12 +536,16 @@ pub(super) fn count_cells(h: &mut Html, snap: Option<&CountSnapshot>, name: &str
     }
 }
 
-pub(super) fn count_page(app: &App, op: &str, q: &Query) -> Res<Response> {
-    let (id, names, snap) = count_job(app, op, q)?;
+pub(super) fn count_page(app: &App, op: &str, q: &Query, side_effects: bool) -> Res<Response> {
+    let (id, names, snap) = count_job(app, op, q, side_effects)?;
+    // A HEAD and no job: nothing to render (the body is dropped anyway).
+    let Some(snap) = snap else {
+        return Ok(Response::new(200, "text/html; charset=utf-8", Vec::new()));
+    };
     let api = format!("/api{}", op_path(&id, "count"));
     let mut h = Html::new();
     h.raw("<h1>Key counts</h1><div id=\"counts\"");
-    if snap.status == JobStatus::Running {
+    if snap.status.is_live() {
         h.raw(" data-count-api=\"").text(&api).raw("\"");
     }
     h.raw("><p id=\"count-status\" class=\"meta\">")
@@ -496,6 +557,10 @@ pub(super) fn count_page(app: &App, op: &str, q: &Query) -> Res<Response> {
             &href(&op_path(&id, "count"), &[("cancel", "1")]),
             "Cancel",
         ),
+        // Not restartable until its worker has stopped.
+        JobStatus::Cancelling => {
+            h.raw("<span>Cancelling…</span>");
+        }
         _ => link(
             &mut h,
             &href(&op_path(&id, "count"), &[("restart", "1")]),

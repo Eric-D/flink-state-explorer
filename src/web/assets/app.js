@@ -175,15 +175,18 @@ function counts() {
   function poll() {
     getJson(api).then(function (j) {
       update(j);
-      if (j.status === "running") {
+      if (j.status === "running" || j.status === "cancelling") {
         setTimeout(poll, 1000);
       } else {
         var actions = document.getElementById("count-actions");
         if (actions) {
-          var a = actions.querySelector("a");
-          if (a && ownPath(api, "/api/op/")) {
+          // The "Cancel" link, or the "Cancelling…" note, becomes "Count again".
+          var old = actions.querySelector("a[href*='cancel=1'], span");
+          if (old && ownPath(api, "/api/op/")) {
+            var a = document.createElement("a");
             a.href = api.slice(4) + "?restart=1";
             a.textContent = "Count again";
+            old.replaceWith(a);
           }
         }
       }

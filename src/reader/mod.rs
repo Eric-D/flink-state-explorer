@@ -1339,8 +1339,22 @@ impl<'a> StateReader<'a> {
         Ok(out)
     }
 
-    /// A cursor must name the subtask that holds its key-group.
+    /// A cursor must name a key-group of the operator, and the subtask that holds it.
     fn check_cursor(&self, ctx: &OpContext, cursor: &Cursor) -> Result<(), ReaderError> {
+        let max_p = self.savepoint.operators[ctx.op_index]
+            .max_parallelism
+            .max(1);
+        if cursor.key_group as i32 >= max_p {
+            return Err(ReaderError::BadCursor {
+                cursor: cursor.to_string(),
+                reason: format!(
+                    "cursor {} does not fit operator {}: it has key-groups 0..{}",
+                    cursor,
+                    hex_id(&self.savepoint.operators[ctx.op_index].id),
+                    max_p - 1
+                ),
+            });
+        }
         match ctx.unit_of(cursor.key_group as i32) {
             Some(u) if ctx.unit_subtask(u) != cursor.subtask => Err(ReaderError::BadCursor {
                 cursor: cursor.to_string(),

@@ -8,10 +8,10 @@ use std::convert::Infallible;
 use std::future::{poll_fn, Future};
 use std::net::{SocketAddr, TcpListener as StdListener};
 use std::pin::{pin, Pin};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full};
@@ -22,7 +22,10 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore};
 
-use super::{busy, new_token, with_security_headers, App, Request, Response, StreamFn, WebOptions};
+use super::{
+    busy, new_token, too_many_downloads, with_security_headers, App, Request, Response, StreamFn,
+    WebOptions,
+};
 use crate::reader::StateReader;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -52,10 +55,66 @@ pub fn max_concurrent_reads() -> usize {
         .clamp(2, 64)
 }
 
-/// The two limits, shared by every connection.
+/// The limits, shared by every connection.
 struct Limits {
     connections: Arc<Semaphore>,
     reads: Arc<Semaphore>,
+    /// Downloads streaming at once ([`WebOptions::max_downloads`]): a download holds one of these
+    /// for its whole life, and no read permit, so a client that stops reading blocks nothing
+    /// but its own slot (until [`WebOptions::download_stall`]).
+    downloads: Arc<Semaphore>,
+}
+
+/// Whether the connection's streamed body waits on its client: armed when a chunk is handed to
+/// hyper, disarmed when hyper asks for the next one (it does so once it could write the previous
+/// ones) or the body ends. Armed for longer than [`WebOptions::download_stall`] = the client
+/// takes nothing: the connection is closed, which ends the download.
+#[derive(Default)]
+struct StallWatch {
+    since: Mutex<Option<Instant>>,
+}
+
+impl StallWatch {
+    fn set(&self, armed: bool) {
+        let mut since = match self.since.lock() {
+            Ok(s) => s,
+            Err(p) => p.into_inner(),
+        };
+        *since = armed.then(Instant::now);
+    }
+
+    fn stalled(&self, limit: Duration) -> bool {
+        let since = match self.since.lock() {
+            Ok(s) => s,
+            Err(p) => p.into_inner(),
+        };
+        since.is_some_and(|t| t.elapsed() >= limit)
+    }
+}
+
+/// Drive `conn` to its end, unless its download stalls ([`StallWatch`]): then drop it, which
+/// closes the socket, drops the body's receiver and so stops the producer.
+async fn serve_watched<F: Future>(conn: F, watch: &StallWatch, limit: Duration) {
+    let mut conn = pin!(conn);
+    let mut tick =
+        tokio::time::interval((limit / 4).clamp(Duration::from_millis(50), Duration::from_secs(5)));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    poll_fn(|cx| {
+        if conn.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(());
+        }
+        while tick.poll_tick(cx).is_ready() {
+            if watch.stalled(limit) {
+                eprintln!(
+                    "web server: a download's client took nothing for {} s: aborted",
+                    limit.as_secs_f64()
+                );
+                return Poll::Ready(());
+            }
+        }
+        Poll::Pending
+    })
+    .await
 }
 
 /// A server running on its own thread. Dropping it stops it.
@@ -196,6 +255,7 @@ async fn accept_loop(
     let limits = Limits {
         connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
         reads: Arc::new(Semaphore::new(max_concurrent_reads())),
+        downloads: Arc::new(Semaphore::new(app.options.max_downloads.max(1))),
     };
     let mut stopped = pin!(stop.notified());
     loop {
@@ -212,14 +272,25 @@ async fn accept_loop(
                 Ok(permit) => {
                     let app = app.clone();
                     let reads = limits.reads.clone();
+                    let downloads = limits.downloads.clone();
+                    let watch = Arc::new(StallWatch::default());
                     tokio::spawn(async move {
-                        let service =
-                            service_fn(move |req| respond(app.clone(), reads.clone(), req));
-                        let _ = http1::Builder::new()
+                        let stall = app.options.download_stall;
+                        let w = watch.clone();
+                        let service = service_fn(move |req| {
+                            respond(
+                                app.clone(),
+                                reads.clone(),
+                                downloads.clone(),
+                                w.clone(),
+                                req,
+                            )
+                        });
+                        let conn = http1::Builder::new()
                             .timer(TokioTimer::new())
                             .header_read_timeout(HEADER_TIMEOUT)
-                            .serve_connection(TokioIo::new(stream), service)
-                            .await;
+                            .serve_connection(TokioIo::new(stream), service);
+                        serve_watched(conn, &watch, stall).await;
                         drop(permit);
                     });
                 }
@@ -250,6 +321,8 @@ async fn accept_loop(
 async fn respond(
     app: Arc<App>,
     reads: Arc<Semaphore>,
+    downloads: Arc<Semaphore>,
+    watch: Arc<StallWatch>,
     req: hyper::Request<Incoming>,
 ) -> Result<hyper::Response<ServerBody>, Infallible> {
     let header = |name: &str| {
@@ -275,20 +348,15 @@ async fn respond(
         cookie: (!cookies.is_empty()).then(|| cookies.join("; ")),
     };
     // Wait for a read permit; it is held by the blocking task itself, so a request whose client
-    // went away still counts until its read is over.
+    // went away still counts until its read is over. A download's body is not read under it.
     let Ok(permit) = reads.acquire_owned().await else {
         return Ok(to_hyper(busy()));
     };
     let handled = tokio::task::spawn_blocking(move || {
         let mut resp = app.handle(&request);
-        match resp.stream.take().and_then(|s| s.take()) {
-            None => {
-                drop(permit);
-                (resp, None)
-            }
-            // The producer takes the permit: a download counts as a read until it ends.
-            Some(produce) => (resp, Some((produce, permit))),
-        }
+        drop(permit);
+        let producer = resp.stream.take().and_then(|s| s.take());
+        (resp, producer)
     })
     .await;
     let (resp, producer) = match handled {
@@ -297,7 +365,11 @@ async fn respond(
     };
     match producer {
         None => Ok(to_hyper(resp)),
-        Some((produce, permit)) => Ok(streamed(resp, produce, permit).await),
+        // A download slot, or a `503` at once: never a wait behind stalled downloads.
+        Some(produce) => match downloads.try_acquire_owned() {
+            Ok(slot) => Ok(streamed(resp, produce, slot, watch).await),
+            Err(_) => Ok(to_hyper(too_many_downloads())),
+        },
     }
 }
 
@@ -316,13 +388,14 @@ enum Chunk {
     Done,
 }
 
-/// Run `produce` on a blocking thread (holding `permit`), and answer `resp`'s headers with the
-/// chunks it writes. Its first message decides: data → `200` and a chunked body; a failure before
-/// any data → a `500` naming it, never a truncated `200`.
+/// Run `produce` on a blocking thread (holding the download `slot`), and answer `resp`'s headers
+/// with the chunks it writes. Its first message decides: data → `200` and a chunked body; a
+/// failure before any data → a `500` (its cause logged, not sent), never a truncated `200`.
 async fn streamed(
     resp: Response,
     produce: StreamFn,
-    permit: OwnedSemaphorePermit,
+    slot: OwnedSemaphorePermit,
+    watch: Arc<StallWatch>,
 ) -> hyper::Response<ServerBody> {
     let (tx, mut rx) = mpsc::channel::<Chunk>(CHUNKS_IN_FLIGHT);
     tokio::task::spawn_blocking(move || {
@@ -338,7 +411,7 @@ async fn streamed(
             Ok(()) => Chunk::Done,
             Err(e) => Chunk::Fail(e),
         });
-        drop(permit);
+        drop(slot);
     });
     match rx.recv().await {
         Some(Chunk::Data(first)) => {
@@ -346,12 +419,19 @@ async fn streamed(
                 first: Some(first),
                 rx,
                 done: false,
+                watch,
             };
             with_body(resp, body.boxed_unsync())
         }
         Some(Chunk::Done) => to_hyper(resp),
+        // The cause names files of the savepoint: it goes to the log, not to the client.
         Some(Chunk::Fail(e)) => {
-            let mut r = Response::text(500, &format!("Internal Server Error: {}\n", e));
+            eprintln!("web server: download failed: {}", e);
+            let mut r = Response::text(
+                500,
+                "Internal Server Error: this state could not be read; the cause is in the \
+                 server's log.\n",
+            );
             with_security_headers(&mut r);
             to_hyper(r)
         }
@@ -404,6 +484,13 @@ struct ChannelBody {
     first: Option<Bytes>,
     rx: mpsc::Receiver<Chunk>,
     done: bool,
+    watch: Arc<StallWatch>,
+}
+
+impl Drop for ChannelBody {
+    fn drop(&mut self) {
+        self.watch.set(false);
+    }
 }
 
 impl Body for ChannelBody {
@@ -414,7 +501,11 @@ impl Body for ChannelBody {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        // Asked for more: what was handed over is written (or buffered). Waiting on the producer
+        // is not the client's stall.
+        self.watch.set(false);
         if let Some(first) = self.first.take() {
+            self.watch.set(true);
             return Poll::Ready(Some(Ok(Frame::data(first))));
         }
         if self.done {
@@ -422,7 +513,10 @@ impl Body for ChannelBody {
         }
         match self.rx.poll_recv(cx) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Some(Chunk::Data(b))) => Poll::Ready(Some(Ok(Frame::data(b)))),
+            Poll::Ready(Some(Chunk::Data(b))) => {
+                self.watch.set(true);
+                Poll::Ready(Some(Ok(Frame::data(b))))
+            }
             Poll::Ready(Some(Chunk::Done)) => {
                 self.done = true;
                 Poll::Ready(None)
