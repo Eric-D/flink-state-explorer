@@ -174,7 +174,13 @@ already parsed. The first call on an operator opens and checks each subtask's ke
 one file at a time. Blocks are then read positionally (`read_exact_at` on Unix, `seek_read` on
 Windows, `reader/source.rs`) through a `FilePool` of at most `DEFAULT_OPEN_FILES` (64,
 `with_open_files`) handles, least recently used closed first — never reopened per key-group.
-Inline `ByteStreamStateHandle` bytes are borrowed from `_metadata`, never copied. Then every call
+Inline `ByteStreamStateHandle` bytes are borrowed from `_metadata`, never copied. **Paths from `_metadata` are
+not trusted** (`state_file::relative_path` / `open_regular`, used by the reader, the export and the
+index): a `RelativeFileStateHandle` path that is absolute or has a `..` component is refused naming
+it (`Path::join` would follow it out of the savepoint directory), and a state file is opened only if
+it is a regular file — `stat` first, then the handle re-checked — so a FIFO (whose `open` blocks
+forever) or a device is refused. Absolute `File`/`Segment` handles may point anywhere local, on
+purpose: that is how checkpoints and externalised savepoints reference their files. Then every call
 reads whole key-group blocks located by `KeyGroupsStateHandle.offsets`, nothing more:
 
 - `operators() -> Vec<OperatorInfo>` (metadata only), `operator_index(op)` (hex id or unique
