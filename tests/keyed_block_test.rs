@@ -488,3 +488,50 @@ fn the_state_id_bound_is_the_count_the_header_declares() {
     assert_eq!(names, ["first", "third"], "the heuristics miss UPPER");
     assert_eq!(count_states_in_header(&header, &metas), 3);
 }
+
+#[test]
+fn runs_in_hash_map_order_parse_like_ascending_ones() {
+    // The heap backend writes a key-group's runs in HashMap order: [2, 0, 1] on real savepoints.
+    let run =
+        |sid: u16, key: &str, v: i64| (sid, vec![(value_key(7, 1, key), v.to_be_bytes().to_vec())]);
+    let shuffled = block(&[run(2, "c", 3), run(0, "a", 1), run(1, "b", 2)]);
+    let ascending = block(&[run(0, "a", 1), run(1, "b", 2), run(2, "c", 3)]);
+    let types = ["VALUE", "VALUE", "VALUE"];
+    let key_of = |es: &[KeyedEntry]| -> Vec<(u16, String)> {
+        let mut v: Vec<(u16, String)> = es.iter().map(|e| (e.state_id, e.key.clone())).collect();
+        v.sort();
+        v
+    };
+    let (a, ra) = parse(&shuffled, 1, &types, None);
+    let (b, rb) = parse(&ascending, 1, &types, None);
+    assert!(ra.is_ok() && rb.is_ok());
+    assert_eq!(key_of(&a), key_of(&b));
+    assert_eq!(a.len(), 3);
+    // And a state filter picks its run wherever it sits.
+    let (only, _) = parse(&shuffled, 1, &types, Some(0));
+    assert_eq!(key_of(&only), vec![(0, "a".to_string())]);
+}
+
+#[test]
+fn an_unknown_state_id_skips_its_run_but_not_the_rest_of_the_key_group() {
+    // The declared state count comes from header heuristics: if it is short, a run under a
+    // higher id must not take the following runs down with it.
+    let run =
+        |sid: u16, key: &str, v: i64| (sid, vec![(value_key(7, 1, key), v.to_be_bytes().to_vec())]);
+    let data = block(&[run(0, "a", 1), run(9, "x", 9), run(1, "b", 2)]);
+    let (entries, res) = parse(&data, 1, &["VALUE", "VALUE"], None);
+    let keys: Vec<(u16, &str)> = entries
+        .iter()
+        .map(|e| (e.state_id, e.key.as_str()))
+        .collect();
+    assert_eq!(
+        keys,
+        [(0, "a"), (1, "b")],
+        "the unknown run is skipped, the next one read"
+    );
+    assert!(
+        matches!(res, Err(BlockDefect::UnknownStateId { state_id: 9, .. })),
+        "{:?}",
+        res
+    );
+}
