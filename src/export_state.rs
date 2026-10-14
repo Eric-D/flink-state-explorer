@@ -123,10 +123,10 @@ fn source_for<'a>(
             let (_, len) = crate::state_file::open(&path, f.state_size)?;
             Ok(Some(Source::File { path, base: 0, len }))
         }
-        // A segment handle points at a region of a shared file. We treat the key-group offsets as
-        // relative to `start_pos`, which matches the offsets being recorded on the logical
-        // checkpoint output stream — NOT verified against a real segmented savepoint, so an
-        // export from one should be sanity-checked before being trusted.
+        // A segment handle points at a region of a shared file, and offsets inside it are
+        // relative to `start_pos`: FileMergingCheckpointStateOutputStream.getPos (:125-129) on
+        // write, FsSegmentDataInputStream.seek (:96-99) on read (release-1.20). No real
+        // file-merging savepoint has been read yet.
         StreamStateHandle::Segment(seg) => {
             let path = crate::state_file::local_path(&seg.file_path)?;
             let base = seg.start_pos.max(0) as u64;

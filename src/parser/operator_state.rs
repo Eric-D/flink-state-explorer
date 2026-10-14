@@ -163,6 +163,14 @@ pub fn inflate_snappy_chunks(mut raw: &[u8], out: &mut Vec<u8>) -> Result<(), St
                     out.extend_from_slice(data);
                 } else {
                     let n = snap::raw::decompress_len(data).map_err(|e| e.to_string())?;
+                    // The framing format caps a chunk at 65 536 uncompressed bytes; trusting a
+                    // corrupt length would zero-fill up to 4 GiB before decompression fails.
+                    if n > 1 << 16 {
+                        return Err(format!(
+                            "chunk inflates to {} bytes, over the 65536-byte limit",
+                            n
+                        ));
+                    }
                     let at = out.len();
                     out.resize(at + n, 0);
                     decoder
@@ -285,6 +293,10 @@ mod tests {
         assert!(inflate_snappy_chunks(&[0x02, 0, 0, 0], &mut out).is_err());
         assert!(inflate_snappy_chunks(&[0x01, 4, 0, 0, 1, 2, 3, 4], &mut out).is_err());
         assert!(inflate_snappy_chunks(&[0xff, 5, 0, 0, 1, 2, 3, 4, 5], &mut out).is_err());
+        // A compressed chunk whose varint claims ~4 GiB: refused before any allocation.
+        let huge = [0x00, 9, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0x0f];
+        let e = inflate_snappy_chunks(&huge, &mut out).unwrap_err();
+        assert!(e.contains("65536-byte limit"), "{}", e);
         // Padding and reserved skippable chunks are skipped.
         inflate_snappy_chunks(
             &[0xfe, 2, 0, 0, 9, 9, 0x01, 5, 0, 0, 0, 0, 0, 0, b'x'],

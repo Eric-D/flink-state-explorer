@@ -154,7 +154,8 @@ plausible half key set.
   could read, then every error on stderr, and exits 2. A subtask whose header does not register
   the state contributes no rows (Flink registers states lazily, so subtasks can disagree). The
   output is written to `<path>.partial` and renamed on success, so a failed export never
-  truncates a previous one. Operator-state files are handled by #27.
+  truncates a previous one. Operator-state files go through the same checks (`read_whole_stream`):
+  a missing or truncated one gives an `[error: <path>: …]` element, never a placeholder.
 
 ## TUI: key cap, text, terminal
 
