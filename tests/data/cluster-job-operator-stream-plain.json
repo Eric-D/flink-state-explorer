@@ -1,0 +1,22 @@
+[
+  {
+    "elements": [
+      "user-bob",
+      "user-delta",
+      "org-alpha",
+      "org-gamma"
+    ],
+    "name": "operator-buffer",
+    "union": false
+  },
+  {
+    "elements": [
+      "union-user-bob",
+      "union-user-delta",
+      "union-org-alpha",
+      "union-org-gamma"
+    ],
+    "name": "operator-union-buffer",
+    "union": true
+  }
+]

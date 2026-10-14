@@ -3,7 +3,8 @@
 //!
 //! This is the fixture the compressed read path needs: everything else only exercises a Snappy
 //! frame built in a unit test, never bytes Flink wrote. Both reading paths are checked — the
-//! streaming export and the index/TUI one.
+//! streaming export and the index/TUI one — and the operator-state stream, which the operator
+//! backend compresses as a whole (`usingStateCompression`).
 //!
 //! Needs `tests/fixtures/savepoint-compressed` (run `cd test-flink-job && mvn verify` first).
 
@@ -189,4 +190,90 @@ fn streaming_export_matches_the_index_path_on_compressed_bytes() {
         compared += streamed.len();
     }
     assert!(compared > 0, "no key compared");
+}
+
+/// Every operator state's `(name, mode)` → its element labels (all subtasks, sorted), from the
+/// index and from the full JSON export.
+fn operator_states(dir: &str) -> [std::collections::BTreeMap<(String, String), Vec<String>>; 2] {
+    let path = Path::new(dir);
+    let sp = savepoint(dir);
+    let index = build_index(&sp, 0, 0u64, path);
+    let mut from_index: std::collections::BTreeMap<(String, String), Vec<String>> =
+        Default::default();
+    for s in index.operators.iter().flat_map(|op| &op.states) {
+        from_index
+            .entry((s.name.clone(), s.state_type.clone()))
+            .or_default()
+            .extend(
+                s.entries
+                    .iter()
+                    .map(|e| String::from_utf8(e.key.clone()).unwrap()),
+            );
+    }
+
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    let tmp = std::env::temp_dir().join(format!(
+        "compressed_op_states_{}_{}.json",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    flink_explorer::export::export_json(&index, None, &tmp).expect("export_json");
+    let root: Value = serde_json::from_str(&std::fs::read_to_string(&tmp).unwrap()).unwrap();
+    std::fs::remove_file(&tmp).ok();
+    let mut from_json: std::collections::BTreeMap<(String, String), Vec<String>> =
+        Default::default();
+    for op in root["operators"].as_array().unwrap() {
+        for s in op["operator_states"].as_array().unwrap() {
+            let key = (
+                s["name"].as_str().unwrap().to_string(),
+                s["mode"].as_str().unwrap().to_string(),
+            );
+            from_json.entry(key).or_default().extend(
+                s["values"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_str().unwrap().to_string()),
+            );
+        }
+    }
+    for m in [&mut from_index, &mut from_json] {
+        m.values_mut().for_each(|v| v.sort());
+    }
+    [from_index, from_json]
+}
+
+#[test]
+fn operator_states_inflate_like_the_uncompressed_run() {
+    // The operator backend compresses its stream too (`usingStateCompression`): without
+    // inflating it every element showed as a hex preview of its Snappy chunk.
+    let [compressed, compressed_json] = operator_states(COMPRESSED);
+    let [plain, _] = operator_states(PLAIN);
+    assert_eq!(compressed_json, compressed, "JSON export = index");
+    assert_eq!(compressed, plain, "same job, same operator-state elements");
+    let buffer = &compressed[&(
+        "operator-buffer".to_string(),
+        "operator/SPLIT_DISTRIBUTE".to_string(),
+    )];
+    assert!(buffer.contains(&"\"user-bob\"".to_string()), "{:?}", buffer);
+    let broadcast = &compressed[&(
+        "broadcast-config".to_string(),
+        "operator/BROADCAST".to_string(),
+    )];
+    assert!(
+        broadcast
+            .iter()
+            .all(|m| m.contains("\"config-a\": \"CONFIG-A\"")),
+        "{:?}",
+        broadcast
+    );
+    assert!(
+        compressed
+            .values()
+            .flatten()
+            .all(|l| !l.contains(" bytes] ")),
+        "no hex preview left: {:?}",
+        compressed
+    );
 }

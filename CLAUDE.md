@@ -67,16 +67,19 @@ pure function of the key index (`BigStateJob.*Of`). For performance work:
 (the TUI load path, headless, with timings and RSS).
 
 **Synthetic savepoints** (`tests/common/synth.rs`) are written byte for byte in Flink's layout
-(`_metadata` v4, keyed-stream header v6, key-group blocks with the metadata-follows flag, inline
-or file-backed, optionally Snappy-compressed, Flink's key-group assignment), so file-backed,
+(`_metadata` v4, keyed-stream header v6, key-group blocks with the metadata-follows flag, managed
+operator state — list, union-list and broadcast states — inline, in files relative to the
+savepoint or by absolute `file:` path, or (operator state) as segments of a shared file under a
+file-merging handle, optionally Snappy-compressed, Flink's key-group assignment), so file-backed,
 multi-subtask and compressed paths are tested **in CI** without Docker. State runs inside a
 key-group are written in a non-ascending order by default (`RunOrder::HashLike`), as the heap
 backend does (`HashMap` of states): **never assume runs come in stateId order**. Limits: one
-storage kind per savepoint (production mixes inline and file handles), and the Snappy framing is
-written with the same `snap` crate the reader uses, so only `savepoint-compressed` proves
-compatibility with Flink's `SnappyFramedOutputStream`.
-`tests/synth_savepoint_test.rs` checks the generated header byte for byte against a real one
-(when `savepoint-big` exists). Prefer them for new fixture-free tests.
+storage kind per savepoint (production mixes inline and file handles), and the keyed Snappy
+framing is written with the same `snap` crate the reader uses, so only `savepoint-compressed`
+proves compatibility with Flink's `SnappyFramedOutputStream`.
+`tests/synth_savepoint_test.rs` checks the generated keyed header byte for byte against a golden
+one Flink wrote, `tests/operator_state_test.rs` whole operator-state streams against
+`savepoint-gitlab` and `savepoint-compressed` (locally). Prefer them for new fixture-free tests.
 
 Gotchas already handled in the pom/IT (don't re-debug):
 - **Docker API version**: docker-java defaults to API v1.32 which Docker ≥25 rejects
@@ -151,7 +154,8 @@ plausible half key set.
   could read, then every error on stderr, and exits 2. A subtask whose header does not register
   the state contributes no rows (Flink registers states lazily, so subtasks can disagree). The
   output is written to `<path>.partial` and renamed on success, so a failed export never
-  truncates a previous one. Operator-state files are handled by #27.
+  truncates a previous one. Operator-state files go through the same checks (`read_whole_stream`):
+  a missing or truncated one gives an `[error: <path>: …]` element, never a placeholder.
 
 ## TUI: key cap, text, terminal
 
@@ -228,7 +232,8 @@ committer wraps each committable via `SimpleVersionedSerialization` (`[int versi
 bytes and parse `writeShort(epoch)+writeLong(producerId)+writeUTF(transactionalId)`. A committable
 appears only if the savepoint was taken with an in-flight transaction — `KafkaSavepointGeneratorIT`
 produces continuously (`startContinuousProducer`) to force one. Operator-state elements are framed as
-`[int outerLen][int version][int innerLen][payload]`.
+`[int outerLen][int version][int innerLen][payload]`. These decoders receive each element's bytes
+from the shared operator-state reader below, so they work on file-backed and compressed streams.
 
 ### Operator info
 `CachedOperator::info_lines()` aggregates everything extractable about an operator (OperatorID/uuid,
@@ -237,6 +242,22 @@ operator-state names + distribution mode, sizes, fully-finished). Shown via the 
 and in the JSON export (`info` block per operator; the export includes **all** operators, not just
 keyed ones). Operator states are surfaced with their real name + mode (`SPLIT_DISTRIBUTE` / `UNION`
 / `BROADCAST`) and decoded element values.
+
+**Operator-state streams** (`src/parser/operator_state.rs`, verified against Flink release-1.20
+`DefaultOperatorStateBackendSnapshotStrategy` / `OperatorBackendSerializationProxy` /
+`OperatorStateRestoreOperation` and snappy-java 1.1.10.4) are read wherever the handle's delegate
+keeps them — inline, `RelativeFileStateHandle` (joined to the savepoint dir), `FileStateHandle`, or
+a `SegmentFileStateHandle` (offsets relative to `startPos`; the file-merging handle, tag 17, is
+parsed) — via `export_state::read_whole_stream`, which resolves handles like the streaming export.
+A stream that cannot be read gives each state with elements a single `[error: <path>: <why>]`
+entry, and an element past the end of its stream an `[error: offset …]` one, never a `name[i]`
+placeholder. Layout: header `[int version=6][bool usingStateCompression]` + meta info, then every
+list state's elements, then every broadcast map; with compression, **everything after the header is
+one** Snappy-framed stream (stream identifier once, right after the header), flushed before every
+recorded offset, so each element is its own run of chunks and is inflated on its own
+(`inflate_snappy_chunks`, no checksum check, like Flink). An element ends at the next offset of
+**any** state (binary search over all offsets). Elements keep no copy of their bytes
+(`ValueRef::Decoded`: the decoded label is the entry's `key`).
 
 > A savepoint's metadata stores only the **OperatorID** (a hash of the uid). The operator's human
 > **name** and **uid** appear only in metadata **v5+** (our Flink 1.20 fixtures are v4 → shown as
@@ -262,11 +283,13 @@ don't store a user class — only the serializer class, which implies the type.
   compressed savepoint. Exercised by the real `savepoint-compressed` fixture, generated by
   `SavepointGeneratorIT.generatesCompressedSavepoint` (pass `compress` to `ClusterJob`, which calls
   `ExecutionConfig.setUseSnapshotCompression`). **Operator** state's own `usingStateCompression` is
-  still not read — only keyed state is covered.
+  read too (see *Operator-state streams* above). **Raw** operator state (bytes the user wrote,
+  with no header to go by) is still listed as `raw-operator-subtaskN` with `name[i]` entries.
 - **Broadcast / operator-state element decoding is best-effort String**: broadcast maps decode when
   the key/value are Strings (the common case; `decode_broadcast_map`), and operator `ListState`
   elements decode as `StringValue`; other element types fall back to a byte preview (the operator
-  backend's element serializers aren't parsed).
+  backend's element serializers aren't parsed). This holds for inline, file-backed and compressed
+  streams alike.
 - **Channel state** (`input_channel_state` / `result_subpartition_state`, unaligned checkpoints) is
   parsed but not displayed — it does not appear in canonical savepoints anyway.
 - RocksDB incremental / changelog state is not decoded (canonical heap savepoints only).
@@ -298,14 +321,22 @@ source** (branch `release-1.20`, https://github.com/apache/flink) rather than gu
 - **Enum** — `EnumSerializerSnapshot`: `writeUTF(enumClass)` + `int(n)` + `n × writeUTF(constant)`
   (constants in ordinal order).
 - **String** — Flink `StringValue`: var-int length = `charCount + 1`, then var-int chars.
+- **Operator-state stream** — `DefaultOperatorStateBackendSnapshotStrategy.java:165-212` +
+  `OperatorBackendSerializationProxy.java:97-103`: `writeInt(6)`, `writeBoolean(usingStateCompression)`
+  and the meta info, never compressed; then **one** `CompressibleFSDataOutputStream` (Snappy-framed when
+  compressed) whose `getPos` (:43-49) flushes before each recorded offset. Restore:
+  `OperatorStateRestoreOperation.java:182-267`. A file-merging handle (tag 17,
+  `MetadataV2V3SerializerBase.java:624-636`) adds two UTF dirs + an `isEmpty` boolean before its
+  `SegmentFileStateHandle` delegate.
 - Magic numbers / metadata layout: see `docs/magic-numbers.md`, `docs/parsing-format.md`.
 
 ## Tests
 - `cargo test` — needs `tests/fixtures/savepoint-gitlab/` (run `mvn verify` first). Note that
   `.github/workflows/ci.yml` runs an **explicit list** of fixture-free tests (add new ones to it;
-  `tests/synth_savepoint_test.rs` and `tests/keyed_block_test.rs` are the fixture-free home for
-  file-backed / multi-subtask / compressed and block-level cases, `tests/tui_*_test.rs` for the
-  TUI over ratatui's `TestBackend`), so the fixture-dependent ones
+  `tests/synth_savepoint_test.rs`, `tests/operator_state_test.rs` and `tests/keyed_block_test.rs`
+  are the fixture-free home for file-backed / multi-subtask / compressed, operator-state and
+  block-level cases, `tests/tui_*_test.rs` for the TUI over ratatui's `TestBackend`), so the
+  fixture-dependent ones
   (`gitlab_savepoint_test`, `decode_e2e_test`, `coverage_audit`, `export_state_stream_test`,
   `key_group_assignment_test`, `compressed_savepoint_test`, `export_parquet_test`) only ever run
   locally.
@@ -318,7 +349,14 @@ source** (branch `release-1.20`, https://github.com/apache/flink) rather than gu
   a third-party engine (DuckDB/Polars were not available here).
 - `tests/compressed_savepoint_test.rs` — needs `savepoint-compressed`: the fixture really sets
   the compression flag, the index path inflates its key-groups (same key sets as the uncompressed
-  run), and the streaming export agrees with the index path on those bytes.
+  run), the streaming export agrees with the index path on those bytes, and the operator states
+  (`"user-bob"`, the broadcast map) decode like the uncompressed run's, in the index and the JSON
+  export.
+- `tests/operator_state_test.rs` — fixture-free (CI): operator-state streams decode the same
+  inline, relative / absolute file, segment, and compressed (incl. an element over 64 KiB, i.e.
+  several `0x00` Snappy chunks); a missing or truncated stream file shows `[error: …]` entries;
+  1M elements index in well under a second (release; 200k in debug) and time grows linearly.
+  Locally it also checks synth's operator streams byte for byte against both real fixtures.
 - `tests/key_group_assignment_test.rs` — the reported key-group is the one Flink assigned
   (ported `MathUtils.murmurHash` + `KeyGroupRangeAssignment`), and every streamed row falls inside
   its subtask's range. POJO keys are range-checked only: their `hashCode()` is user code.
