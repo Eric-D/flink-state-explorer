@@ -67,8 +67,7 @@ impl Source {
                     Some(f) => f,
                     None => {
                         // Two threads may both open it: one handle is kept, the other dropped.
-                        let opened =
-                            File::open(path).map_err(|e| crate::state_file::io_error(path, &e))?;
+                        let (opened, _) = crate::state_file::open_regular(path)?;
                         let _ = file.set(opened);
                         file.get().expect("set above")
                     }
@@ -155,7 +154,7 @@ impl FilePool {
             }
         }
         // Opened outside the lock: two threads may both open it, and one handle is kept.
-        let file = Arc::new(File::open(path).map_err(|e| crate::state_file::io_error(path, &e))?);
+        let file = Arc::new(crate::state_file::open_regular(path)?.0);
         if let Ok(mut guard) = self.open.lock() {
             let (tick, open) = &mut *guard;
             *tick += 1;
@@ -218,6 +217,13 @@ pub(crate) fn inline_bytes(delegate: &StreamStateHandle) -> &[u8] {
 /// Where `delegate`'s bytes are. A file-backed stream is opened here, and must be as long as its
 /// handle records ([`crate::state_file::open`]): a missing, unreadable or short file is an `Err`
 /// naming it, never a stream that silently yields fewer rows. `Ok(None)`: no stream at all.
+///
+/// Paths come from `_metadata` and are not trusted: a relative handle must stay inside
+/// `savepoint_dir` ([`crate::state_file::relative_path`] refuses absolute paths and `..`), and
+/// every file opened — here and on any later reopen — must be a regular file
+/// ([`crate::state_file::open_regular`]: a FIFO would block the open forever). Absolute `File` /
+/// `Segment` handles are allowed anywhere on the local file system on purpose: that is how
+/// checkpoints and externalised savepoints reference their state files.
 pub(crate) fn source_for(
     delegate: &StreamStateHandle,
     savepoint_dir: &Path,
@@ -227,7 +233,7 @@ pub(crate) fn source_for(
             len: bs.data.len() as u64,
         })),
         StreamStateHandle::Relative(rel) => {
-            let path = savepoint_dir.join(&rel.relative_path);
+            let path = crate::state_file::relative_path(savepoint_dir, &rel.relative_path)?;
             let (file, len) = crate::state_file::open(&path, rel.state_size)?;
             Ok(Some(Source::File {
                 file: file.into(),
