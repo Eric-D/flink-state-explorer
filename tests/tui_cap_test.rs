@@ -185,6 +185,32 @@ fn a_filter_says_it_searched_only_the_stored_keys() {
 }
 
 #[test]
+fn a_filter_matching_no_stored_key_keeps_the_capped_operator_listed() {
+    // The key may be among the ones the index did not keep: the operator and the row saying so
+    // must stay visible, or a real key past the cap looks absent.
+    let index = capped_index(100, 1000);
+    let mut tree = TreeView::new(&index);
+    let mut terminal = Terminal::new(TestBackend::new(110, 40)).unwrap();
+    tree.expand();
+    tree.apply_filter(&Some(AppliedFilter::Pattern("key-0999*".to_string())));
+    let rows = draw(&mut terminal, &mut tree);
+    assert!(
+        row(&rows, "keyed-op").contains("(0 match in 100 of 1000 keys shown, 1 states)"),
+        "{}",
+        row(&rows, "keyed-op")
+    );
+    for _ in 0..5 {
+        tree.move_down();
+        draw(&mut terminal, &mut tree);
+    }
+    let rows = draw(&mut terminal, &mut tree);
+    row(
+        &rows,
+        "900 more keys not indexed (not shown, not searched by /)",
+    );
+}
+
+#[test]
 fn below_the_cap_the_counts_read_as_before() {
     let index = capped_index(40, 40);
     let mut tree = TreeView::new(&index);
@@ -235,7 +261,7 @@ fn operator(keys: usize, parallelism: i32) -> KeyedOperator {
     op
 }
 
-fn write(op: &KeyedOperator, tag: &str) -> std::path::PathBuf {
+fn write(op: &KeyedOperator, tag: &str) -> synth::TempDir {
     let mut spec = Spec::new(Storage::Files);
     spec.operators.push(op.clone());
     let dir = synth::temp_dir(tag);

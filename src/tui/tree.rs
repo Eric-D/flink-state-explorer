@@ -89,7 +89,12 @@ impl OperatorSnapshot {
     /// reader splits, writer/committer states) have no keyed partitions, so they must be counted
     /// here too — otherwise `hide_empty` would hide them and their decoded state entirely.
     fn child_count(&self) -> usize {
-        self.keyed.as_ref().map_or(0, |k| k.visible_count()) + self.states.len()
+        self.keyed.as_ref().map_or(0, |k| {
+            // A capped operator stays listed under a filter that matched none of its stored keys:
+            // the key may be among the ones not indexed, and the row saying so must be reachable.
+            let unsearched = (k.filtered_indices.is_some() && k.hidden_keys() > 0) as usize;
+            k.visible_count() + unsearched
+        }) + self.states.len()
     }
 
     /// A Kafka connector operator (source or sink), detected from its operator-state names.

@@ -159,8 +159,9 @@ plausible half key set.
   keys per operator; `CachedKeyedState::total_keys` still counts every key (`stored_keys()`,
   `is_truncated()`). The kept keys are shared between subtasks by `spread_quotas` (equal shares,
   max-min fair: a subtask with fewer keys than its share keeps them all), re-applied after each
-  subtask so at most ~2 × cap partitions are held at once; each subtask gives its lexicographically
-  smallest keys. It used to fill the cap from subtask 0, so past the cap the other subtasks' keys
+  subtask, so the kept partitions never exceed ~2 × cap between subtasks (each subtask's full key
+  map is still built first — #24 removes that); each subtask gives its lexicographically smallest
+  keys, and the kept set is sorted once, so paging reads in key order. It used to fill the cap from subtask 0, so past the cap the other subtasks' keys
   were unreachable. `build_index_with_cap` takes the cap as an argument (tests use a small one).
   The structural fix (no cap at all) is #24.
 - **Paging** is bounded by the **stored** partitions (`KeyedSnapshot::visible_count`): bounding it
