@@ -45,6 +45,8 @@ payloads. Everything visible in the TUI is also available as a JSON export.
   serializer stores it (POJO/enum).
 - **JSON export** (`E`) — writes `export.json` next to the savepoint with the decoded model (up to
   100 000 keys per operator, flagged `truncated` past that; `--export-state` streams every key).
+- **Web UI** (`--web`) — the same savepoint in a browser, read-only, loopback-only, token-guarded;
+  see [Web UI](#web-ui).
 - **Filtering** — by key prefix, exact match, or key-group range.
 - **Profiles** — per-project proto dirs, patterns, and bindings.
 - **Index caching** — fast reload with staleness detection (auto-rebuilds if stale).
@@ -64,6 +66,9 @@ Reading external RocksDB/SST state files is optional and off by default (it pull
 ```bash
 cargo build --release --features sst
 ```
+
+The [web UI](#web-ui) (`--web`, hyper + tokio) is a default feature; `--no-default-features`
+builds the TUI-only binary.
 
 ### Prebuilt binaries
 
@@ -161,6 +166,96 @@ between its subtasks. Past that, the TUI says so (`100000 of 1000000 keys shown`
 sets `truncated: true` at the root and on the operator, with its `stored_keys` and `total_keys`.
 To get every key of a state, use `--export-state`, which streams the savepoint instead.
 
+## Web UI
+
+For people who would rather click than use a terminal, the same binary serves a read-only
+browser UI:
+
+```bash
+flink-explorer /path/to/savepoint-dir --web            # prints the URL to open
+flink-explorer /path/to/savepoint-dir --web --open     # …and opens it in the default browser
+flink-explorer /path/to/savepoint-dir --web --port 8080
+```
+
+It prints one URL, `http://127.0.0.1:<port>/?token=<32 hex digits>`; open it, and the token is
+swapped for a session cookie and dropped from the address bar. `--port 0` (the default) picks a
+free port. `Ctrl-C` stops the server. `-p/--profile` applies, as for the TUI (protobuf decoding).
+
+Pages — each one is a URL you can bookmark and reload. A page URL works only in a browser that
+already holds the session cookie: sent to a colleague (on the same tunnel), it answers `403`
+until they open the token URL themselves — and **handing over the token URL hands over full
+read access to the savepoint** for as long as the server runs. The table:
+
+| Page | URL | JSON twin |
+|------|-----|-----------|
+| Overview: operators, sizes, keyed and operator states | `/` | `/api/operators` |
+| Operator: info lines, keyed states, operator states, lookup box | `/op/<id>` | `/api/op/<id>` |
+| Every key with all its states, paged | `/op/<id>/keys?cursor=…&limit=…` | `/api/op/<id>/keys?…` |
+| One state's entries, paged | `/op/<id>/state?name=<state>&cursor=…` | `/api/op/<id>/state?…` |
+| One key: every state's decoded value as a tree, raw bytes in hex | `/op/<id>/key?at=<cursor>` | `/api/op/<id>/key?at=…` |
+| Exact lookup by key text | `/op/<id>/lookup?key=<text>` | `/api/op/<id>/lookup?key=…` |
+| The rest of a big key: one state's entries, paged | `/op/<id>/entries?at=<cursor>&state=<state>&offset=N` | `/api/op/<id>/entries?…` |
+
+The `/api/` rows have exactly the shape of an `--export-state` NDJSON line (`operator`, `subtask`,
+`state`, `state_type`, `key`, `key_group`, `value`, and `map_key` / `namespace_hex`); a page's
+`next` field is the cursor of the next page (`subtask.keygroup.ordinal`), `null` at the end.
+
+It reads the savepoint **lazily** (one key-group per request, through `reader::StateReader`), so
+a large savepoint opens at once and memory stays small. A key page shows at most 200 entries per
+state (a MAP state with a million entries, say) and links to the paged entries view for the
+rest; the JSON lists such states under `truncated`. Key-groups that cannot be read (a missing or
+truncated state file) are skipped with a visible warning naming the subtask, the key-groups and
+the file (`unreadable` in the JSON), never silently. At most 64 connections are served at once
+(one more gets `503`) and about two requests per CPU read the savepoint at a time (the others
+wait), so a burst of large pages cannot exhaust memory.
+
+**Security model.** The server publishes production data, so:
+
+- it binds to **`127.0.0.1` only** by default. `--bind <ip>` overrides that and prints a loud
+  warning when the address is not loopback: the traffic is plain HTTP. The printed URL still says
+  `127.0.0.1` when bound to `0.0.0.0`/`::`: from another machine, replace it with an address of
+  the server;
+- every request needs the **session**: the random 128-bit token (from the OS's CSPRNG) is printed
+  once and exchanged for an `HttpOnly`, `SameSite=Strict` cookie (by a page that sets it and
+  moves on with `<meta http-equiv="refresh">`, so that a token link opened from another site
+  keeps the cookie); without it, `403` and no data. Whoever has the token URL has the session:
+  treat it like a password;
+- **cookies are not port-scoped**: the browser also sends the session cookie (named
+  `flink_explorer_<port>`, i.e. the token) to every *other* port on `127.0.0.1`/`localhost`. Any
+  other local web server you browse to — or any local user able to run one there — can read it
+  and then use this server. On a shared machine, stop the server when you are done;
+- with `--open`, the token URL is passed to the browser on its **command line**, which other
+  local users can see (`ps`) while that process runs; on a shared machine, copy the URL instead;
+- the **`Host` header** must be a loopback name (`localhost`, `127.0.0.1`, `[::1]`) or the bound
+  address, which defeats DNS rebinding (a rebinding page sends its own host name);
+- only **`GET`/`HEAD`** (`405` otherwise): there is nothing to change;
+- every response sends a strict `Content-Security-Policy` (`default-src 'none'`, scripts and
+  styles from the server only, no framing), `X-Content-Type-Options: nosniff`,
+  `Referrer-Policy: no-referrer`, `Cache-Control: no-store` and same-origin
+  `Cross-Origin-Resource-Policy` / `Cross-Origin-Opener-Policy`;
+- keys and values are always HTML-escaped (by construction: see `src/web/html.rs`), never
+  inlined in a `<script>`; the only files served are the two embedded assets, never a path from
+  `_metadata`;
+- paths in `_metadata` are not trusted (by the TUI and the export either): a relative state-file
+  path that is absolute or contains `..` is refused, and only regular files are opened (a FIFO
+  or a device is refused). Absolute `file:` handles are followed, as checkpoints use them.
+
+**Remote savepoints.** Keep the default bind on the remote machine and tunnel to it:
+
+```bash
+ssh -L 8080:127.0.0.1:8080 user@flink-host \
+    flink-explorer /data/savepoints/savepoint-abc --web --port 8080
+# then open the printed URL locally: http://127.0.0.1:8080/?token=…
+```
+
+The local port may differ (`ssh -L 9000:127.0.0.1:8080` → open `http://127.0.0.1:9000/?token=…`).
+
+**Limits.** Keys come in **on-disk order** (key-group by key-group, then as stored), not sorted.
+Key counts, search by substring and downloads come later (#23). The lookup is exact, on the key
+as it is rendered; it cannot locate POJO/Kryo keys (their `hashCode()` is user code) and says so.
+Operator-state elements are listed (name, mode, element count) but not decoded: use the TUI.
+A build without the UI: `cargo build --release --no-default-features`.
+
 ## Configuration
 
 ### Profile
@@ -232,6 +327,13 @@ src/
 │   ├── filter.rs         # key filter (prefix / exact / key-group range)
 │   ├── profile_picker.rs # profile selection overlay
 │   └── loading.rs        # loading / progress screen
+├── reader/               # lazy StateReader: one key-group per call, exact key lookup
+├── web/                  # `--web` (feature `web`, default)
+│   ├── mod.rs            # request guards (method, Host, token/cookie, headers)
+│   ├── html.rs           # Html newtype: escaping as a type invariant
+│   ├── pages.rs          # routes: HTML pages + /api/ JSON twins
+│   ├── http.rs           # hyper/tokio glue (the only file that knows them)
+│   └── assets/           # app.css, app.js (embedded with include_str!)
 ├── export.rs             # JSON export (same decoder as the TUI)
 └── error.rs              # unified error types
 ```
