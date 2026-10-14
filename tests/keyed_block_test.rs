@@ -97,6 +97,7 @@ fn parse(
             kg_prefix_len: prefix_len,
             key_pojo: None,
             state_types: &types,
+            layouts: &[],
             only_state,
         },
         &mut |e| out.push(e),
@@ -149,6 +150,7 @@ fn compressed_key_group_decodes_like_an_uncompressed_one() {
                 kg_prefix_len: 1,
                 key_pojo: None,
                 state_types: &["VALUE".to_string()],
+                layouts: &[],
                 only_state: Some(0),
             },
             &mut |e| out.push(e),
@@ -208,6 +210,7 @@ fn a_state_filter_skips_other_states_entries() {
         kg_prefix_len: 1,
         key_pojo: None,
         state_types: &types,
+        layouts: &[],
         only_state,
     };
     parse_key_group_block(&block, 0, &ctx(Some(1)), &mut |e| only_one.push(e)).unwrap();
@@ -534,4 +537,230 @@ fn an_unknown_state_id_skips_its_run_but_not_the_rest_of_the_key_group() {
         "{:?}",
         res
     );
+}
+
+// --- key types (#26) ---
+
+/// `PojoSerializer.serialize` (flink-core java/typeutils/runtime/PojoSerializer.java:354-399,
+/// release-1.20): the flags byte `NO_SUBCLASS` (2), then per field `writeBoolean(isNull)` and the
+/// field serializer's bytes.
+fn pojo_record(fields: &[&[u8]]) -> Vec<u8> {
+    let mut out = vec![2u8];
+    for f in fields {
+        out.push(0); // not null
+        out.extend_from_slice(f);
+    }
+    out
+}
+
+fn pojo_info(fields: &[(&str, &str)]) -> flink_explorer::parser::pojo::PojoInfo {
+    flink_explorer::parser::pojo::PojoInfo {
+        class_name: "com.example.UserKey".to_string(),
+        short_name: "UserKey".to_string(),
+        fields: fields
+            .iter()
+            .map(|(name, ty)| flink_explorer::parser::pojo::PojoField {
+                name: name.to_string(),
+                type_name: ty.to_string(),
+                nested_pojo: None,
+            })
+            .collect(),
+    }
+}
+
+/// One state's run: `short stateId`, then `[int keyLen][key][int valueLen][value]` per entry, the
+/// metadata-follows flag on the last entry's first byte.
+fn run(block: &mut Vec<u8>, state_id: u16, entries: &[(Vec<u8>, Vec<u8>)]) {
+    block.extend_from_slice(&state_id.to_be_bytes());
+    for (i, (k, v)) in entries.iter().enumerate() {
+        let mut k = k.clone();
+        if i + 1 == entries.len() {
+            k[0] |= 0x80;
+        }
+        block.extend_from_slice(&(k.len() as i32).to_be_bytes());
+        block.extend_from_slice(&k);
+        block.extend_from_slice(&(v.len() as i32).to_be_bytes());
+        block.extend_from_slice(v);
+    }
+}
+
+fn layout(map_key_type: Option<&str>) -> flink_explorer::parser::keyed_state::EntryLayout {
+    flink_explorer::parser::keyed_state::EntryLayout {
+        namespace_len: Some(1),
+        map_key_type: map_key_type.map(str::to_string),
+    }
+}
+
+#[test]
+fn a_timer_renders_its_pojo_key_like_the_entries_do() {
+    // A timer key is `[kgPrefix][flipSignBit(ts)][key][namespace]` (TimerSerializer.serialize).
+    // It used to come out empty for POJO keys, so the TUI filed the timer under key "".
+    let info = pojo_info(&[("id", "Long"), ("name", "String")]);
+    let key = pojo_record(&[&7i64.to_be_bytes(), &[2, b'x']]);
+    let ts = 1_700_000_000_123i64;
+
+    let mut block = Vec::new();
+    let mut value_key = vec![0u8];
+    value_key.extend_from_slice(&key);
+    value_key.push(0); // VoidNamespace
+    run(&mut block, 0, &[(value_key, 5i64.to_be_bytes().to_vec())]);
+    let mut timer_key = vec![0u8];
+    timer_key.extend_from_slice(&(ts ^ i64::MIN).to_be_bytes());
+    timer_key.extend_from_slice(&key);
+    timer_key.push(0); // VoidNamespace
+    run(&mut block, 1, &[(timer_key, Vec::new())]);
+    block.extend_from_slice(&0xFFFFu16.to_be_bytes());
+
+    let types = ["VALUE".to_string(), "TIMER".to_string()];
+    for layouts in [vec![layout(None), layout(None)], Vec::new()] {
+        let mut out = Vec::new();
+        let _ = parse_key_group_block(
+            &block,
+            0,
+            &KeyGroupParse {
+                num_states: 2,
+                key_type: "Pojo",
+                kg_prefix_len: 1,
+                key_pojo: Some(&info),
+                state_types: &types,
+                layouts: &layouts,
+                only_state: None,
+            },
+            &mut |e| out.push(e),
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].key, r#"{ id: 7, name: "x" }"#);
+        assert_eq!(
+            out[1].key, out[0].key,
+            "the timer's key differs from the entry's"
+        );
+        assert_eq!(out[1].value, ts.to_be_bytes().to_vec());
+    }
+}
+
+#[test]
+fn a_pojo_key_that_does_not_fully_decode_renders_opaquely() {
+    // `{ id: Long, blob: <Kryo> }`: decoding stops at the Kryo field (its length is unknown), so
+    // two keys differing only there used to render alike and merge. What follows the decoded part
+    // is then not a namespace, so each key renders as the hex of its own bytes — namespace and
+    // map key split off.
+    let info = pojo_info(&[("id", "Long"), ("blob", "Kryo")]);
+    let keys: Vec<Vec<u8>> = [[1u8, 2, 3], [1, 2, 4]]
+        .iter()
+        .map(|blob| pojo_record(&[&7i64.to_be_bytes(), blob]))
+        .collect();
+
+    let mut block = Vec::new();
+    let value_entries: Vec<(Vec<u8>, Vec<u8>)> = keys
+        .iter()
+        .map(|k| {
+            let mut kb = vec![0u8];
+            kb.extend_from_slice(k);
+            kb.push(0); // VoidNamespace
+            (kb, 1i64.to_be_bytes().to_vec())
+        })
+        .collect();
+    run(&mut block, 0, &value_entries);
+    let map_entries: Vec<(Vec<u8>, Vec<u8>)> = keys
+        .iter()
+        .map(|k| {
+            let mut kb = vec![0u8];
+            kb.extend_from_slice(k);
+            kb.push(0); // VoidNamespace
+            kb.extend_from_slice(&[3, b'u', b'k']); // map key "uk"
+            let mut v = vec![0u8]; // NullableSerializer: not null
+            v.extend_from_slice(&9i64.to_be_bytes());
+            (kb, v)
+        })
+        .collect();
+    run(&mut block, 1, &map_entries);
+    block.extend_from_slice(&0xFFFFu16.to_be_bytes());
+
+    let types = ["VALUE".to_string(), "MAP".to_string()];
+    let layouts = [layout(None), layout(Some("String"))];
+    let mut out = Vec::new();
+    parse_key_group_block(
+        &block,
+        0,
+        &KeyGroupParse {
+            num_states: 2,
+            key_type: "Pojo",
+            kg_prefix_len: 1,
+            key_pojo: Some(&info),
+            state_types: &types,
+            layouts: &layouts,
+            only_state: None,
+        },
+        &mut |e| out.push(e),
+    );
+    assert_eq!(out.len(), 4);
+    let hex = |b: &[u8]| -> String {
+        let h: String = b.iter().map(|x| format!("{:02x}", x)).collect();
+        format!("0x{}", h)
+    };
+    for (i, e) in out.iter().enumerate() {
+        let k = &keys[i % 2];
+        assert_eq!(e.key, hex(k), "entry {} of state {}", i, e.state_id);
+    }
+    assert_ne!(out[0].key, out[1].key);
+    assert_eq!(out[0].namespace, vec![0u8]);
+    assert_eq!(out[2].namespace, vec![0u8, 3, b'u', b'k']);
+    let (map_key, value) = flink_explorer::parser::value::decode_map_entry(
+        &out[2].namespace,
+        &out[2].value,
+        "String",
+        "Long",
+        None,
+        None,
+        0,
+    );
+    assert_eq!((map_key.as_str(), value), ("uk", serde_json::json!(9)));
+}
+
+#[test]
+fn an_undecodable_key_keeps_its_window_namespace() {
+    // A window state's namespace is a TimeWindow, two longs (TimeWindow.Serializer.serialize): the
+    // key renders over its own bytes only, the 16 namespace bytes stay in the namespace.
+    let window: Vec<u8> = [1_000i64, 2_000]
+        .iter()
+        .flat_map(|t| t.to_be_bytes())
+        .collect();
+    let keys: [&[u8]; 2] = [&[0x01, 0x00], &[0x01]];
+    let mut block = Vec::new();
+    let entries: Vec<(Vec<u8>, Vec<u8>)> = keys
+        .iter()
+        .map(|k| {
+            let mut kb = vec![0u8];
+            kb.extend_from_slice(k);
+            kb.extend_from_slice(&window);
+            (kb, vec![0x2a])
+        })
+        .collect();
+    run(&mut block, 0, &entries);
+    block.extend_from_slice(&0xFFFFu16.to_be_bytes());
+
+    let layouts = [flink_explorer::parser::keyed_state::EntryLayout {
+        namespace_len: Some(16),
+        map_key_type: None,
+    }];
+    let mut out = Vec::new();
+    parse_key_group_block(
+        &block,
+        0,
+        &KeyGroupParse {
+            num_states: 1,
+            key_type: "Kryo",
+            kg_prefix_len: 1,
+            key_pojo: None,
+            state_types: &["LIST".to_string()],
+            layouts: &layouts,
+            only_state: None,
+        },
+        &mut |e| out.push(e),
+    );
+    let got: Vec<(&str, &[u8])> = out
+        .iter()
+        .map(|e| (e.key.as_str(), e.namespace.as_slice()))
+        .collect();
+    assert_eq!(got, [("0x0100", &window[..]), ("0x01", &window[..])]);
 }

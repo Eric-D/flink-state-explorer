@@ -23,9 +23,9 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 
 use crate::parser::keyed_state::{
-    count_states_in_header, extract_state_metadata, extract_value_pojo_classes,
-    extract_value_serializer_types, key_group_block, parse_key_group_block,
-    read_keyed_stream_header, KeyGroupParse,
+    count_states_in_header, extract_entry_layouts, extract_state_metadata,
+    extract_value_pojo_classes, extract_value_serializer_types, key_group_block,
+    parse_key_group_block, read_keyed_stream_header, EntryLayout, KeyGroupParse,
 };
 use crate::parser::metadata::{Operator, Savepoint};
 use crate::parser::pojo::{extract_pojo_infos, PojoInfo};
@@ -62,6 +62,9 @@ struct ResolvedState {
     key_type: String,
     key_pojo: Option<PojoInfo>,
     state_types: Vec<String>,
+    /// What follows the key in each state's entries, so keys split from namespaces the same way
+    /// as on the index path.
+    layouts: Vec<EntryLayout>,
     num_states: usize,
     /// For MAP states: the `Map<K,V>` key and value serializer types.
     map_key_type: String,
@@ -293,6 +296,7 @@ fn resolve_state(header: &[u8], state_name: &str) -> Option<ResolvedState> {
         None
     };
     let state_types: Vec<String> = metas.iter().map(|m| m.state_type.clone()).collect();
+    let layouts = extract_entry_layouts(header, header.len());
     let num_states = count_states_in_header(header, &metas);
 
     let (map_key_type, map_value_type) = if meta.state_type == "MAP" {
@@ -310,6 +314,7 @@ fn resolve_state(header: &[u8], state_name: &str) -> Option<ResolvedState> {
         key_type,
         key_pojo,
         state_types,
+        layouts,
         num_states,
         map_key_type,
         map_value_type,
@@ -657,6 +662,7 @@ pub fn export_state_rows<S: RowSink + ?Sized>(
                     kg_prefix_len,
                     key_pojo: sub.key_pojo.as_ref(),
                     state_types: &sub.state_types,
+                    layouts: &sub.layouts,
                     only_state: Some(sub.state_id),
                 },
                 &mut |entry| {

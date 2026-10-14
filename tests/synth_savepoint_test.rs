@@ -825,11 +825,12 @@ fn char_and_non_bmp_string_states_decode_on_both_paths() {
     assert_eq!(value_of("label", "emoji-😀"), json!("emoji-😀 ✓ 😀"));
     assert_eq!(value_of("label", "flag-🇫🇷"), json!("flag-🇫🇷 ✓ 😀"));
     assert_eq!(value_of("initial", "emoji-😀"), json!("é"));
-    assert_eq!(value_of("initial", "flag-🇫🇷"), json!("\u{FFFD}"));
+    // A lone surrogate (half of a pair, which a Java `char` may hold) as its Java escape.
+    assert_eq!(value_of("initial", "flag-🇫🇷"), json!("\\uD83D"));
     assert_eq!(value_of("letters", "café"), json!(["c", "a", "f", "é"]));
     assert_eq!(
         value_of("typed", "math-𝔸"),
-        json!(["m", "a", "t", "h", "-", "\u{FFFD}", "\u{FFFD}"])
+        json!(["m", "a", "t", "h", "-", "\\uD835", "\\uDD38"])
     );
 
     // Index (TUI) path: the value types read from the header, every key intact, same values.

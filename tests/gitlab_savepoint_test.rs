@@ -348,3 +348,57 @@ fn summary_report() {
     println!("State types: {:?}", types);
     println!("=== DONE ===");
 }
+
+#[test]
+fn entry_layouts_match_what_flink_wrote() {
+    // Every state's namespace width and map key type, read off headers Flink 1.20 wrote: an
+    // undecodable key is split from its namespace with them, and a decoded one checked.
+    use flink_explorer::parser::keyed_state::{extract_entry_layouts, extract_state_metadata};
+    use flink_explorer::parser::state_handle::{StateHandle, StreamStateHandle};
+    let dir = Path::new(SAVEPOINT_DIR);
+    let savepoint = parser::parse_metadata(&dir.join("_metadata")).unwrap();
+    let index = load_index();
+    let mut checked = 0;
+    for (op, cached) in savepoint.operators.iter().zip(&index.operators) {
+        for st in &op.subtask_states {
+            let StateHandle::KeyGroups(kg) = &st.managed_keyed_state else {
+                continue;
+            };
+            let StreamStateHandle::ByteStream(bs) = &kg.delegate_handle else {
+                continue;
+            };
+            let header_end = kg
+                .offsets
+                .iter()
+                .copied()
+                .filter(|&o| o > 0)
+                .min()
+                .unwrap_or(bs.data.len() as i64) as usize;
+            let metas = extract_state_metadata(&bs.data);
+            let layouts = extract_entry_layouts(&bs.data, header_end);
+            assert_eq!(layouts.len(), metas.len());
+            for (m, l) in metas.iter().zip(&layouts) {
+                // Window operators namespace by TimeWindow (two longs), everything else by
+                // VoidNamespace (one byte).
+                let want = if m.name == "window-contents" || m.name.ends_with("_window-timers") {
+                    16
+                } else {
+                    1
+                };
+                assert_eq!(l.namespace_len, Some(want), "namespace of {}", m.name);
+                let descriptor = cached
+                    .keyed_state
+                    .as_ref()
+                    .and_then(|ks| ks.descriptors.iter().find(|d| d.name == m.name))
+                    .unwrap();
+                let want_map_key = descriptor
+                    .value_type
+                    .strip_prefix("Map<")
+                    .map(|_| parser::value::split_map_types(&descriptor.value_type).0);
+                assert_eq!(l.map_key_type, want_map_key, "map key of {}", m.name);
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 40, "only {} states checked", checked);
+}

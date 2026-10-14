@@ -55,8 +55,9 @@ fn char_value() {
     assert_eq!(decode(&[0x00, 0x41], "Char"), json!("A"));
     assert_eq!(decode(&[0x00, 0xE9], "Char"), json!("é"));
     assert_eq!(decode(&[0x20, 0xAC], "Char"), json!("€"));
-    // A lone surrogate is a valid Java char but no Rust char.
-    assert_eq!(decode(&[0xD8, 0x3D], "Char"), json!("\u{FFFD}"));
+    // A lone surrogate is a valid Java char but no Rust char: its Java escape, so distinct
+    // chars stay distinct (U+FFFD would merge them, e.g. as map or tuple keys).
+    assert_eq!(decode(&[0xD8, 0x3D], "Char"), json!("\\uD83D"));
 }
 
 #[test]
