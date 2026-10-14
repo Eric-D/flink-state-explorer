@@ -46,6 +46,8 @@ pub const ENTRY_LIMIT: usize = 200;
 pub(super) enum Fail {
     NotFound(String),
     BadRequest(String),
+    /// Refused for now (a limit is reached): `503`, retry later.
+    Busy(String),
     Internal(String),
 }
 
@@ -70,7 +72,13 @@ impl From<ReaderError> for Fail {
     }
 }
 
-pub(super) fn route(app: &App, path: &str, query: &[(String, String)]) -> Response {
+/// `side_effects`: false for a `HEAD`, which must not start or cancel a count.
+pub(super) fn route(
+    app: &App,
+    path: &str,
+    query: &[(String, String)],
+    side_effects: bool,
+) -> Response {
     let segments: Vec<String> = path.split('/').skip(1).map(url_decode_path).collect();
     let segs: Vec<&str> = segments.iter().map(String::as_str).collect();
     let q = Query(query);
@@ -93,7 +101,7 @@ pub(super) fn route(app: &App, path: &str, query: &[(String, String)]) -> Respon
         ["op", op, "lookup"] => (false, lookup_page(app, op, &q)),
         ["op", op, "entries"] => (false, entries_page(app, op, &q)),
         ["op", op, "search"] => (false, tools::search_page(app, op, &q)),
-        ["op", op, "count"] => (false, tools::count_page(app, op, &q)),
+        ["op", op, "count"] => (false, tools::count_page(app, op, &q, side_effects)),
         ["op", op, "download"] => (false, tools::download(app, op, &q)),
         ["api", "operators"] => (true, api_operators(app)),
         ["api", "op", op] => (true, api_operator(app, op)),
@@ -107,7 +115,7 @@ pub(super) fn route(app: &App, path: &str, query: &[(String, String)]) -> Respon
         ["api", "op", op, "lookup"] => (true, api_lookup(app, op, &q)),
         ["api", "op", op, "entries"] => (true, api_entries(app, op, &q)),
         ["api", "op", op, "search"] => (true, tools::api_search(app, op, &q)),
-        ["api", "op", op, "count"] => (true, tools::api_count(app, op, &q)),
+        ["api", "op", op, "count"] => (true, tools::api_count(app, op, &q, side_effects)),
         _ if segs.first() == Some(&"api") => {
             (true, Err(Fail::NotFound("no such API route".into())))
         }
@@ -119,9 +127,10 @@ pub(super) fn route(app: &App, path: &str, query: &[(String, String)]) -> Respon
             let (status, msg) = match fail {
                 Fail::NotFound(m) => (404, m),
                 Fail::BadRequest(m) => (400, m),
+                Fail::Busy(m) => (503, m),
                 Fail::Internal(m) => (500, m),
             };
-            if api {
+            let mut r = if api {
                 json_response(status, &json!({ "error": msg }))
             } else {
                 let mut body = Html::new();
@@ -133,7 +142,11 @@ pub(super) fn route(app: &App, path: &str, query: &[(String, String)]) -> Respon
                 let mut r = layout(app, "Error", &[], &body);
                 r.status = status;
                 r
+            };
+            if status == 503 {
+                r.headers.push(("Retry-After", "5".to_string()));
             }
+            r
         }
     }
 }
@@ -575,10 +588,7 @@ fn operator_page(app: &App, op: &str) -> Res<Response> {
             }
             // `app.js` refreshes the count cells while a count runs.
             h.raw("<div");
-            if counts
-                .as_ref()
-                .is_some_and(|c| c.status == super::jobs::JobStatus::Running)
-            {
+            if counts.as_ref().is_some_and(|c| c.status.is_live()) {
                 h.raw(" data-count-api=\"")
                     .text(&format!("/api{}", op_path(&id, "count")))
                     .raw("\"");
@@ -1478,17 +1488,34 @@ fn api_lookup(app: &App, op: &str, q: &Query) -> Res<Response> {
             "subtask": subtask,
             "blocks_read": stats.blocks,
         }),
-        Lookup::NeedsScan { reason } => json!({
-            "result": "needs_scan",
-            "key": key,
-            "reason": reason,
-            "scan": href(
-                &format!("/api{}", op_path(&id, "search")),
-                &[("q", &key), ("mode", "exact")],
-            ),
-        }),
+        Lookup::NeedsScan { reason } => {
+            let (q, mode) = scan_query(&key);
+            json!({
+                "result": "needs_scan",
+                "key": key,
+                "reason": reason,
+                "scan": href(
+                    &format!("/api{}", op_path(&id, "search")),
+                    &[("q", q.as_str()), ("mode", mode)],
+                ),
+                "scan_mode": mode,
+            })
+        }
     };
     Ok(json_response(200, &v))
+}
+
+/// The search a `NeedsScan` lookup offers: the exact key, or — longer than a search takes — a
+/// substring search for its first [`tools::MAX_QUERY_CHARS`] characters (which finds it too).
+fn scan_query(key: &str) -> (String, &'static str) {
+    if key.chars().count() <= tools::MAX_QUERY_CHARS {
+        (key.to_string(), "exact")
+    } else {
+        (
+            key.chars().take(tools::MAX_QUERY_CHARS).collect(),
+            "substring",
+        )
+    }
 }
 
 fn lookup_page(app: &App, op: &str, q: &Query) -> Res<Response> {
@@ -1523,21 +1550,31 @@ fn lookup_page(app: &App, op: &str, q: &Query) -> Res<Response> {
                     "</p><p>Its key-group cannot be computed from the text (POJO, Kryo or \
                       opaque keys have a user-defined <code>hashCode()</code>). ",
                 );
-            link(
-                &mut h,
-                &href(&op_path(&id, "search"), &[("q", &key), ("mode", "exact")]),
-                "Scan the operator for this exact key",
-            );
-            h.raw(" (it reads every key-group, a few megabytes per request), or ");
-            link(
-                &mut h,
-                &href(
-                    &op_path(&id, "search"),
-                    &[("q", &key), ("mode", "substring")],
-                ),
-                "search for keys containing it",
-            );
-            h.raw(".</p>");
+            let (q, mode) = scan_query(&key);
+            if mode == "exact" {
+                link(
+                    &mut h,
+                    &href(&op_path(&id, "search"), &[("q", &q), ("mode", "exact")]),
+                    "Scan the operator for this exact key",
+                );
+                h.raw(" (it reads every key-group, a few megabytes per request), or ");
+                link(
+                    &mut h,
+                    &href(&op_path(&id, "search"), &[("q", &q), ("mode", "substring")]),
+                    "search for keys containing it",
+                );
+                h.raw(".</p>");
+            } else {
+                h.raw("This key is longer than ")
+                    .display(tools::MAX_QUERY_CHARS)
+                    .raw(" characters, the longest a search takes: ");
+                link(
+                    &mut h,
+                    &href(&op_path(&id, "search"), &[("q", &q), ("mode", "substring")]),
+                    "search for keys containing its first characters",
+                );
+                h.raw(" (it reads every key-group, a few megabytes per request).</p>");
+            }
         }
     }
     Ok(layout(

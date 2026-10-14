@@ -52,6 +52,15 @@ pub struct WebOptions {
     pub count_step_bytes: u64,
     /// A pause between two count steps: zero in use; tests set one to catch a job running.
     pub count_step_pause: Duration,
+    /// Count jobs running at once, over every operator; one more is refused (`503`) until one
+    /// ends. A cancelled job counts until its worker has stopped.
+    pub max_running_counts: usize,
+    /// Downloads streamed at once; one more is answered `503`. A download holds no read permit,
+    /// so this is what bounds their memory (a Parquet download buffers a row group).
+    pub max_downloads: usize,
+    /// A download whose client takes nothing for this long is aborted (its connection closed),
+    /// which frees its slot.
+    pub download_stall: Duration,
 }
 
 impl Default for WebOptions {
@@ -59,6 +68,9 @@ impl Default for WebOptions {
         WebOptions {
             count_step_bytes: 4 << 20,
             count_step_pause: Duration::ZERO,
+            max_running_counts: 2,
+            max_downloads: 2,
+            download_stall: Duration::from_secs(45),
         }
     }
 }
@@ -85,8 +97,9 @@ pub struct Response {
     pub headers: Vec<(&'static str, String)>,
     pub body: Vec<u8>,
     /// A body produced while it is sent (a download): run by [`http`] on a blocking thread that
-    /// holds a read permit, written through a bounded channel as a chunked body. `body` is then
-    /// empty. If the producer fails before its first chunk, the client gets a `500` instead.
+    /// holds a download slot (not a read permit), written through a bounded channel as a chunked
+    /// body. `body` is then empty. If the producer fails before its first chunk, the client gets
+    /// a `500` instead.
     pub stream: Option<Streamed>,
 }
 
@@ -289,7 +302,8 @@ impl App {
                  where flink-explorer runs.\n",
             );
         }
-        pages::route(self, &req.path, &query)
+        // A HEAD has no side effects: it starts and cancels nothing.
+        pages::route(self, &req.path, &query, req.method == "GET")
     }
 
     fn has_session(&self, cookie: Option<&str>) -> bool {
@@ -311,6 +325,17 @@ pub fn busy() -> Response {
         "Service Unavailable: too many connections; retry in a moment.\n",
     );
     r.headers.push(("Retry-After", "1".to_string()));
+    with_security_headers(&mut r);
+    r
+}
+
+/// What a download gets when [`WebOptions::max_downloads`] are already streaming.
+pub fn too_many_downloads() -> Response {
+    let mut r = Response::text(
+        503,
+        "Service Unavailable: too many downloads in progress; retry when one has finished.\n",
+    );
+    r.headers.push(("Retry-After", "5".to_string()));
     with_security_headers(&mut r);
     r
 }

@@ -1,8 +1,11 @@
 //! Count jobs: exact per-state key and entry counts of one operator, computed by a background
 //! pass over its key-groups ([`crate::reader::StateReader::count`], a step of
 //! [`super::WebOptions::count_step_bytes`] at a time, one block in memory). At most one job per
-//! operator; results stay in memory for the session. A job checks for cancellation between steps;
-//! dropping the [`CountJobs`] (the server stopping) cancels every job.
+//! operator, and [`super::WebOptions::max_running_counts`] running over all operators (one more
+//! is refused); results stay in memory for the session. A job checks for cancellation between
+//! steps: a cancelled job is `cancelling` until its worker has stopped, and only then
+//! `cancelled` (and restartable). Dropping the [`CountJobs`] (the server stopping) cancels
+//! every job.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,6 +20,8 @@ const MAX_WARNINGS: usize = 100;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum JobStatus {
     Running,
+    /// Asked to stop; its worker has not noticed yet.
+    Cancelling,
     Done,
     Cancelled,
     Failed(String),
@@ -26,10 +31,16 @@ impl JobStatus {
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
             JobStatus::Running => "running",
+            JobStatus::Cancelling => "cancelling",
             JobStatus::Done => "done",
             JobStatus::Cancelled => "cancelled",
             JobStatus::Failed(_) => "failed",
         }
+    }
+
+    /// Its worker is still running (it holds one of the running slots).
+    pub(crate) fn is_live(&self) -> bool {
+        matches!(self, JobStatus::Running | JobStatus::Cancelling)
     }
 }
 
@@ -46,13 +57,22 @@ pub(crate) struct CountSnapshot {
     pub malformed: Vec<String>,
     /// Warnings beyond [`MAX_WARNINGS`], not listed.
     pub more_warnings: usize,
+    /// Key-groups skipped because they could not be read, all of them (listed or not).
+    pub unreadable_key_groups: u64,
+    /// Malformed key-groups (counted up to their defect), all of them.
+    pub malformed_key_groups: u64,
     pub elapsed: Duration,
 }
 
 impl CountSnapshot {
-    /// The counts are exact (the whole operator was read).
+    /// The counts are exact: every key-group was read, and read whole.
     pub fn exact(&self) -> bool {
-        self.status == JobStatus::Done
+        self.status == JobStatus::Done && self.incomplete_key_groups() == 0
+    }
+
+    /// Key-groups whose keys are missing from the counts, or partly missing.
+    pub fn incomplete_key_groups(&self) -> u64 {
+        self.unreadable_key_groups + self.malformed_key_groups
     }
 }
 
@@ -91,6 +111,10 @@ impl Job {
     }
 }
 
+/// Why a count was not started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Busy(pub String);
+
 /// The jobs of one server, by canonical hex operator id.
 #[derive(Default)]
 pub(crate) struct CountJobs {
@@ -104,25 +128,38 @@ impl CountJobs {
         jobs.get(op).map(|j| j.snapshot())
     }
 
-    /// The job of `op`, started if there is none — or, with `restart`, if the one there is no
-    /// longer running (a running job is never started twice).
+    /// The job of `op`, started if there is none — or, with `restart`, if the one there has
+    /// stopped (a job whose worker still runs, even cancelling, is never started twice). `Err`
+    /// when `max_running` jobs already run.
     pub(crate) fn start(
         &self,
         reader: &Arc<StateReader<'static>>,
         op: &str,
         restart: bool,
-        step_bytes: u64,
-        pause: Duration,
-    ) -> CountSnapshot {
+        options: &super::WebOptions,
+    ) -> Result<CountSnapshot, Busy> {
+        let (step_bytes, pause) = (options.count_step_bytes, options.count_step_pause);
         let mut jobs = match self.jobs.lock() {
             Ok(j) => j,
             Err(p) => p.into_inner(),
         };
         if let Some(j) = jobs.get(op) {
             let snap = j.snapshot();
-            if !restart || snap.status == JobStatus::Running {
-                return snap;
+            if !restart || snap.status.is_live() {
+                return Ok(snap);
             }
+        }
+        let running = jobs
+            .values()
+            .filter(|j| j.snapshot().status.is_live())
+            .count();
+        let max_running = options.max_running_counts.max(1);
+        if running >= max_running {
+            return Err(Busy(format!(
+                "{} count(s) already running, the most this server runs at once; cancel one or \
+                 retry when one has finished",
+                running
+            )));
         }
         let initial = reader.progress(op, Some(&Default::default()), 0, None);
         let job = Arc::new(Job {
@@ -137,6 +174,8 @@ impl CountJobs {
                 unreadable: Vec::new(),
                 malformed: Vec::new(),
                 more_warnings: 0,
+                unreadable_key_groups: 0,
+                malformed_key_groups: 0,
                 elapsed: Duration::ZERO,
             }),
         });
@@ -148,23 +187,32 @@ impl CountJobs {
             .name("flink-explorer-count".into())
             .spawn({
                 let job = job.clone();
-                move || run(&reader, &op, &job, step_bytes, pause)
+                move || {
+                    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run(&reader, &op, &job, step_bytes, pause)
+                    }));
+                    if ran.is_err() {
+                        job.finish(JobStatus::Failed(
+                            "the count failed (internal error)".into(),
+                        ));
+                    }
+                }
             });
         if let Err(e) = spawned {
             job.finish(JobStatus::Failed(format!("cannot start the count: {}", e)));
-            return job.snapshot();
+            return Ok(job.snapshot());
         }
-        snap
+        Ok(snap)
     }
 
-    /// Ask `op`'s job to stop (idempotent: a finished job stays as it is). `None`: no job.
+    /// Ask `op`'s job to stop (idempotent: a finished job stays as it is). It is `cancelling`
+    /// until its worker notices, between two steps. `None`: no job.
     pub(crate) fn cancel(&self, op: &str) -> Option<CountSnapshot> {
         let job = self.jobs.lock().ok()?.get(op).cloned()?;
         job.cancel.store(true, Ordering::SeqCst);
-        // The worker notices between steps; say so at once.
         job.update(|s| {
             if s.status == JobStatus::Running {
-                s.status = JobStatus::Cancelled;
+                s.status = JobStatus::Cancelling;
             }
         });
         Some(job.snapshot())
@@ -207,6 +255,12 @@ fn run(reader: &StateReader<'static>, op: &str, job: &Job, step_bytes: u64, paus
             }
             s.keys += page.keys;
             s.bytes_read += page.stats.bytes_read;
+            s.unreadable_key_groups += page
+                .unreadable
+                .iter()
+                .map(|u| u64::from(u.last_key_group.saturating_sub(u.first_key_group)) + 1)
+                .sum::<u64>();
+            s.malformed_key_groups += page.malformed.len() as u64;
             for u in page.unreadable {
                 if s.unreadable.len() + s.malformed.len() < MAX_WARNINGS {
                     s.unreadable.push(u);

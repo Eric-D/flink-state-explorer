@@ -121,7 +121,8 @@ key-group begins) to resolve the state's id/type/serializers, then seeks per key
 `KeyGroupsStateHandle.offsets`, reading **one key-group at a time** into a reused buffer. Entries of
 other states are skipped by their length prefixes without decoding keys or copying values
 (`KeyGroupParse::only_state`). Peak memory is one key-group, not one savepoint —
-`ExportStats::max_block_bytes` reports it.
+`ExportStats::max_block_bytes` reports it — plus, for Parquet, the 65 536-row group being built
+(~17 MB measured on `savepoint-big`; more with large values).
 
 A key-group that cannot be read to its end mark (truncated, a bad length, a stateId beyond the
 header's state count) is **reported, not silently cut short**: the rows read before the defect are
@@ -359,24 +360,39 @@ key-group per request. Feature `web` is **on by default** (users take the releas
   HTML page renders one request and a "Next page of results" link; `app.js` reads `data-api` on
   `#search-status`, fetches `next_api` until `done`, Stop, or 10 000 rows, appending with
   `textContent` only and following only server paths (`ownPath`). A `NeedsScan` lookup links to
-  `search?mode=exact` (JSON: `scan`). `/op/<id>/count` + `/api/…`: `CountJobs` (one per operator,
+  `search?mode=exact` (JSON: `scan`), or — a key longer than 256 chars — to a `substring` search
+  of its first 256 (`scan_mode`). Search and count of a non-keyed operator are `NoKeyedState`
+  404s; a cursor past the operator's last key-group is a `BadCursor` 400 (`check_cursor`).
+  `/op/<id>/count` + `/api/…`: `CountJobs` (one per operator,
   in `App`, kept for the session) run `StateReader::count` steps of `WebOptions::count_step_bytes`
   (4 MiB) on a `std::thread`, checking an `AtomicBool` between steps; a GET starts the job if
-  there is none, `?cancel=1` cancels (idempotent; 404 if none), `?restart=1` starts again a job
-  that is not running (polling never restarts a cancelled one); dropping `App` cancels all. Pages
-  show `≥ N (counting… x %)` (`tools::count_text`) until `done`; rows carry `data-state` and
-  `app.js` polls `[data-count-api]` once a second. `/op/<id>/download?state=&format=`:
+  there is none, `?cancel=1` cancels (idempotent; 404 if none) → `cancelling` until the worker
+  stops → `cancelled`, `?restart=1` starts again a job whose worker has stopped (polling never
+  restarts a cancelled one); at most `WebOptions::max_running_counts` (2) live (running or
+  cancelling) jobs over all operators, one more is `Fail::Busy` → 503 + `Retry-After`; a `HEAD`
+  (`route(.., side_effects = false)`) only shows a job. Dropping `App` cancels all. Pages
+  show `≥ N (counting… x %)` (`tools::count_text`) until `done`; `exact` only when done with no
+  unreadable and no malformed key-group (`unreadable_key_groups`/`malformed_key_groups`, all of
+  them, not just the 100 listed), otherwise `≥ N (incomplete: k key-group(s) unreadable)`; rows
+  carry `data-state` and `app.js` polls `[data-count-api]` once a second (while running or
+  cancelling). `/op/<id>/download?state=&format=`:
   `Response.stream: Option<Streamed>` (a `StreamFn` writing to `dyn Write + Send`), produced in
-  `http.rs` on a second `spawn_blocking` that **takes the read permit** (a download counts as a
-  read until it ends) and writes 64 KiB chunks into a bounded `mpsc` (4 in flight, `blocking_send`
-  — a slow client back-pressures the export); the first message decides the status (data → `200`
-  chunked, a failure first → `500` naming it), `ChannelBody` ends cleanly only on `Chunk::Done`,
+  `http.rs` on a second `spawn_blocking` that holds a **download slot** — its own semaphore,
+  `WebOptions::max_downloads` (2), `try_acquire` → `too_many_downloads()` 503 at once — and **no
+  read permit** (released when `App::handle` returns), so stalled downloads never starve pages or
+  assets. It writes 64 KiB chunks into a bounded `mpsc` (4 in flight, `blocking_send`
+  — a slow client back-pressures the export). Stall deadline: `StallWatch` per connection, armed
+  when `ChannelBody` hands hyper a chunk and disarmed when hyper polls for the next; armed longer
+  than `WebOptions::download_stall` (45 s) → `serve_watched` drops the connection, which drops the
+  receiver and ends the producer. The first message decides the status (data → `200`
+  chunked, a failure first → a generic `500`, the cause to stderr), `ChannelBody` ends cleanly only on `Chunk::Done`,
   otherwise errs so hyper aborts the connection (no final chunk); a client gone makes the writer
   fail and the export stop. The body is `export_state_rows` + `NdjsonSink` / `ParquetSink`
   (`--features parquet`, else 400): byte-identical to `--export-state -o -`; a malformed key-group
   aborts the transfer. `Content-Disposition: attachment; filename="<8 hex>-<state>.<ext>"`
   (`download_filename`: `[A-Za-z0-9._-]`, no leading dot or `..`, ≤ 100 chars). HEAD drops the
-  stream unrun. `WebOptions` (`start_with_options`) exists for tests (`count_step_pause`).
+  stream unrun. `WebOptions` (`start_with_options`) exists for tests (`count_step_pause`, the
+  limits above).
   **Tests**: `tests/web_tools_test.rs` (CI): a glob/substring search with `budget=1&limit=3` over
   many continuations returns every match exactly once and the same order as one request; the HTML
   chain of next-page links does too; a hostile query and key render escaped; ranges across the
@@ -384,8 +400,13 @@ key-group per request. Feature `web` is **on by default** (users take the releas
   (and distinct keys) per state, inline+compressed and files; a throttled job shows `≥`/counting,
   is cancelled and stays so, restarts; NDJSON downloads == `export_state_ndjson` byte for byte
   (multi-chunk, inline+compressed and files), Parquet == `ParquetSink` (with the feature),
-  filenames sanitised, a lost file → `500` not `200`, 403 without session, every key found by
-  lookup and an empty key-group answered with 0 blocks. Reverted once each (range stop,
+  filenames sanitised, a lost file → generic `500` not `200` and a count with `exact: false`,
+  403 without session, every key found by lookup and an empty key-group answered with 0 blocks;
+  `stalled_downloads_do_not_block_the_server` (more non-reading 4 KiB-`SO_RCVBUF` download
+  sockets than read permits: `/api/operators`, assets and a keys page still answer, exactly
+  `max_downloads` get `200`, the rest and one more `503`, the stalled ones are aborted after the
+  deadline and a new download succeeds — fails on the old permit-holding code), the count cap +
+  `cancelling`, HEAD starts no count, the long NeedsScan key. Reverted once each (range stop,
   first-message status, cancel check, mid-block resume ordinal, filename sanitising): each fails.
   **Measured** on `savepoint-big` (release): full-operator search 43 requests 1.6 s, exact scan
   1.6 s, a 2-key-group range 0.3 s, count of all states 1.5 s (1M keys, big-stats 2.5M entries),

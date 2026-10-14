@@ -10,7 +10,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
-use common::synth::{self, Item, KeyedOperator, Kind, RunOrder, Ser, Spec, Storage, Val};
+use common::synth::{self, Item, KeyedOperator, Kind, OpState, RunOrder, Ser, Spec, Storage, Val};
 use flink_explorer::export_state::{
     export_state_ndjson, export_state_rows, list_states, RowSink, StateRow,
 };
@@ -25,8 +25,9 @@ const HOSTILE_KEY: &str = "<img src=x onerror=alert(1)>";
 const OPAQUE_KEY: &str = "0x010203";
 
 /// The sample operator (String keys: VALUE Long, VALUE String, MAP, LIST, timers) on two
-/// subtasks, plus one hostile key, and an operator with opaque keys (`get` cannot hash them).
-fn spec(keys: usize, storage: Storage, compressed: bool) -> (Spec, String, String) {
+/// subtasks, plus one hostile key, an operator with opaque keys (`get` cannot hash them), and a
+/// non-keyed operator (operator state only).
+fn spec(keys: usize, storage: Storage, compressed: bool) -> (Spec, String, String, String) {
     let mut op = synth::sample_operator(keys);
     let hostile = Val::str(HOSTILE_KEY);
     op.items.push(Item::Value {
@@ -57,12 +58,18 @@ fn spec(keys: usize, storage: Storage, compressed: bool) -> (Spec, String, Strin
         value: Val::Long(1),
     });
     let opaque_hex = opaque.id_hex();
+    let source = KeyedOperator::new(0x52, 1, 128, Ser::String).op_state(
+        0,
+        OpState::list("offsets", Ser::String, vec![Val::str("a")]),
+    );
+    let source_hex = source.id_hex();
     let mut spec = Spec::new(storage);
     spec.compressed = compressed;
     spec.run_order = RunOrder::HashLike;
     spec.operators.push(op);
     spec.operators.push(opaque);
-    (spec, op_hex, opaque_hex)
+    spec.operators.push(source);
+    (spec, op_hex, opaque_hex, source_hex)
 }
 
 struct Fixture {
@@ -71,6 +78,8 @@ struct Fixture {
     server: RunningServer,
     op: String,
     opaque: String,
+    /// A non-keyed operator.
+    source: String,
     cookie: String,
 }
 
@@ -85,7 +94,7 @@ fn fixture_with(
     options: WebOptions,
     damage: impl FnOnce(&synth::Written),
 ) -> Fixture {
-    let (spec, op, opaque) = spec(keys, storage, compressed);
+    let (spec, op, opaque, source) = spec(keys, storage, compressed);
     let dir = synth::temp_dir("web-tools");
     let written = synth::write_savepoint(&spec, &dir);
     damage(&written);
@@ -98,6 +107,7 @@ fn fixture_with(
         server,
         op,
         opaque,
+        source,
         cookie: String::new(),
     };
     f.cookie = login(&f);
@@ -463,6 +473,17 @@ fn search_parameters_are_bounded() {
             400,
         ),
         (format!("/api/op/{}/search?q=a&cursor=1.3.0", f.op), 400),
+        // Past the last key-group (127): not a cursor of this operator.
+        (format!("/api/op/{}/search?q=a&cursor=0.500.0", f.op), 400),
+        (format!("/api/op/{}/search?q=a&cursor=1.128.0", f.op), 400),
+        (format!("/op/{}/search?q=a&cursor=0.500.0", f.op), 400),
+        (format!("/api/op/{}/keys?cursor=0.500.0", f.op), 400),
+        (format!("/api/op/{}/search?q=a&cursor=1.127.0", f.op), 200),
+        // A non-keyed operator has nothing to search or count: 404, not an empty result.
+        (format!("/api/op/{}/search?q=a", f.source), 404),
+        (format!("/op/{}/search?q=a", f.source), 404),
+        (format!("/api/op/{}/count", f.source), 404),
+        (format!("/op/{}/count", f.source), 404),
         (format!("/api/op/{}/search", f.op), 400),
         (format!("/op/{}/search?q={}", f.op, long), 400),
     ] {
@@ -500,6 +521,25 @@ fn a_key_needing_a_scan_is_offered_one() {
     assert_eq!(v["result"], "needs_scan");
     let (found, _, _) = search_all(&f, v["scan"].as_str().unwrap());
     assert_eq!(found, vec![OPAQUE_KEY.to_string()]);
+
+    // A key longer than a search takes is offered a substring search of its start, which is a
+    // valid request (not a 400).
+    let long = format!("{}{}", OPAQUE_KEY, "z".repeat(web::MAX_QUERY_CHARS));
+    let r = get(&f, &format!("/op/{}/lookup?key={}", f.opaque, long));
+    assert_eq!(r.status, 200);
+    let body = r.text();
+    assert!(!body.contains("Scan the operator for this exact key"));
+    assert!(body.contains("longer than 256 characters"), "{}", body);
+    let scan = body
+        .split("<a href=\"")
+        .filter_map(|s| s.split_once("\">"))
+        .find(|(_, text)| text.starts_with("search for keys containing its first"))
+        .map(|(href, _)| unescape(href))
+        .unwrap_or_else(|| panic!("no search link in {}", body));
+    assert_eq!(get(&f, &scan).status, 200, "{}", scan);
+    let v = get(&f, &format!("/api/op/{}/lookup?key={}", f.opaque, long)).json();
+    assert_eq!(v["scan_mode"], "substring");
+    assert_eq!(get(&f, v["scan"].as_str().unwrap()).status, 200);
 }
 
 // --- counts ---------------------------------------------------------------------------------------
@@ -520,7 +560,7 @@ fn wait_done(f: &Fixture, op: &str) -> Value {
     let start = Instant::now();
     loop {
         let v = get(f, &format!("/api/op/{}/count", op)).json();
-        if v["status"] != "running" {
+        if v["status"] != "running" && v["status"] != "cancelling" {
             return v;
         }
         assert!(start.elapsed() < Duration::from_secs(30), "{}", v);
@@ -591,6 +631,7 @@ fn a_count_shows_its_progress_and_can_be_cancelled() {
     let options = WebOptions {
         count_step_bytes: 1,
         count_step_pause: Duration::from_millis(30),
+        ..WebOptions::default()
     };
     let f = fixture_with(300, Storage::Files, false, options, |_| {});
     // Nothing to cancel yet.
@@ -614,7 +655,26 @@ fn a_count_shows_its_progress_and_can_be_cancelled() {
     assert!(page.contains("data-count-api"));
 
     let v = get(&f, &format!("/api/op/{}/count?cancel=1", f.op)).json();
-    assert_eq!(v["status"], "cancelled", "{}", v);
+    // Cancelling until the worker has stopped, between two steps; a restart meanwhile is not one.
+    assert_eq!(v["status"], "cancelling", "{}", v);
+    assert!(
+        v["keys_text"].as_str().unwrap().contains("cancelling"),
+        "{}",
+        v
+    );
+    let page = get(&f, &format!("/op/{}/count", f.op)).text();
+    assert!(
+        page.contains("data-count-api"),
+        "still polled while cancelling"
+    );
+    assert!(!page.contains("restart=1"), "{}", page);
+    let v = get(&f, &format!("/api/op/{}/count?restart=1", f.op)).json();
+    assert!(
+        v["status"] == "cancelling" || v["status"] == "cancelled",
+        "{}",
+        v
+    );
+    assert_eq!(wait_done(&f, &f.op)["status"], "cancelled");
     std::thread::sleep(Duration::from_millis(200));
     // It stays cancelled: polling does not restart it, and it is no longer counting.
     let a = get(&f, &format!("/api/op/{}/count", f.op)).json();
@@ -808,12 +868,15 @@ fn a_download_that_cannot_be_read_is_an_error() {
     let lost = lost.into_inner();
     let r = get(&f, &format!("/op/{}/download?state=counter", f.op));
     assert_eq!(r.status, 500, "{}", r.text());
-    assert!(r.text().contains(&lost), "{}", r.text());
+    // The cause (it names the file) is logged, not sent.
+    assert!(!r.text().contains(&lost), "{}", r.text());
+    assert!(r.text().contains("server's log"), "{}", r.text());
     assert!(r.header("Content-Disposition").is_none());
     assert!(r.header("Content-Security-Policy").is_some());
-    // A count reports the lost key-groups instead of hiding them.
+    // A count reports the lost key-groups instead of hiding them, and does not claim to be exact.
     let v = wait_done(&f, &f.op);
     assert_eq!(v["status"], "done");
+    assert_eq!(v["exact"], false, "{}", v);
     assert!(
         v["unreadable"][0]["error"]
             .as_str()
@@ -822,6 +885,183 @@ fn a_download_that_cannot_be_read_is_an_error() {
         "{}",
         v
     );
+    // Subtask 1 holds key-groups 64..127.
+    assert_eq!(v["unreadable_key_groups"], 64, "{}", v);
+    let keys_text = v["keys_text"].as_str().unwrap();
+    assert!(
+        keys_text.starts_with("≥ ") && keys_text.contains("incomplete: 64 key-group(s) unreadable"),
+        "{}",
+        keys_text
+    );
+    assert!(
+        v["states"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["keys_text"].as_str().unwrap().starts_with("≥ ")),
+        "{}",
+        v
+    );
+    assert!(
+        v["status_text"].as_str().unwrap().starts_with("Incomplete"),
+        "{}",
+        v
+    );
+    let page = get(&f, &format!("/op/{}/count", f.op)).text();
+    assert!(
+        page.contains("incomplete: 64 key-group(s) unreadable"),
+        "{}",
+        page
+    );
+    assert!(!page.contains("Counted every key-group"), "{}", page);
+}
+
+/// A connection with a 4 KiB receive buffer that sends `raw` and then reads nothing.
+fn stalled_client(addr: SocketAddr, raw: &str) -> TcpStream {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()
+        .unwrap();
+    let s = rt.block_on(async {
+        let sock = tokio::net::TcpSocket::new_v4().unwrap();
+        sock.set_recv_buffer_size(4096).unwrap();
+        sock.connect(addr).await.unwrap().into_std().unwrap()
+    });
+    s.set_nonblocking(false).unwrap();
+    let mut s = s;
+    s.write_all(raw.as_bytes()).unwrap();
+    s
+}
+
+/// The status of the response arriving on `s` (its first line only is read).
+fn status_of(s: &mut TcpStream) -> u16 {
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut head = [0u8; 12];
+    s.read_exact(&mut head).expect("a status line");
+    std::str::from_utf8(&head[9..12]).unwrap().parse().unwrap()
+}
+
+/// Downloads whose clients read nothing hold a download slot each (and no read permit): more
+/// downloads than slots are refused at once, every other request is still answered, and a stalled
+/// download is aborted after `download_stall`, which frees its slot.
+#[test]
+fn stalled_downloads_do_not_block_the_server() {
+    let options = WebOptions {
+        download_stall: Duration::from_secs(2),
+        ..WebOptions::default()
+    };
+    let f = fixture_with(30_000, Storage::Files, false, options, |_| {});
+    // Far more than the sockets, the server's buffers and the channel can hold.
+    let state = "stats";
+    let raw = format!(
+        "GET /op/{}/download?state={} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nCookie: {}\r\n\
+         Connection: close\r\n\r\n",
+        f.op,
+        state,
+        f.server.addr().port(),
+        f.cookie
+    );
+    // More than every read permit: before the fix, these took them all.
+    let n = (web::max_concurrent_reads() + 4).min(web::MAX_CONNECTIONS - 8);
+    let mut stalled: Vec<TcpStream> = (0..n)
+        .map(|_| stalled_client(f.server.addr(), &raw))
+        .collect();
+    std::thread::sleep(Duration::from_millis(500));
+
+    let t = Instant::now();
+    let r = get(&f, "/api/operators");
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert_eq!(get(&f, "/assets/app.css").status, 200);
+    assert_eq!(get(&f, &format!("/api/op/{}/keys", f.op)).status, 200);
+    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+
+    let statuses: Vec<u16> = stalled.iter_mut().map(status_of).collect();
+    let ok = statuses.iter().filter(|&&s| s == 200).count();
+    assert_eq!(ok, WebOptions::default().max_downloads, "{:?}", statuses);
+    assert!(
+        statuses.iter().all(|&s| s == 200 || s == 503),
+        "{:?}",
+        statuses
+    );
+    // While the two slots are held, one more download is refused at once (with the headers).
+    let r = get(&f, &format!("/op/{}/download?state=counter", f.op));
+    assert_eq!(r.status, 503, "{}", r.text());
+    assert!(r.header("Content-Security-Policy").is_some());
+    assert!(r.header("Retry-After").is_some());
+
+    // The stalled ones are aborted after the deadline: their bodies end without the last chunk.
+    std::thread::sleep(Duration::from_secs(4));
+    for (s, status) in stalled.iter_mut().zip(&statuses) {
+        if *status != 200 {
+            continue;
+        }
+        let mut rest = Vec::new();
+        let _ = s.read_to_end(&mut rest);
+        let split = rest.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let (_, complete) = dechunk(&rest[split + 4..]);
+        assert!(!complete, "a stalled download was aborted, not completed");
+    }
+    // Their slots are free again.
+    let r = get(&f, &format!("/op/{}/download?state=counter", f.op));
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert!(r.complete);
+}
+
+/// A `HEAD` of a count shows a job but never starts (nor cancels) one.
+#[test]
+fn a_head_starts_no_count() {
+    let f = fixture(10, Storage::Inline, false);
+    for path in [
+        format!("/op/{}/count", f.op),
+        format!("/api/op/{}/count", f.op),
+        format!("/api/op/{}/count?restart=1", f.op),
+        format!("/api/op/{}/count?cancel=1", f.op),
+    ] {
+        let r = request(&f, "HEAD", &path, Some(&f.cookie));
+        assert_eq!(r.status, 200, "{}", path);
+        assert!(r.body.is_empty());
+    }
+    let v = get(&f, &format!("/api/op/{}", f.op)).json();
+    assert!(v["counts"].is_null(), "a HEAD started a count: {}", v);
+    assert!(get(&f, &format!("/op/{}", f.op))
+        .text()
+        .contains("Count keys and entries"));
+}
+
+/// At most `max_running_counts` jobs run at once; one more is refused with a message, and
+/// accepted once the running one has really stopped.
+#[test]
+fn running_counts_are_capped() {
+    let options = WebOptions {
+        count_step_bytes: 1,
+        count_step_pause: Duration::from_millis(30),
+        max_running_counts: 1,
+        ..WebOptions::default()
+    };
+    let f = fixture_with(300, Storage::Files, false, options, |_| {});
+    assert_eq!(
+        get(&f, &format!("/api/op/{}/count", f.op)).json()["status"],
+        "running"
+    );
+    let r = get(&f, &format!("/api/op/{}/count", f.opaque));
+    assert_eq!(r.status, 503, "{}", r.text());
+    assert!(r.header("Retry-After").is_some());
+    assert!(r.header("Content-Security-Policy").is_some());
+    assert!(r.json()["error"]
+        .as_str()
+        .unwrap()
+        .contains("already running"));
+    let r = get(&f, &format!("/op/{}/count", f.opaque));
+    assert_eq!(r.status, 503);
+    assert!(r.text().contains("already running"));
+    // Showing the running one is not starting one.
+    assert_eq!(get(&f, &format!("/api/op/{}/count", f.op)).status, 200);
+    // A cancelling job still holds its slot; a cancelled one does not.
+    get(&f, &format!("/api/op/{}/count?cancel=1", f.op));
+    assert_eq!(wait_done(&f, &f.op)["status"], "cancelled");
+    let v = get(&f, &format!("/api/op/{}/count", f.opaque)).json();
+    assert_eq!(v["status"], "running", "{}", v);
+    assert_eq!(wait_done(&f, &f.opaque)["status"], "done");
 }
 
 // --- access ---------------------------------------------------------------------------------------
