@@ -70,6 +70,8 @@ fn capped_index(stored: usize, total: usize) -> IndexCache {
         partitions,
         total_keys: total,
         key_type: "String".to_string(),
+        malformed_key_groups: 0,
+        first_malformed: None,
     };
     index_of(keyed)
 }

@@ -113,6 +113,21 @@ flowchart LR
     end
 ```
 
+Nothing delimits a state's run of entries but the **metadata-follows flag**:
+`FullSnapshotAsyncWriter` sets `FIRST_BIT_IN_BYTE_MASK` (`0x80`) on `key[0]` of the **last** entry
+of each run (`setMetaDataFollowsFlagInKey`, `FullSnapshotAsyncWriter.java:177/217`, release-1.20),
+and only after such an entry does a `short` follow — the next stateId or `0xFFFF`.
+`FullSnapshotRestoreOperation.java:301-308` reads it back the same way. `key[0]` is the high byte
+of the key-group prefix, which never uses that bit (maxParallelism ≤ 32768); the restore clears it
+before use, and our key readers skip the prefix, so it never reaches a decoded key.
+
+A key-length heuristic cannot stand in for the flag (a key over the threshold ends the key-group),
+nor can a bounds check (a stateId `short` followed by the high bytes of the next key length reads
+as a plausible length). A block that cannot be read to its end mark — truncated, a negative
+length, a stateId at or beyond the header's state count — is reported (`BlockDefect`), counted in
+`ExportStats::malformed_key_groups` / `CachedKeyedState::malformed_key_groups`, and keeps the
+entries read before the defect.
+
 ### Entry Format (FullSnapshotAsyncWriter)
 
 Each entry is wrapped by `BytePrimitiveArraySerializer`:
@@ -211,6 +226,15 @@ States without this option default to `VALUE`.
 
 The header size is derived from the key-group offsets array:
 `header_size = min(offsets where offset > 0)`.
+
+Every header extractor (state metadata, value serializer types, value POJO classes, POJO infos,
+key POJO, state count) is handed `&data[..header_size]` and scans **all** of it — on the index
+path and the streaming export alike. They used to stop at 50 KB (dropping every state registered
+past it) and, on the index path, ran over the whole state file.
+
+The state count is the `short` `KeyedBackendSerializationProxy.write` puts right before the first
+`StateMetaInfoSnapshot` (`KeyedBackendSerializationProxy.java:133`), never taken below the states
+the heuristics find; it bounds the stateIds of the key-group blocks.
 
 ### TypeSerializerSnapshot Format
 
@@ -439,9 +463,10 @@ non-Pojo collections (`Map<String,Date>`) do **not** consume a POJO info.
 
 ### State ID Filtering
 
-Entries in key-group blocks with `state_id >= numDescriptors` are skipped.
-These phantom entries can occur when `count_states_in_header()` overestimates
-the number of states due to header scanning ambiguity.
+A stateId at or beyond `count_states_in_header()` (the header's declared state count) makes the
+block malformed: it is reported, not parsed further. On the index path, entries whose stateId is
+valid but has no descriptor (`state_id >= numDescriptors`, a state the header heuristics did not
+recognise) are skipped.
 
 ### NullableSerializer Detection (Heuristic)
 
