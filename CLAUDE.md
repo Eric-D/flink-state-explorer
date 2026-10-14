@@ -182,8 +182,16 @@ plausible half key set.
   filter, which only searches stored keys), the pager rows, a trailing `… N more keys not indexed`
   row, `i` info (`Keys`), the `S` summary, and the `E` export (`truncated` at the root and per
   operator, plus `stored_keys` / `total_keys`). `--export-state` streams every key regardless.
-  Pager rows are recognized by `FlatNode::is_pager`, not by an arrow anywhere in the label (a key
-  may contain `↓`).
+  Rows are told apart by their `NodeKind` (`Data` / `PagerUp` / `PagerDown` / `Marker`), never by
+  their label: a key, a value or an operator-state element may contain `↓` or `…`.
+- **Operator-state elements** page like keyed partitions: 500 rows at a time behind `↑`/`↓` pager
+  rows (`StateSnapshot::entry_offset`), each row showing the element's **real** index, also under a
+  filter (`(12/1200 entries)` in the header).
+- **Raw bytes.** `x` (or Enter on a leaf) opens the hex `DetailOverlay` on the selected row's bytes
+  (`TreeView::selected_raw_bytes`): a keyed value — from its state row or any row under it — as the
+  index stores it (for a MAP, the per-key blob `index::builder` assembles, and the panel title says
+  so; the key panel holds the rendered key, since the index keeps no raw key bytes), or an
+  operator-state element's own bytes.
 - **Text.** Shorten display text only through `src/tui/text.rs` (`width`, `truncate_to_width`,
   `ellipsize`): it measures terminal columns and cuts on a `char` boundary. `&s[..n]` on display
   text panicked as soon as `n` fell inside `é`, CJK or an emoji. Widths come from ratatui's own
@@ -200,8 +208,20 @@ plausible half key set.
 
 **`src/parser/value.rs` is the single source of truth for binary value decoding.** It turns a
 state value's raw bytes into a `serde_json::Value`: `decode_state_value(bytes, value_type,
-pojo_info, proto)`. Both the JSON export (`src/export.rs`) and (target) the TUI render this Value;
-do **not** add a second decoder. To support a new type, add it here once.
+pojo_info, proto)`. The JSON export (`src/export.rs`), the streaming export and the TUI
+(`src/tui/tree.rs`) all render this Value; do **not** add a second decoder. To support a new type,
+add it here once.
+
+- **TUI.** Every label is `value_to_display` of the decoded Value; a MAP's rows are the decoded
+  object's entries (`decode_state_value` reads the index's per-key MAP blob via `decode_map_blob`),
+  a LIST's rows the decoded array's elements, a structure's rows its decoded fields (first 50 map
+  entries / 100 elements, then `… +N more`). The TUI only adds presentation: `auto_date` (a `Long`
+  in the 2000–2040 epoch-millis range shown as a date — on by default, so compare with the export
+  with it off) and the debug hex suffix. It used to have ~900 lines of decoders of its own, which
+  disagreed with the export on 18 of 43 states of `savepoint-gitlab` (MAP values read with their
+  `NullableSerializer` byte, keyed `ListState` read as length-prefixed, `Map<K,V>` split on the first
+  comma, no Byte/Tuple/array/TTL arm). `tests/tui_parity_test.rs` (CI) and
+  `tests/tui_gitlab_parity_test.rs` (fixture) render every (key, state) and compare.
 
 - `src/parser/keyed_state.rs` extracts state metadata + the value serializer **type string** per
   state (e.g. `Long`, `Pojo`, `List<String>`, `Map<String,Pojo>`, `Tuple<String,Long>`, `int[]`,
@@ -236,8 +256,8 @@ early), `"[not decoded: follows <field>]"` for every POJO/tuple field after one 
 unknown, and `"[not decoded: <n> more elements]"` closing a list cut short. Internally this is
 `Decoded = Result<Value, Value>`: `Err` carries the partial value and means the reader position is
 lost, which is how a nested POJO's failure stops its parent (it used to read on, from garbage).
-`value_to_display` prints markers without quotes; the TUI's per-field POJO view uses the same
-markers (`read_field_value_pub` → `Result`). In a typed Parquet scalar column a marker is NULL
+`value_to_display` prints markers without quotes, and the TUI shows the decoded Value, so the
+same markers, on its state rows and its per-field rows. In a typed Parquet scalar column a marker is NULL
 (only truncated bytes produce one there).
 
 ### Decoded correctly
@@ -301,8 +321,10 @@ list state's elements, then every broadcast map; with compression, **everything 
 one** Snappy-framed stream (stream identifier once, right after the header), flushed before every
 recorded offset, so each element is its own run of chunks and is inflated on its own
 (`inflate_snappy_chunks`, no checksum check, like Flink). An element ends at the next offset of
-**any** state (binary search over all offsets). Elements keep no copy of their bytes
-(`ValueRef::Decoded`: the decoded label is the entry's `key`).
+**any** state (binary search over all offsets). The decoded label is the entry's `key`, and the
+element's bytes are kept (`ValueRef::Inline`, cache format 8) for the TUI's hex view (`x`): at most
+the stream's size, next to labels that are usually longer. Only an element that could not be read
+is `ValueRef::Decoded` (label, no bytes).
 
 > A savepoint's metadata stores only the **OperatorID** (a hash of the uid). The operator's human
 > **name** and **uid** appear only in metadata **v5+** (our Flink 1.20 fixtures are v4 → shown as
@@ -424,11 +446,24 @@ source** (branch `release-1.20`, https://github.com/apache/flink) rather than gu
   compressed, operator-state, key-type and block-level cases, `tests/tui_*_test.rs` for the TUI
   over ratatui's `TestBackend`), so the fixture-dependent ones
   (`gitlab_savepoint_test`, `decode_e2e_test`, `coverage_audit`, `export_state_stream_test`,
-  `key_group_assignment_test`, `compressed_savepoint_test`, `export_parquet_test`) only ever run
-  locally.
+  `key_group_assignment_test`, `compressed_savepoint_test`, `export_parquet_test`,
+  `tui_gitlab_parity_test`) only ever run locally.
+- `tests/tui_parity_test.rs` (CI) — every (key, state) of a synthetic savepoint (`Map<String,String>`
+  with a null value and a comma, `Map<String,Long>`, `Map<Enum,Boolean>`, `List<Long>` with 0x2c
+  bytes in the values, `List<String>`, `byte[]`, `int[]`, `Byte`, `Tuple2`, `Char`, `Long`, and a key
+  holding none of them) rendered through `TreeView` + `TestBackend` equals `value_to_display` of the
+  `--export-state` value, MAP/LIST rows included; the exported values are the written ones; and
+  `auto_date` only touches `Long`s. Helpers in `tests/common/tui.rs`.
+- `tests/tui_gitlab_parity_test.rs` — the same over every (key, state) of `savepoint-gitlab`
+  (2262 pairs, 66 states incl. timers and windows).
+- `tests/tui_raw_bytes_test.rs` (CI) — `x` on a keyed value gives its bytes (and the overlay shows
+  them), on a MAP the per-key blob; an operator state of 1,200 elements pages to `[1199]` (with its
+  bytes) and keeps real indices under a filter; keys and elements whose labels look like pager
+  rows (`↓ 1-30 / 99`) do not trap the cursor.
 - `tests/decode_e2e_test.rs` — protobuf, tuples, primitive arrays, full-POJO, scrollbar, and
   `AllFieldsPojo` field by field (chars decoded, then explicit markers — no `null`) on the index,
-  streaming and TUI-display paths.
+  streaming and `deserialize_pojo_to_json` display paths. It does **not** check the TUI: the
+  `tui_*parity_test`s do.
 - `tests/value_decode_test.rs` (CI) — `parser::value` on hand-written Flink bytes: `Char`, `char[]`,
   an emoji string, null Strings, every marker (Kryo, unknown serializer, truncated bytes, nested
   POJO, list, tuple, subclass, map key) and their TUI rendering. Reader-level `StringValue` and
