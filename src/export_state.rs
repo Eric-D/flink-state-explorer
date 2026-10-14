@@ -119,7 +119,7 @@ fn source_for<'a>(
             Ok(Some(Source::File { path, base: 0, len }))
         }
         StreamStateHandle::File(f) => {
-            let path = PathBuf::from(&f.file_path);
+            let path = crate::state_file::local_path(&f.file_path)?;
             let (_, len) = crate::state_file::open(&path, f.state_size)?;
             Ok(Some(Source::File { path, base: 0, len }))
         }
@@ -128,7 +128,7 @@ fn source_for<'a>(
         // checkpoint output stream — NOT verified against a real segmented savepoint, so an
         // export from one should be sanity-checked before being trusted.
         StreamStateHandle::Segment(seg) => {
-            let path = PathBuf::from(&seg.file_path);
+            let path = crate::state_file::local_path(&seg.file_path)?;
             let base = seg.start_pos.max(0) as u64;
             let len = seg.state_size.max(0) as u64;
             // The segment must lie within its file.
@@ -169,11 +169,25 @@ fn open_keyed_streams<'a>(
     let mut errors = Vec::new();
     for (subtask_index, kg) in keyed_handles(op) {
         match source_for(effective_delegate(kg), savepoint_dir) {
-            Ok(Some(src)) => streams.push(KeyedStream {
-                subtask_index,
-                kg,
-                src,
-            }),
+            Ok(Some(src)) => {
+                let what = match &src {
+                    Source::File { path, .. } => path.display().to_string(),
+                    Source::Mem(_) => format!("subtask {} (inline)", subtask_index),
+                };
+                match crate::state_file::check_offsets(
+                    &what,
+                    &kg.offsets,
+                    kg.start_key_group,
+                    src.len(),
+                ) {
+                    Ok(()) => streams.push(KeyedStream {
+                        subtask_index,
+                        kg,
+                        src,
+                    }),
+                    Err(e) => errors.push(e),
+                }
+            }
             Ok(None) => {}
             Err(e) => errors.push(e),
         }
@@ -528,7 +542,7 @@ pub fn export_state_rows<S: RowSink + ?Sized>(
         }
     }
 
-    let (op, resolved, streams, errors) = targets.remove(0);
+    let (op, _resolved, streams, errors) = targets.remove(0);
     let op_hex = hex_id(&op.id);
     if !errors.is_empty() {
         return Err(format!(
@@ -577,19 +591,11 @@ pub fn export_state_rows<S: RowSink + ?Sized>(
 
         // A subtask can register its states in its own order, so re-resolve per subtask rather
         // than reusing the first subtask's state id.
-        let sub = resolve_state(&header, state_name).unwrap_or_else(|| ResolvedState {
-            state_id: resolved.state_id,
-            name: resolved.name.clone(),
-            state_type: resolved.state_type.clone(),
-            value_type: resolved.value_type.clone(),
-            pojo: resolved.pojo.clone(),
-            key_type: resolved.key_type.clone(),
-            key_pojo: resolved.key_pojo.clone(),
-            state_types: resolved.state_types.clone(),
-            num_states: resolved.num_states,
-            map_key_type: resolved.map_key_type.clone(),
-            map_value_type: resolved.map_value_type.clone(),
-        });
+        // A subtask whose header does not register the state holds none of its entries: reading
+        // it with another subtask's state id would decode a different state.
+        let Some(sub) = resolve_state(&header, state_name) else {
+            continue;
+        };
 
         let kg_prefix_len = if op.max_parallelism > 128 { 2 } else { 1 };
 

@@ -327,7 +327,7 @@ where
             crate::state_file::read(&savepoint_dir.join(&rel.relative_path), rel.state_size)?
         }
         StreamStateHandle::File(f) => {
-            crate::state_file::read(Path::new(&f.file_path), f.state_size)?
+            crate::state_file::read(&crate::state_file::local_path(&f.file_path)?, f.state_size)?
         }
         // File-merging segments are only read by the streaming export; say so rather than show
         // the operator as if it had no keys.
@@ -344,6 +344,14 @@ where
     if data.is_empty() {
         return Ok(None);
     }
+    let what = match effective_delegate {
+        StreamStateHandle::Relative(rel) => {
+            savepoint_dir.join(&rel.relative_path).display().to_string()
+        }
+        StreamStateHandle::File(f) => f.file_path.clone(),
+        _ => "inline keyed state".to_string(),
+    };
+    crate::state_file::check_offsets(&what, &kg.offsets, kg.start_key_group, data.len() as u64)?;
 
     let state_metas = extract_state_metadata(&data);
     if state_metas.is_empty() {
@@ -543,10 +551,11 @@ fn keyed_state_handle_size(handle: &StateHandle) -> u64 {
     match handle {
         StateHandle::KeyGroups(kg) => match &kg.delegate_handle {
             StreamStateHandle::ByteStream(bs) => bs.data.len() as u64,
-            StreamStateHandle::Relative(rel) => rel.state_size as u64,
-            StreamStateHandle::File(f) => f.state_size as u64,
+            // Flink records -1 when it could not tell the size: count it as unknown (0).
+            StreamStateHandle::Relative(rel) => rel.state_size.max(0) as u64,
+            StreamStateHandle::File(f) => f.state_size.max(0) as u64,
             StreamStateHandle::KeyGroups(nested) => match &nested.delegate_handle {
-                StreamStateHandle::Relative(rel) => rel.state_size as u64,
+                StreamStateHandle::Relative(rel) => rel.state_size.max(0) as u64,
                 StreamStateHandle::ByteStream(bs) => bs.data.len() as u64,
                 _ => 0,
             },

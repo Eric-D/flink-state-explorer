@@ -201,22 +201,29 @@ fn export_state(cli: &Cli) -> Result<(), String> {
                 &mut w,
             )?
         }
-        "ndjson" => {
-            let file = std::fs::File::create(&path)
-                .map_err(|e| format!("create {}: {}", path.display(), e))?;
+        // Written to a side file and renamed on success, so a failed export (e.g. a state file
+        // went missing) never truncates a previous good export at `path`.
+        "ndjson" => write_then_rename(&path, |tmp| {
+            let file = std::fs::File::create(tmp)
+                .map_err(|e| format!("create {}: {}", tmp.display(), e))?;
             let mut w = io::BufWriter::new(file);
-            flink_explorer::export_state::export_state_ndjson(
+            let stats = flink_explorer::export_state::export_state_ndjson(
                 &savepoint,
                 &cli.savepoint_dir,
                 cli.operator.as_deref(),
                 state,
                 proto.as_ref(),
                 &mut w,
-            )?
-        }
-        "parquet" => {
+            )?;
+            io::Write::flush(&mut w).map_err(|e| format!("write {}: {}", tmp.display(), e))?;
+            Ok(stats)
+        })?,
+        "parquet" if to_stdout => {
             export_state_parquet(cli, &savepoint, state, proto.as_ref(), &path, to_stdout)?
         }
+        "parquet" => write_then_rename(&path, |tmp| {
+            export_state_parquet(cli, &savepoint, state, proto.as_ref(), tmp, false)
+        })?,
         _ => unreachable!("format validated above"),
     };
 
@@ -237,6 +244,27 @@ fn export_state(cli: &Cli) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// Run `write` against `<path>.partial`, then move it over `path` only if it succeeded.
+fn write_then_rename<T>(
+    path: &Path,
+    write: impl FnOnce(&Path) -> Result<T, String>,
+) -> Result<T, String> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".partial");
+    let tmp = PathBuf::from(tmp);
+    match write(&tmp) {
+        Ok(v) => {
+            std::fs::rename(&tmp, path)
+                .map_err(|e| format!("rename {} to {}: {}", tmp.display(), path.display(), e))?;
+            Ok(v)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
 }
 
 #[cfg(feature = "parquet")]

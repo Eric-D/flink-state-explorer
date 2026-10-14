@@ -120,7 +120,7 @@ fn index_records_a_missing_state_file_and_keeps_the_other_subtask() {
             &idx,
             &files[bad],
             1 - bad as i32,
-            "No such file or directory",
+            &std::io::Error::from_raw_os_error(2).to_string(), // ENOENT, in the platform's words
         );
     }
 }
@@ -390,4 +390,122 @@ fn no_cache_neither_reads_nor_writes_the_cache() {
         cached,
         "--no-cache rewrote the cache"
     );
+}
+
+#[test]
+fn a_subtask_that_does_not_register_the_state_contributes_no_rows() {
+    // Flink registers a state on first access, so subtasks can disagree: subtask 0 knows
+    // [counter, label], subtask 1 knows [counter, other] — stateId 1 means two different states.
+    let mut op = KeyedOperator::new(0x61, 2, 128, Ser::String)
+        .state("counter", Kind::Value(Ser::Long))
+        .state("label", Kind::Value(Ser::String))
+        .state("other", Kind::Value(Ser::Long));
+    op.subtask_states = Some(vec![
+        vec!["counter".into(), "label".into()],
+        vec!["counter".into(), "other".into()],
+    ]);
+    for i in 0..100 {
+        let key = Val::Str(format!("key-{:07}", i));
+        op.items.push(Item::Value {
+            state: 0,
+            key: key.clone(),
+            value: Val::Long(i),
+        });
+        op.items.push(Item::Value {
+            state: 1,
+            key: key.clone(),
+            value: Val::Str(format!("l{}", i)),
+        });
+        op.items.push(Item::Value {
+            state: 2,
+            key,
+            value: Val::Long(-i),
+        });
+    }
+    let mut spec = Spec::new(Storage::Files);
+    spec.operators.push(op);
+    let dir = synth::temp_dir("per-subtask-headers");
+    synth::write_savepoint(&spec, &dir);
+    let sp = parser::parse_metadata(&dir.join("_metadata")).unwrap();
+
+    let mut out = Vec::new();
+    export_state_ndjson(&sp, &dir, None, "label", None, &mut out).expect("export");
+    let rows: Vec<serde_json::Value> = String::from_utf8(out)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let in_subtask_0 = keys_of_subtask_n(0, 100);
+    assert!(!rows.is_empty());
+    for r in &rows {
+        assert_eq!(r["subtask"], 0, "subtask 1 has no `label`: {}", r);
+        assert!(
+            r["value"].as_str().unwrap().starts_with('l'),
+            "decoded another state: {}",
+            r
+        );
+        assert!(in_subtask_0.contains(r["key"].as_str().unwrap()));
+    }
+    assert_eq!(rows.len(), in_subtask_0.len());
+}
+
+#[test]
+fn an_absolute_file_handle_is_read_through_its_file_scheme() {
+    let mut spec = Spec::new(Storage::AbsoluteFiles);
+    spec.operators.push(synth::sample_operator(50));
+    let dir = synth::temp_dir("absolute");
+    synth::write_savepoint(&spec, &dir);
+    let index = index(&dir);
+    let op = &index.operators[0];
+    assert!(op.load_errors.is_empty(), "{:?}", op.load_errors);
+    assert_eq!(op.keyed_state.as_ref().unwrap().total_keys, 50);
+    let sp = parser::parse_metadata(&dir.join("_metadata")).unwrap();
+    let mut out = Vec::new();
+    let stats = export_state_ndjson(&sp, &dir, None, "counter", None, &mut out).unwrap();
+    assert_eq!(stats.rows, 50);
+}
+
+fn keys_of_subtask_n(subtask: i32, n: usize) -> BTreeSet<String> {
+    let (start, end) = synth::range_for_subtask(128, 2, subtask);
+    (0..n)
+        .map(|i| format!("key-{:07}", i))
+        .filter(|k| {
+            (start..=end).contains(&synth::key_group_for_hash(synth::java_string_hash(k), 128))
+        })
+        .collect()
+}
+
+#[test]
+fn a_cut_file_is_caught_by_its_key_group_offsets_even_without_a_state_size() {
+    // Flink writes stateSize -1 when it could not tell; the offsets still tell.
+    let (dir, files) = savepoint("offsets");
+    let meta_path = dir.join("_metadata");
+    let mut meta = std::fs::read(&meta_path).unwrap();
+    // Each RelativeFileStateHandle is [tag 6][utf path][long stateSize]: set every size to -1.
+    for f in &files {
+        let name = f.file_name().unwrap().to_str().unwrap().as_bytes().to_vec();
+        let mut needle = vec![6u8];
+        needle.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        needle.extend_from_slice(&name);
+        let at = meta
+            .windows(needle.len())
+            .position(|w| w == needle.as_slice())
+            .unwrap()
+            + needle.len();
+        meta[at..at + 8].copy_from_slice(&(-1i64).to_be_bytes());
+    }
+    std::fs::write(&meta_path, &meta).unwrap();
+    truncate_to_half(&files[1]);
+
+    let idx = index(&dir);
+    let errs = &idx.operators[0].load_errors;
+    assert!(
+        errs.iter()
+            .any(|e| e.contains(files[1].to_str().unwrap()) && e.contains("truncated: key-group")),
+        "{:?}",
+        errs
+    );
+    let sp = parser::parse_metadata(&meta_path).unwrap();
+    let e = export_state_ndjson(&sp, &dir, None, "counter", None, &mut Vec::new()).unwrap_err();
+    assert!(e.contains("truncated: key-group"), "{}", e);
 }

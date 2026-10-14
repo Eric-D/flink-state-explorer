@@ -837,7 +837,7 @@ impl TreeView {
                         .add_modifier(Modifier::BOLD)
                 } else {
                     match node.level {
-                        NodeLevel::Operator if node.label.contains(LOAD_ERROR_MARK) => {
+                        NodeLevel::Operator if self.operators[node.op_idx].load_errors > 0 => {
                             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
                         }
                         NodeLevel::Operator => Style::default()

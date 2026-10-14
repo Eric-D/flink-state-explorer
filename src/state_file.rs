@@ -7,7 +7,25 @@
 
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// The local path of an absolute state-file handle. Flink writes `Path.toString()`, which keeps the
+/// scheme (`file:/abs/x`, `file:///abs/x`); a remote file system (`s3://`, `hdfs://`, …) cannot be
+/// read here, and saying so beats the misleading "No such file or directory" it would give.
+pub fn local_path(flink_path: &str) -> Result<PathBuf, String> {
+    if let Some(rest) = flink_path.strip_prefix("file:") {
+        // file:/abs, file://abs (authority-less, as Flink writes local paths), file:///abs.
+        let rest = rest.trim_start_matches('/');
+        return Ok(PathBuf::from(format!("/{}", rest)));
+    }
+    match flink_path.split_once("://") {
+        Some((scheme, _)) if !scheme.is_empty() && scheme.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.') => Err(format!(
+            "{}: remote file system ({}), not readable locally; copy the savepoint to a local directory",
+            flink_path, scheme
+        )),
+        _ => Ok(PathBuf::from(flink_path)),
+    }
+}
 
 /// Open `path`, check it is readable and at least `expected_len` bytes long, and return it with
 /// its actual length.
@@ -34,6 +52,33 @@ pub fn read(path: &Path, expected_len: i64) -> Result<Vec<u8>, String> {
     // The file may have shrunk between the stat and the read.
     check_len(path, data.len() as u64, expected_len)?;
     Ok(data)
+}
+
+/// A second length check that does not depend on `stateSize` (which may be `-1`): every
+/// key-group must start inside the stream. `what` names the stream in the error.
+pub fn check_offsets(
+    what: &str,
+    offsets: &[i64],
+    start_key_group: i32,
+    len: u64,
+) -> Result<(), String> {
+    if let Some((i, &off)) = offsets
+        .iter()
+        .enumerate()
+        .filter(|(_, &o)| o > 0)
+        .max_by_key(|(_, &o)| o)
+    {
+        if off as u64 >= len {
+            return Err(format!(
+                "{}: truncated: key-group {} starts at byte {}, the stream has {} bytes",
+                what,
+                start_key_group + i as i32,
+                off,
+                len
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// `"<path>: <OS error>"`, the form every state-file I/O error takes.
@@ -70,6 +115,19 @@ pub fn summarize(errors: &[String], max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_path_strips_the_file_scheme_and_refuses_remote_ones() {
+        assert_eq!(local_path("file:/a/b").unwrap(), PathBuf::from("/a/b"));
+        assert_eq!(local_path("file:///a/b").unwrap(), PathBuf::from("/a/b"));
+        assert_eq!(local_path("/a/b").unwrap(), PathBuf::from("/a/b"));
+        let e = local_path("s3://bucket/sp/x").unwrap_err();
+        assert!(
+            e.contains("s3://bucket/sp/x") && e.contains("remote file system (s3)"),
+            "{}",
+            e
+        );
+    }
 
     fn temp_file(tag: &str, bytes: &[u8]) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(

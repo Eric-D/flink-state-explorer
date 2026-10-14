@@ -132,8 +132,8 @@ Two things to know about the rows:
 
 ## State files: never read a broken one as "no state"
 
-Every state file (relative, absolute, or a file-merging segment) is opened through
-`src/state_file.rs`, which returns an error **naming the path** when the file is missing,
+Every **keyed**-state file (relative, absolute — `file:` scheme stripped, remote schemes refused —
+or, on the export path, a file-merging segment) is opened through `src/state_file.rs`, which returns an error **naming the path** when the file is missing,
 unreadable, or **shorter than the handle's `stateSize`** (`"<path>: truncated: N of M bytes"`;
 Flink records the stream position at close, `-1` if unknown, which skips the length check). Do not
 go back to `fs::read(..).unwrap_or_default()` or `metadata().ok()?`: that turned a lost file into a
@@ -148,7 +148,10 @@ plausible half key set.
   cannot be read, and also if another candidate operator has an unreadable file (it may hold the
   state too; `--operator` scopes it away). The state is resolved from **every** subtask's header,
   so a bad first file is reported as such, not as "state not found". `--list-states` prints what it
-  could read, then every error on stderr, and exits 2.
+  could read, then every error on stderr, and exits 2. A subtask whose header does not register
+  the state contributes no rows (Flink registers states lazily, so subtasks can disagree). The
+  output is written to `<path>.partial` and renamed on success, so a failed export never
+  truncates a previous one. Operator-state files are handled by #27.
 
 ## Decoder architecture — IMPORTANT
 
