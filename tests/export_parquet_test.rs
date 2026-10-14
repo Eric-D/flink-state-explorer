@@ -290,7 +290,7 @@ fn char_state_is_a_utf8_column_of_one_character_strings() {
         BTreeMap::from([
             ("a".to_string(), Value::from("A")),
             ("e".to_string(), Value::from("é")),
-            ("half".to_string(), Value::from("\u{FFFD}")),
+            ("half".to_string(), Value::from("\\uD83D")),
         ])
     );
     std::fs::remove_file(&path).ok();

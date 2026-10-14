@@ -209,6 +209,20 @@ do **not** add a second decoder. To support a new type, add it here once.
   POJO's last *nested field* serializer would mislabel it). POJO info is matched to a state **by
   class name** (`extract_value_pojo_classes`), because `extract_pojo_infos` dedupes by class.
 - `src/parser/pojo.rs` parses POJO *structure* (field names/types) from `PojoSerializerSnapshot`.
+- Serializer snapshot classes are matched by their **exact** name (`keyed_state::serializer_name` +
+  `leaf_serializer_type`, a table shared with `pojo.rs`): a substring match read `BigIntSerializer`
+  as `Int`.
+- **Keys** are decoded in `value.rs` too (`decode_key`), for the index/TUI and the streaming export
+  alike. The index groups entries by the rendered key, so the rendering is **injective**:
+  String/Long/Int/Short/Byte/Char/Boolean/Float/Double/BigInteger/BigDecimal/Date/LocalDate as
+  their value, `Tuple<…>` of those as compact JSON (`["user-1",1]`, strings escaped), POJOs as
+  `{ id: 7, name: "x" }`; anything else (Kryo, custom serializers, NaN, …) as `0x` + the hex of the
+  key's own bytes (`opaque_key`). `keyed_state::split_key` separates the key from its namespace
+  (and a MAP state's map key) with the per-state `EntryLayout` read off the header
+  (`extract_entry_layouts`: the namespace serializer's width — VoidNamespace 1, TimeWindow 16,
+  GlobalWindow 1 — and the map key type), and keeps a decoded key only when exactly one namespace
+  (+ one map key) follows it, which rejects a POJO decode stopped by a Kryo field. Timers render
+  their key the same way, so they land in their key's partition.
 - Protobuf: a POJO with `className` + `protoBytes` fields is decoded against a `.proto` when a
   profile with a matching `[[proto_patterns]]` is loaded (`src/proto/`). `.proto` files are
   gitignored (project-specific).
@@ -228,14 +242,17 @@ markers (`read_field_value_pub` → `Result`). In a typed Parquet scalar column 
 
 ### Decoded correctly
 Scalars, `char`/`Character` (`Char` → a one-character string) and `char[]` (an array of them; a
-lone surrogate becomes U+FFFD), strings with characters outside the BMP (`StringValue` writes
+lone surrogate is shown as its Java escape, e.g. `\uD83D`, so distinct chars stay distinct), strings with characters outside the BMP (`StringValue` writes
 UTF-16 units, so surrogate pairs are decoded together), date/time (`Date`/`Timestamp`/`Instant`;
 note: Flink serializes `java.time.LocalDate`/
 `LocalTime`/`LocalDateTime` POJO fields with **Kryo**, so they show as `[Kryo]` — the dedicated
 `Local*Serializer` formats are still handled in `value.rs` for the explicit-state case, layouts
 verified vs Flink: `LocalDate`=int+byte+byte, `LocalTime`=byte+byte+byte+int, `LocalDateTime`=13B),
-Enum (as name), nested POJO, `byte[]`/`String[]`, primitive arrays
-(`int[]/long[]/double[]/…`), Tuples, keyed `ListState` (delimiter-separated), `MapState`
+Enum (as name), `Char`, `BigInteger`/`BigDecimal` (exact, as strings — `BigDecimal` in Java's
+`toString()` form, which keeps `1.0` and `1.00` apart), nested POJO, `byte[]`/`String[]`, primitive
+arrays
+(`int[]/long[]/double[]/…`), Tuples, **keys** of every type above plus Tuple and POJO keys (see
+`decode_key`), keyed `ListState` (delimiter-separated), `MapState`
 (keys + values, incl. POJO values), protobuf-in-POJO (with a profile), **window state**
 (`window-contents`) and **timers** (priority-queue states `_timer_state/...`, shown as the firing
 timestamp), **TTL-wrapped values** (`Ttl<T>` → `{ _ttlLastAccess, value }`, via `TtlSerializer`),
@@ -328,6 +345,12 @@ don't store a user class — only the serializer class, which implies the type.
 - **Channel state** (`input_channel_state` / `result_subpartition_state`, unaligned checkpoints) is
   parsed but not displayed — it does not appear in canonical savepoints anyway.
 - RocksDB incremental / changelog state is not decoded (canonical heap savepoints only).
+- **Keys**: `Timestamp`/`Instant`/`LocalTime`/`LocalDateTime` keys render as hex (their display
+  drops sub-millisecond precision, which would merge keys). A `Float` key renders through `f64`
+  (`1.100000023841858`). An undecodable key under an unknown (custom) namespace serializer keeps
+  its namespace in the hex, and one in a MAP state whose map key is undecodable too keeps the map
+  key — distinct keys still never merge, but such a key shows once per namespace / map entry. POJO
+  keys keep their `{ field: value }` display, which does not escape strings.
 
 ## Binary format references (verify against apache/flink)
 
@@ -360,6 +383,20 @@ source** (branch `release-1.20`, https://github.com/apache/flink) rather than gu
 - **Map value** — wrapped by `NullableSerializer`: a leading `isNull` byte (0x01 = null), then the
   value. Map key bytes are `VoidNamespace(1 byte) + serialized key`.
 - **VoidNamespace** = 1 byte; a window's namespace is a `TimeWindow` = two `long`s (start, end).
+- **Entry key** — `flink-runtime/.../state/SerializedCompositeKeyBuilder.java` (used by
+  `HeapKeyValueStateIterator`): `kgPrefix + key + namespace`, then the map user key for a MAP
+  state. No length is written in between unless key **and** namespace are both variable-sized
+  (`isAmbiguousCompositeKeyPossible`), which VoidNamespace (`getLength() == 0`, writes one byte),
+  TimeWindow (16) and GlobalWindow (1) never are. In the header, each state's block ends with its
+  namespace serializer's snapshot (`writeUTF(class) + int version`, no payload), timers included
+  (`TimerSerializerSnapshot` nests `[key, namespace]`).
+- **Scalars** — `typeutils/base/`: `ShortSerializer` writeShort, `ByteSerializer` writeByte,
+  `CharSerializer` writeChar (2 bytes), `Float`/`DoubleSerializer` writeFloat/writeDouble.
+  `BigIntSerializer`: `int len` (0 = null, 1/2/3 = the `ZERO`/`ONE`/`TEN` fast paths, else `len - 4`
+  bytes of `toByteArray()`, two's complement); `BigDecSerializer`: that BigInteger (unscaled) then
+  `int scale`.
+- **Tuple** — `TupleSerializer`: the fields back to back, no null flags. `TupleSerializerSnapshot`:
+  composite, outer version 2, outer snapshot `writeUTF(tupleClass)`, one nested snapshot per field.
 - **Enum** — `EnumSerializerSnapshot`: `writeUTF(enumClass)` + `int(n)` + `n × writeUTF(constant)`
   (constants in ordinal order).
 - **String** — Flink `StringValue` (`flink-core/.../types/StringValue.java`): var-int length =
@@ -382,10 +419,10 @@ source** (branch `release-1.20`, https://github.com/apache/flink) rather than gu
 ## Tests
 - `cargo test` — needs `tests/fixtures/savepoint-gitlab/` (run `mvn verify` first). Note that
   `.github/workflows/ci.yml` runs an **explicit list** of fixture-free tests (add new ones to it;
-  `tests/synth_savepoint_test.rs`, `tests/operator_state_test.rs` and `tests/keyed_block_test.rs`
-  are the fixture-free home for file-backed / multi-subtask / compressed, operator-state and
-  block-level cases, `tests/tui_*_test.rs` for the TUI over ratatui's `TestBackend`), so the
-  fixture-dependent ones
+  `tests/synth_savepoint_test.rs`, `tests/operator_state_test.rs`, `tests/key_types_test.rs` and
+  `tests/keyed_block_test.rs` are the fixture-free home for file-backed / multi-subtask /
+  compressed, operator-state, key-type and block-level cases, `tests/tui_*_test.rs` for the TUI
+  over ratatui's `TestBackend`), so the fixture-dependent ones
   (`gitlab_savepoint_test`, `decode_e2e_test`, `coverage_audit`, `export_state_stream_test`,
   `key_group_assignment_test`, `compressed_savepoint_test`, `export_parquet_test`) only ever run
   locally.
@@ -398,7 +435,12 @@ source** (branch `release-1.20`, https://github.com/apache/flink) rather than gu
   `readChar` cases are in `tests/java_deser_test.rs`; `synth_savepoint_test.rs` runs `Char`,
   `char[]`, `List<Char>`, `Map<String,Char>` and emoji keys/values through both read paths.
 - `tests/coverage_audit.rs` — dumps the full operator/state inventory + decoded values (diagnostic).
-- `tests/gitlab_savepoint_test.rs` — exhaustive per-state assertions.
+- `tests/gitlab_savepoint_test.rs` — exhaustive per-state assertions, incl. every state's
+  namespace width / map key type as read off the headers Flink wrote.
+- `tests/key_types_test.rs` — fixture-free: Short, Double (±0, NaN, ±∞), Boolean, BigInteger,
+  Tuple2, Byte, Float, Char and undecodable keys in VALUE and MAP states (plus timers) stay
+  distinct on the export and the index, with their values, Flink's key-group, and the map key in
+  `map_key`; BigInteger/BigDecimal/Char layouts; JDK `hashCode()` known answers.
 - `tests/export_parquet_test.rs` — **needs `--features parquet`**: the file is well-formed, the
   `value` column is typed per state, map rows keep `map_key`, key-groups are absolute, columns are
   zstd, and the rows read back equal the NDJSON ones. Verified by reading with arrow-rs, not with
