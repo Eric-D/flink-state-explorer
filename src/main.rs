@@ -96,6 +96,10 @@ fn main() -> ExitCode {
     if cli.export_state.is_some() {
         return match export_state(&cli) {
             Ok(()) => ExitCode::from(0),
+            // `--export-state … -o - | head`: the reader went away, which is not an error.
+            Err(e) if is_stdout(&cli) && e.to_lowercase().contains("broken pipe") => {
+                ExitCode::from(0)
+            }
             Err(e) => {
                 eprintln!("Error: {}", e);
                 ExitCode::from(2)
@@ -376,11 +380,20 @@ fn export_state(cli: &Cli) -> Result<(), String> {
     Ok(())
 }
 
+fn is_stdout(cli: &Cli) -> bool {
+    cli.out.as_deref().is_some_and(|p| p == Path::new("-"))
+}
+
 /// Run `write` against `<path>.partial`, then move it over `path` only if it succeeded.
 fn write_then_rename<T>(
     path: &Path,
     write: impl FnOnce(&Path) -> Result<T, String>,
 ) -> Result<T, String> {
+    // Only a regular file (or a path not there yet) can be replaced by a rename. `/dev/null`, a
+    // named pipe or a device is written to directly: there is no previous export to protect.
+    if std::fs::metadata(path).is_ok_and(|m| !m.is_file()) {
+        return write(path);
+    }
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".partial");
     let tmp = PathBuf::from(tmp);
